@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -33,7 +33,7 @@ class Tokenizer:
         self.channels = channels
         self.K = vocab_size
 
-        self.num_fac = 10.0
+        assert self.channels == 2, f"Tokenizer now supports price/volume only, channels={channels}"
         self.vol_fac = 1.0
 
     def parse(self, sample_path: str, segment: np.ndarray, rot: bool = False) -> None:
@@ -46,10 +46,11 @@ class Tokenizer:
 
         # check shape
         assert data.ndim == 2
-        ticks_num, _ = data.shape
+        _, columns_num = data.shape
+        assert columns_num >= 3, f"Expected at least [secs, price, volume] columns, got {columns_num}"
 
         # parse data
-        secs, temp, vol, num = data[:, 0], data[:, 1], data[:, 2], data[:, 3]
+        secs, temp, vol = data[:, 0], data[:, 1], data[:, 2]
 
         # decode
         temp = temp / 1000
@@ -62,10 +63,9 @@ class Tokenizer:
         self.secs = secs
         self.temp = temp
         self.vol = vol
-        self.num = num
 
     def secs_to_ts(self, secs: np.ndarray) -> np.ndarray:
-        dt = pd.to_datetime(secs, unit="s", origin=self.anno)
+        dt = pd.to_datetime(secs, unit="s", origin=self.anno, utc=True).tz_convert("US/Eastern")
         minutes = dt.hour * 60 + dt.minute
         weekdays = dt.weekday
         days = dt.day
@@ -82,7 +82,8 @@ class Tokenizer:
         # city
         city = self.mapping[self.sample_id]
         city = np.array([city])
-        years = (dt[0] - self.anno).days
+        anno = pd.Timestamp(self.anno, tz="UTC")
+        years = (dt[0] - anno).days
         years = np.array([years])
         op = np.array([self.temp[0]])
 
@@ -102,13 +103,9 @@ class Tokenizer:
         vol = np.sqrt(self.vol) * self.vol_fac
         vol = np.clip(vol, 0, K)
         vol_tok = np.round(vol).astype(np.int32)
-        # tokenize num
-        num = np.sqrt(self.num) * self.num_fac
-        num = np.clip(num, 0, K)
-        num_tok = np.round(num).astype(np.int32)
 
         # to sequence
-        seq = np.stack((num_tok, vol_tok, temp_tok), axis=1).flatten()
+        seq = np.stack((temp_tok, vol_tok), axis=1).flatten()
 
         # ctx
         assert ts.shape[0] == seq.shape[0]
@@ -133,16 +130,15 @@ class Tokenizer:
         ctx = ctx.cpu().numpy()
 
         # split
-        num_tok, vol_tok, temp_tok = np.split(seq, n, axis=-1)
+        temp_tok, vol_tok = np.split(seq, n, axis=-1)
 
         # ctx
         city, first = ctx[:, 0], ctx[:, 1]
 
         # to value
-        num = np.square(num_tok / self.num_fac)
         vol = np.square(vol_tok / self.vol_fac)
         first = einops.rearrange(first, "b -> b 1 1")
         L = (self.K - 1) // 2
         temp = (temp_tok - L) / 10000 * first + first
-        seq1 = np.concatenate((temp * 1000, vol, num), axis=-1)
+        seq1 = np.concatenate((temp * 1000, vol), axis=-1)
         return seq1.astype(np.int32)

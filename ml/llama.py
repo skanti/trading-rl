@@ -362,10 +362,11 @@ class Transformer(nn.Module):
 
         return ctx
 
-    def forward(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward_hidden(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
 
         b, s, _ = x.shape
+        assert s <= self.config.block_size, f"Sequence length {s} exceeds block_size={self.config.block_size}"
         if input_pos is None:
             b, s, _ = x.shape
             mask = self.causal_mask[None, None, :s, :s]
@@ -377,6 +378,10 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
+        return x
+
+    def forward(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+        x = self.forward_hidden(x=x, input_pos=input_pos)
         logits = self.output(x)
         return logits
 
@@ -390,12 +395,9 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
-
-    # config
     b = 8
     device = "cuda:0"
 
-    # model
     t0 = time.perf_counter()
     cfg = ModelArgs(
         block_size=4096,
@@ -406,13 +408,10 @@ if __name__ == "__main__":
     )
     model = Transformer(cfg).to(device).eval()
     assert model.config.batch_size == b
-    # model = DummyModule().to(device).eval()
-    # model.compile()
     t1 = time.perf_counter()
 
-    # warmup
-    model.warmup(device=device)
-
-    ctx = torch.randint(0, 128, (b, 1), device=device)
+    model.setup_caches(max_batch_size=b, max_seq_length=32, dtype=torch.float32)
+    x = torch.randn(b, 32, cfg.dim, device=device)
     with torch.inference_mode():
-        res = model.sample(ctx, desc="Decode")
+        res = model.forward_hidden(x)
+    print(f"Smoke test complete, shape={tuple(res.shape)}, init={t1 - t0:0.3f}s")

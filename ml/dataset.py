@@ -13,7 +13,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from rich.logging import RichHandler
 
-from . import tokenizer
+try:
+    from . import tokenizer
+except ImportError:
+    import tokenizer
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)
 logger = logging.getLogger("DATASET")
@@ -30,6 +33,7 @@ class TokLoader(Dataset):
         channels: int,
         vocab_size: int,
         anno: str,
+        rollout_size: int,
         should_augment: bool = False,
         limit: int | None = None,
     ):
@@ -40,6 +44,7 @@ class TokLoader(Dataset):
         self.data_dir = data_dir
         self.seq_size = seq_size
         self.channels = channels
+        self.rollout_size = rollout_size
         self.should_augment = should_augment
 
         # using mapping as weights
@@ -71,28 +76,37 @@ class TokLoader(Dataset):
 
         # get size
         N = self.seq_size
-        ctx_idx, sod_idx, eod_idx = sample.ctx_idx, sample.sod_idx, sample.eod_idx
-        size = eod_idx - ctx_idx
-        assert size >= N
+        T = self.rollout_size
+        sod_idx, eod_idx = int(sample.sod_idx), int(sample.eod_idx)
+        ctx_idx = int(sample.ctx_idx) if "ctx_idx" in sample.index else 0
 
-        # determine idx
-        i = np.random.randint(sod_idx, eod_idx + 1)
-        assert (i - N) >= ctx_idx
+        # The first action sees the previous N ticks, and every action needs a
+        # following price for reward. Keep the entire sampled path inside RTH.
+        last_context_idx_low = max(sod_idx, ctx_idx + N - 1)
+        last_context_idx_high = eod_idx - T
+        assert last_context_idx_high >= last_context_idx_low, (
+            f"Sample too short for seq_size={N}, rollout_size={T}, "
+            f"sample_id={sample_id}, sod_idx={sod_idx}, eod_idx={eod_idx}, ctx_idx={ctx_idx}"
+        )
 
-        # correction
-        eod_idx = i
-        ctx_idx = i - N
+        if self.should_augment:
+            last_context_idx = np.random.randint(last_context_idx_low, last_context_idx_high + 1)
+        else:
+            last_context_idx = last_context_idx_low
+
+        ctx_idx = last_context_idx - N + 1
+        eod_idx = ctx_idx + N + T
 
         # make segment
         segment = np.arange(ctx_idx, eod_idx)
-        assert segment.shape[0] == N
+        assert segment.shape[0] == N + T
 
         # parse
         self.tokenizer.parse(sample_path=sample_path, segment=segment)
 
         # tokenize
         ctx, seq, ts = self.tokenizer.tokenize()
-        assert seq.shape[0] == (self.seq_size * self.channels)
+        assert seq.shape[0] == ((self.seq_size + self.rollout_size) * self.channels)
 
         # check date
         assert (
@@ -104,6 +118,8 @@ class TokLoader(Dataset):
             "ts": ts,
             "seq": seq,
             "ctx": ctx,
+            "prices": self.tokenizer.temp.astype(np.float32),
+            "secs": self.tokenizer.secs.astype(np.int64),
             "pos": pos,
             "days": days,
         }
@@ -160,15 +176,16 @@ def make_dataloader(cfg_data: DictConfig, cfg_split: DictConfig, seed: int):
         channels=cfg_data.channels,
         vocab_size=cfg_data.vocab_size,
         anno=cfg_data.anno,
+        rollout_size=cfg_data.rollout_size,
         limit=cfg_split.get("samples_num", None),
-        should_augment=cfg_split.should_augment,
+        should_augment=cfg_split.get("should_augment", False),
     )
 
     dataloader = DataLoader(
         dataset,
         batch_size=cfg_split.batch_size,
         num_workers=cfg_split.workers_num,
-        shuffle=cfg_split.should_augment,
+        shuffle=cfg_split.get("should_augment", False),
         pin_memory=True,
         drop_last=True,
         persistent_workers=cfg_split.workers_num > 0,
