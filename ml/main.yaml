@@ -1,23 +1,30 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-mlp-vel-gamma95-epochs"
-  experiment_dir: "${oc.env:EXP_DIR}/spider/${general.experiment_name}"
+  experiment_name: "train-rl-llama"
+  experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
   pretrained_path: null
   device: "cuda:0"
   method: "rl"
   lr: 1e-3
-  batch_size: 64
+  batch_size: 8
   gamma: 0.95
   # network
   agent:
-    window_size: 4096
-    vocab_size: 128
-    hidden_dim: 256
-    goals_dim: 3
-    obs_dim: 15
-    actions_dim: 8
+    batch_size: 8
+    seq_size: 4096
+    ctx_size: 2
+    channels: 1
+    sequence:
+      seq_size: ${model.seq_size}
+      ctx_size: ${model.ctx_size}
+      channels: ${model.channels}
+      vocab_size: 4096
+      layers_num: 4
+      heads_num: 8
+      embed_dim: 256
+      batch_size: ${model.batch_size}
   critic: ${model.agent}
   # loss
   loss_weights:

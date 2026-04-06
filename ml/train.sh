@@ -5,7 +5,7 @@ blue=$(tput setaf 4)
 reset=$(tput sgr0)
 
 main() {
-  if [ -z "$SPIDER_AUTO_COMPLETE" ]; then
+  if [ -z "$TRADING_AUTO_COMPLETE" ]; then
     echo "${red} auto_complete.zsh not sourced. Run:${reset}"
     echo "${red} source ./auto_complete.bash${reset}"
     exit 1

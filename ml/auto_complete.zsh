@@ -63,4 +63,4 @@ compdef _train train.sh
 compdef _list_projects delete_experiment_safely.sh
 compdef _list_projects copy_experiment.sh
 
-export SPIDER_AUTO_COMPLETE=1
+export TRADING_AUTO_COMPLETE=1
