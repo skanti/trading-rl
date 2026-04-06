@@ -1,0 +1,14 @@
+
+# hidden files
+.*
+
+# generated files
+MUJOCO_LOG.TXT
+__pycache__/
+.DS_Store
+outputs
+
+# except gitignore file
+!.gitignore
+!.gitattributes
+

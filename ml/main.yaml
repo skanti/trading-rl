@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+general:
+  experiment_name: "train-rl-mlp-vel-gamma95-epochs"
+  experiment_dir: "${oc.env:EXP_DIR}/spider/${general.experiment_name}"
+model:
+  pretrained_path: null
+  device: "cuda:0"
+  method: "rl"
+  lr: 1e-3
+  batch_size: 64
+  gamma: 0.95
+  # network
+  agent:
+    window_size: 4096
+    vocab_size: 128
+    hidden_dim: 256
+    goals_dim: 3
+    obs_dim: 15
+    actions_dim: 8
+  critic: ${model.agent}
+  # loss
+  loss_weights:
+    policy: 1.0
+    value: 1.0
+    entropy: 0.01
+data:
+  seq_size: ${model.seq_size}
+  ctx_size: ${model.ctx_size}
+  channels: ${model.channels}
+  vocab_size: ${model.sequence.vocab_size}
+  anno: "2010-01-01"
+  mapping_path: "${oc.env:DATA_DIR}/ppv1/ppv1_2025-07-20_mapping.txt"
+  days_path: "${oc.env:DATA_DIR}/ppv1/ppv1_2025-10-04_days.csv"
+  data_dir: "${oc.env:DATA_DIR}/ppv1/ppv1_2025-10-04"
+  date_val: "2025-09-29"
+train:
+  batch_size: ${model.batch_size}
+  steps_num: 5e4
+  workers_num: 8
+  split: "train"
+val:
+  batch_size: ${model.batch_size}
+  workers_num: 0
+  split: "val"
+loop:
+  # logger
+  log_interval: 20
+  save_interval: 100
+  checkpoint_interval: 5000

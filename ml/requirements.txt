@@ -1,0 +1,8 @@
+torch
+numpy
+einops
+tqdm
+pandas
+rich
+omegaconf
+fsspec
