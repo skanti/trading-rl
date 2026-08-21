@@ -7,8 +7,8 @@ MUJOCO_LOG.TXT
 __pycache__/
 .DS_Store
 outputs
+/ml/artifacts/
 
 # except gitignore file
 !.gitignore
 !.gitattributes
-

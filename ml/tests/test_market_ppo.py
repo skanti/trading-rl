@@ -7,16 +7,15 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-import llama
-from dataset import TokLoader
-from tokenizer import Tokenizer
+import model
+from dataset import MarketDayDataset
 from train import (
-    LlamaActor,
-    LlamaCritic,
-    RolloutBatch,
-    batch_to_rollout,
-    discounted_returns,
+    FEATURE_DIM,
+    build_market_features,
+    collect_rollout,
+    generalized_advantages,
     market_rewards,
+    performance_metrics,
     ppo_update,
     regular_session_mask,
 )
@@ -27,119 +26,125 @@ ANNO = "2010-01-01"
 
 def et_seconds(ts: str) -> int:
     dt = pd.Timestamp(ts, tz="US/Eastern").tz_convert("UTC")
-    origin = pd.Timestamp(ANNO, tz="UTC")
-    return int((dt - origin).total_seconds())
+    return int((dt - pd.Timestamp(ANNO, tz="UTC")).total_seconds())
 
 
-def tiny_model_args(block_size: int = 6) -> llama.ModelArgs:
-    return llama.ModelArgs(
-        batch_size=4,
-        block_size=block_size,
-        vocab_size=64,
-        n_layer=1,
-        n_head=2,
-        dim=16,
-        intermediate_size=32,
-    )
+class ConstantActor(model.TradingActor):
+    def __init__(self, window_size: int, action: int):
+        super().__init__(window_size, hidden_dim=8, depth=1)
+        self.constant_action = action
+
+    @torch.no_grad()
+    def play(self, inputs: torch.Tensor, sampling: str = "multinomial") -> torch.Tensor:
+        return torch.full(inputs.shape[:-2], self.constant_action, dtype=torch.long, device=inputs.device)
 
 
 class MarketPPOTest(unittest.TestCase):
-    def test_tokenizer_uses_price_volume_only(self):
+    def test_action_space_is_flat_plus_five_sizes_each_direction(self):
+        actions = torch.arange(model.ACTION_DIM)
+        positions = model.action_to_position(actions)
+        self.assertEqual(positions.tolist(), list(range(-5, 6)))
+        self.assertTrue(torch.equal(model.position_to_action(positions), actions))
+        self.assertEqual(model.position_to_action(torch.tensor([0])).item(), 5)
+
+    def test_models_are_flat_window_mlps(self):
+        actor = model.TradingActor(window_size=8, hidden_dim=16, depth=2)
+        critic = model.TradingCritic(window_size=8, hidden_dim=16, depth=2)
+        inputs = torch.randn(3, 4, 8, FEATURE_DIM)
+        self.assertEqual(actor(inputs).shape, (3, 4, 11))
+        self.assertEqual(critic(inputs).shape, (3, 4))
+        self.assertFalse(any("transformer" in type(module).__name__.lower() for module in actor.modules()))
+
+    def test_price_features_are_invariant_to_absolute_symbol_scale(self):
+        prices = torch.tensor([[10.0, 10.1, 10.0, 10.2, 10.3, 10.4]])
+        volumes = torch.tensor([[10.0, 20.0, 15.0, 30.0, 25.0, 40.0]])
+        progress = torch.linspace(-1, 1, 6).reshape(1, -1)
+        a = build_market_features(prices, volumes, progress, window_size=4, rollout_size=2)
+        b = build_market_features(prices * 137.0, volumes, progress, window_size=4, rollout_size=2)
+        self.assertTrue(torch.allclose(a, b, atol=2e-4))
+
+    def test_rollout_is_autoregressive_over_selected_positions(self):
+        # Action 10 maps to long size five. It is absent from the initial state
+        # and appears at the newest tick of the next state.
+        actor = ConstantActor(window_size=4, action=10)
+        prices = torch.arange(100.0, 106.0).reshape(1, -1)
+        volumes = torch.ones_like(prices)
+        progress = torch.linspace(-1, 1, 6).reshape(1, -1)
+        rollout = collect_rollout(actor, prices, volumes, progress, rollout_size=2)
+        self.assertTrue(rollout.states[:, 0, :, -1].eq(0).all())
+        self.assertEqual(rollout.states[0, 1, -1, -1].item(), 1.0)
+        self.assertEqual(rollout.positions.tolist(), [[5, 5]])
+
+    def test_rewards_charge_resizing_and_force_close(self):
+        positions = torch.tensor([[5, 2, 0], [-5, -5, -5]])
+        now = torch.tensor([[100.0, 101.0, 102.0], [100.0, 99.0, 98.0]])
+        nxt = torch.tensor([[101.0, 102.0, 103.0], [99.0, 98.0, 97.0]])
+        rewards, info = market_rewards(positions, now, nxt, transaction_cost=0.001)
+        self.assertGreater(rewards.sum().item(), 0.0)
+        self.assertEqual(info["forced_closes"].tolist(), [False, True])
+        self.assertEqual(info["end_positions"].tolist(), [0.0, 0.0])
+        self.assertAlmostEqual(info["costs"][0].sum().item(), 0.002, places=6)
+
+        flat_reward, _ = market_rewards(torch.zeros_like(positions), now, nxt, risk_penalty=0.1)
+        exposed_reward, exposed_info = market_rewards(positions, now, nxt, risk_penalty=0.1)
+        self.assertTrue(exposed_info["risk_costs"].ge(0).all())
+        self.assertGreater(flat_reward.sum().item(), exposed_reward.sum().item())
+
+    def test_performance_metrics_track_return_profit_factor_and_drawdown(self):
+        rewards = torch.tensor([[0.10, -0.04, 0.02], [-0.02, 0.01, 0.01]])
+        metrics = performance_metrics(rewards)
+        self.assertAlmostEqual(metrics["return"], 0.04, places=6)
+        self.assertAlmostEqual(metrics["profit_factor"], 0.14 / 0.06, places=5)
+        self.assertAlmostEqual(metrics["max_drawdown"], 0.04, places=6)
+
+    def test_dataset_returns_raw_window_without_symbol_or_absolute_context(self):
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            secs = np.array([et_seconds(f"2025-01-02 09:{30 + i:02d}:00") for i in range(4)], dtype=np.int32)
-            price = np.array([100000, 100100, 100200, 100300], dtype=np.int32)
-            volume = np.array([1, 4, 9, 16], dtype=np.int32)
-            ignored_num = np.array([10, 20, 30, 40], dtype=np.int32)
-            arr = np.stack([secs, price, volume, ignored_num], axis=1)
-
-            npy_path = tmp_path / "ABC.npy"
-            np.save(npy_path, arr)
-
-            tokenizer = Tokenizer(anno=ANNO, mapping={"ABC": 0}, seq_size=4, ctx_size=2, channels=2, vocab_size=128)
-            tokenizer.parse(str(npy_path), np.arange(4))
-            ctx, seq, ts = tokenizer.tokenize()
-
-            arr[:, 3] = 9999
-            np.save(npy_path, arr)
-            tokenizer.parse(str(npy_path), np.arange(4))
-            _, seq_num_changed, _ = tokenizer.tokenize()
-
-            self.assertEqual(ctx.shape, (2,))
-            self.assertEqual(seq.shape, (8,))
-            self.assertEqual(ts.shape, (8, 5))
-            self.assertTrue(np.array_equal(seq, seq_num_changed))
-
-    def test_actor_critic_are_separate_last_token_models(self):
-        torch.manual_seed(0)
-        actor = LlamaActor(tiny_model_args())
-        critic = LlamaCritic(tiny_model_args())
-        actor_ptrs = {p.data_ptr() for p in actor.parameters()}
-        critic_ptrs = {p.data_ptr() for p in critic.parameters()}
-
-        def fail_next_token(*args, **kwargs):
-            raise AssertionError("next_token should not be used for PPO")
-
-        actor.backbone.next_token = fail_next_token
-        ctx = torch.tensor([[0.0, 100.0], [1.0, 101.0]])
-        seq = torch.randint(0, 64, (2, 4))
-        ts = torch.zeros((2, 4, 5), dtype=torch.long)
-
-        logits = actor(ctx=ctx, seq=seq, ts=ts)
-        values = critic(ctx=ctx, seq=seq, ts=ts)
-
-        self.assertEqual(logits.shape, (2, 3))
-        self.assertEqual(values.shape, (2,))
-        self.assertTrue(actor_ptrs.isdisjoint(critic_ptrs))
-
-    def test_batch_to_rollout_uses_seq_size_times_channels_context(self):
-        batch = {
-            "ctx": torch.tensor([[0.0, 100.0]]),
-            "seq": torch.arange(12).reshape(1, 12),
-            "ts": torch.zeros((1, 12, 5), dtype=torch.long),
-            "prices": torch.tensor([[10.0, 11.0, 12.0, 13.0, 14.0, 15.0]]),
-            "secs": torch.tensor([[et_seconds(f"2025-01-02 09:{30 + i:02d}:00") for i in range(6)]]),
-        }
-        cfg_data = OmegaConf.create({"seq_size": 4, "channels": 2, "rollout_size": 2})
-
-        rollout = batch_to_rollout(batch=batch, cfg_data=cfg_data, device="cpu")
-
-        self.assertEqual(rollout.seq.shape, (2, 8))
-        self.assertEqual(rollout.ts.shape, (2, 8, 5))
-        self.assertEqual(rollout.price_now.tolist(), [[13.0, 14.0]])
-        self.assertEqual(rollout.price_next.tolist(), [[14.0, 15.0]])
-
-    def test_tokloader_returns_context_plus_rollout(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            secs = np.array([et_seconds(f"2025-01-02 09:{27 + i:02d}:00") for i in range(8)], dtype=np.int32)
-            price = np.arange(100000, 100800, 100, dtype=np.int32)
-            volume = np.ones(8, dtype=np.int32)
-            ignored_num = np.arange(8, dtype=np.int32)
-            np.save(tmp_path / "ABC.npy", np.stack([secs, price, volume, ignored_num], axis=1))
-            days = pd.DataFrame(
-                [{"sample_id": "ABC", "date": pd.Timestamp("2025-01-02"), "sod_idx": 3, "eod_idx": 7}]
-            )
-            loader = TokLoader(
-                days=days,
-                mapping={"ABC": 0},
-                data_dir=str(tmp_path),
-                seq_size=4,
-                ctx_size=2,
-                channels=2,
-                vocab_size=128,
-                anno=ANNO,
-                rollout_size=2,
-                should_augment=False,
-            )
-
-            item = loader[0]
-
-            self.assertEqual(item["seq"].shape, (12,))
-            self.assertEqual(item["ts"].shape, (12, 5))
+            path = Path(tmp)
+            secs = np.array([et_seconds(f"2025-01-02 09:{27 + i:02d}:00") for i in range(8)], dtype=np.int64)
+            raw = np.stack((secs, np.arange(100000, 100800, 100), np.arange(1, 9), np.arange(8)), axis=1)
+            np.save(path / "ABC.npy", raw)
+            days = pd.DataFrame([{"sample_id": "ABC", "sod_idx": 3, "eod_idx": 7}])
+            dataset = MarketDayDataset(days, str(path), window_size=4, rollout_size=2)
+            item = dataset[0]
+            self.assertEqual(set(item), {"_id", "prices", "volumes", "secs"})
             self.assertEqual(item["prices"].shape, (6,))
+            self.assertAlmostEqual(item["prices"][0], 100.0)
 
-    def test_market_hours_and_forced_close(self):
+    def test_full_session_dataset_filters_incomplete_days_and_starts_at_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            raw = np.stack(
+                (
+                    np.arange(12, dtype=np.int64),
+                    np.arange(100000, 101200, 100),
+                    np.arange(1, 13),
+                ),
+                axis=1,
+            )
+            np.save(path / "FULL.npy", raw)
+            np.save(path / "SHORT.npy", raw)
+            days = pd.DataFrame(
+                [
+                    {"sample_id": "FULL", "ctx_idx": 0, "sod_idx": 3, "eod_idx": 7},
+                    {"sample_id": "SHORT", "ctx_idx": 0, "sod_idx": 3, "eod_idx": 6},
+                ]
+            )
+            dataset = MarketDayDataset(
+                days,
+                str(path),
+                window_size=4,
+                rollout_size=4,
+                should_augment=True,
+                require_full_session=True,
+            )
+            self.assertEqual(len(dataset), 1)
+            item = dataset[0]
+            self.assertEqual(item["_id"], "FULL")
+            self.assertEqual(item["prices"].shape, (8,))
+            self.assertAlmostEqual(item["prices"][3], 100.3, places=4)
+            self.assertAlmostEqual(item["prices"][-1], 100.7, places=4)
+
+    def test_market_hours(self):
         secs = torch.tensor(
             [
                 et_seconds("2025-01-02 09:29:00"),
@@ -148,75 +153,40 @@ class MarketPPOTest(unittest.TestCase):
                 et_seconds("2025-01-02 16:01:00"),
             ]
         )
-        mask = regular_session_mask(secs, ANNO)
-        self.assertEqual(mask.tolist(), [False, True, True, False])
-
-        actions = torch.tensor([[2, 2], [0, 0]])
-        price_now = torch.tensor([[100.0, 101.0], [100.0, 101.0]])
-        price_next = torch.tensor([[101.0, 102.0], [101.0, 102.0]])
-        rewards, info = market_rewards(actions, price_now, price_next, transaction_cost=0.0)
-
-        self.assertGreater(rewards[0].sum().item(), 0)
-        self.assertLess(rewards[1].sum().item(), 0)
-        self.assertEqual(info["forced_closes"].tolist(), [True, True])
-        self.assertEqual(info["end_positions"].tolist(), [0.0, 0.0])
+        self.assertEqual(regular_session_mask(secs, ANNO).tolist(), [False, True, True, False])
 
     def test_ppo_update_cpu_sanity(self):
         torch.manual_seed(0)
-        actor = LlamaActor(tiny_model_args())
-        critic = LlamaCritic(tiny_model_args())
+        actor = model.TradingActor(window_size=4, hidden_dim=16, depth=1)
+        critic = model.TradingCritic(window_size=4, hidden_dim=16, depth=1)
         optimizer = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=1e-3)
-
-        b, t, context_tokens = 2, 2, 4
-        rollout = RolloutBatch(
-            ctx=torch.tensor([[0.0, 100.0]] * (b * t)),
-            seq=torch.randint(0, 64, (b * t, context_tokens)),
-            ts=torch.zeros((b * t, context_tokens, 5), dtype=torch.long),
-            price_now=torch.tensor([[100.0, 101.0], [100.0, 101.0]]),
-            price_next=torch.tensor([[101.0, 100.0], [99.0, 102.0]]),
-            secs_now=torch.zeros((b, t), dtype=torch.long),
-            secs_next=torch.zeros((b, t), dtype=torch.long),
-            batch_size=b,
-            rollout_size=t,
-        )
+        prices = torch.tensor([[100.0, 101.0, 102.0, 103.0, 104.0, 105.0]]).repeat(2, 1)
+        volumes = torch.ones_like(prices)
+        progress = torch.linspace(-1, 1, 6).repeat(2, 1)
+        rollout = collect_rollout(actor, prices, volumes, progress, rollout_size=2)
         with torch.no_grad():
-            dist = actor.distribution(rollout.ctx, rollout.seq, rollout.ts)
-            actions_flat = dist.sample()
-            logprobs_old = dist.log_prob(actions_flat).reshape(b, t)
-            values_old = critic(rollout.ctx, rollout.seq, rollout.ts).reshape(b, t)
-
-        actions = actions_flat.reshape(b, t)
-        rewards, _ = market_rewards(actions, rollout.price_now, rollout.price_next)
-        returns = discounted_returns(rewards, gamma=0.9)
-        advantages = returns - values_old
-        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+            old_dist = actor.distribution(rollout.states)
+            old_logprobs = old_dist.log_prob(rollout.actions)
+            old_values = critic(rollout.states)
+            advantages, returns = generalized_advantages(rollout.rewards, old_values, 0.99, 0.95)
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
         cfg = OmegaConf.create(
             {
                 "model": {
-                    "loss_weights": {"policy": 1.0, "value": 1.0, "entropy": 0.01},
+                    "loss_weights": {"policy": 1.0, "value": 0.5, "entropy": 0.01},
                     "ppo_clip": 0.2,
                     "ppo_value_clip": 0.2,
                     "max_grad_norm": 1.0,
+                    "entropy_target": 2.5,
                 },
                 "train": {"ppo_epochs": 1},
             }
         )
         before = [p.detach().clone() for p in actor.parameters()]
-
-        losses = ppo_update(
-            actor=actor,
-            critic=critic,
-            optimizer=optimizer,
-            rollout=rollout,
-            actions=actions,
-            logprobs_old=logprobs_old,
-            values_old=values_old,
-            returns=returns,
-            advantages=advantages,
-            cfg=cfg,
-        )
-
-        self.assertTrue(all(np.isfinite(v) for v in losses.values()))
+        losses = ppo_update(actor, critic, optimizer, rollout, old_logprobs, old_values, returns, advantages, cfg)
+        self.assertTrue(all(np.isfinite(value) for value in losses.values()))
+        self.assertGreater(losses["loss_entropy"], 0.0)
+        self.assertLessEqual(losses["entropy"], np.log(model.ACTION_DIM) + 1e-6)
         self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, actor.parameters())))
 
 
