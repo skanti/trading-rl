@@ -43,7 +43,7 @@ data:
   date_val: "2025-12-01"
   enforce_market_hours: true
 train:
-  batch_size: 8
+  batch_size: 16
   steps_num: 50000
   ppo_epochs: 4
   workers_num: 8

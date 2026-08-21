@@ -38,7 +38,7 @@ _train() {
 
   # Collect YAMLs (relative to the script dir), then present paths
   # relative to the current working directory for nicer display.
-  yamls=(${(f)"$(command find "$basedir" -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)"})
+  yamls=(${(f)"$(command find "$basedir" -type f \( -name '*.yaml' -o -name '*.yml' \) ! -path '*/.*' 2>/dev/null)"})
   # De-duplicate and map to paths relative to $PWD
   typeset -aU yamls
   yamls=("${yamls[@]/#${PWD}\//}")

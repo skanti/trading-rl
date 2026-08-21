@@ -429,6 +429,7 @@ def main(cfg: DictConfig) -> None:
             csv_logger.write(
                 {
                     "step": step + 1,
+                    "stage": 0,
                     "timestamp": time.time(),
                     "lr": scheduler.get_last_lr()[0],
                     **rollout_metrics(rollout),
