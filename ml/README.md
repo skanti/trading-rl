@@ -47,9 +47,11 @@ bonus. There is no target-entropy floor or entropy schedule.
 
 The online toy provider samples three or four random log-price anchors, fits a
 quadratic or cubic Bezier curve through them, samples a full price path from the
-curve, and adds observation noise. Absolute price is independently randomized
-over two orders of magnitude. Training batches are generated in memory and are
-never written to disk; evaluation uses a fixed seed and a held-out batch.
+curve, and adds IID innovations to its log returns before integrating them into
+price. This avoids the predictable mean reversion produced by independent
+price-level noise. Absolute price is independently randomized over two orders
+of magnitude. Training batches are generated in memory and are never written
+to disk; evaluation uses a fixed seed and a held-out batch.
 
 The normal trainer selects this provider when `data.use_toy: true`. Set it to
 `false` to load the configured market-day files instead. Toy mode uses the same

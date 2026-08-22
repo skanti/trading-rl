@@ -84,11 +84,28 @@ class MarketPPOTest(unittest.TestCase):
 
         self.assertEqual(first.prices.shape, (32, 12))
         self.assertEqual(first.target_positions.shape, (32, 4))
+        self.assertEqual(first.latent_returns.shape, (32, 11))
         self.assertTrue(first.prices.gt(0).all())
         self.assertTrue(first.anchor_counts.ge(3).logical_and(first.anchor_counts.le(4)).all())
         self.assertTrue(first.target_positions.ge(-1).logical_and(first.target_positions.le(1)).all())
         self.assertTrue(torch.equal(first.prices, repeated.prices))
         self.assertFalse(torch.equal(first.prices, fresh.prices))
+
+    def test_bezier_noise_is_an_unpredictable_integrated_return_innovation(self):
+        provider = OnlineBezierToyProvider(window_size=8, rollout_size=4, return_noise_std=3e-4)
+        batch = provider.sample(2048, "cpu", torch.Generator().manual_seed(321))
+        observed_returns = torch.log(batch.prices[:, 1:] / batch.prices[:, :-1])
+        innovations = observed_returns - batch.latent_returns
+
+        variance = innovations.square().mean()
+        lag_one_correlation = (innovations[:, 1:] * innovations[:, :-1]).mean() / variance
+        self.assertAlmostEqual(variance.sqrt().item(), 3e-4, delta=1e-5)
+        self.assertLess(abs(lag_one_correlation.item()), 0.03)
+
+        clean = OnlineBezierToyProvider(window_size=8, rollout_size=4, return_noise_std=0.0)
+        clean_batch = clean.sample(32, "cpu", torch.Generator().manual_seed(123))
+        clean_returns = torch.log(clean_batch.prices[:, 1:] / clean_batch.prices[:, :-1])
+        self.assertTrue(torch.allclose(clean_returns, clean_batch.latent_returns, atol=2e-6))
 
     def test_rollout_is_autoregressive_over_selected_positions(self):
         # Buy opens a unit long. Repeating buy at the upper bound is a no-op,

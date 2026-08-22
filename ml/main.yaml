@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-mlp-4k-3action-bezier-toy"
+  experiment_name: "train-rl-mlp-4k-3action-bezier-integrated-noise"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
   pretrained_path: null
@@ -43,7 +43,8 @@ data:
   date_val: "2025-12-01"
   enforce_market_hours: true
   toy:
-    noise_std: 3e-4
+    # IID innovations are added to log returns, then integrated into price.
+    return_noise_std: 3e-4
     # Per-tick threshold is smaller than toy_train.py's because this curve is
     # sampled across 4,486 rather than 44 points.
     flat_return_threshold: 2.5e-6

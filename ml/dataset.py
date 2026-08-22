@@ -28,25 +28,31 @@ class BezierToyBatch:
     progress: torch.Tensor
     target_positions: torch.Tensor
     anchor_counts: torch.Tensor
+    latent_returns: torch.Tensor
 
 
 class OnlineBezierToyProvider:
-    """Generate fresh scale-randomized noisy Bezier curves in memory."""
+    """Generate fresh Bezier trends with integrated return noise in memory.
+
+    Noise is added to log returns and cumulatively integrated into prices. IID
+    innovations are therefore unpredictable from the current observation and
+    do not create the mechanical mean reversion caused by IID price-level noise.
+    """
 
     def __init__(
         self,
         window_size: int,
         rollout_size: int,
-        noise_std: float = 3e-4,
+        return_noise_std: float = 3e-4,
         flat_return_threshold: float = 2.5e-4,
     ):
         if window_size < 2 or rollout_size < 1:
             raise ValueError("window_size must be >= 2 and rollout_size must be >= 1")
-        if noise_std < 0 or flat_return_threshold < 0:
-            raise ValueError("noise_std and flat_return_threshold must be non-negative")
+        if return_noise_std < 0 or flat_return_threshold < 0:
+            raise ValueError("return_noise_std and flat_return_threshold must be non-negative")
         self.window_size = int(window_size)
         self.rollout_size = int(rollout_size)
-        self.noise_std = float(noise_std)
+        self.return_noise_std = float(return_noise_std)
         self.flat_return_threshold = float(flat_return_threshold)
 
     @property
@@ -97,15 +103,23 @@ class OnlineBezierToyProvider:
             if count:
                 latent_log_prices[selected] = self._sample_curve(anchor_count, count, device, generator)
 
+        latent_returns = latent_log_prices[:, 1:] - latent_log_prices[:, :-1]
+        return_innovations = torch.randn(
+            batch_size, self.ticks - 1, device=device, generator=generator
+        ) * self.return_noise_std
+        observed_log_returns = latent_returns + return_innovations
+        observed_log_prices = torch.cat(
+            (
+                latent_log_prices[:, :1],
+                latent_log_prices[:, :1] + observed_log_returns.cumsum(dim=1),
+            ),
+            dim=1,
+        )
         base_log_price = torch.empty(batch_size, 1, device=device).uniform_(
             np.log(8.0), np.log(800.0), generator=generator
         )
-        observation_noise = torch.randn(
-            batch_size, self.ticks, device=device, generator=generator
-        ) * self.noise_std
-        prices = torch.exp(base_log_price + latent_log_prices + observation_noise)
+        prices = torch.exp(base_log_price + observed_log_prices)
 
-        latent_returns = latent_log_prices[:, 1:] - latent_log_prices[:, :-1]
         future_returns = latent_returns[
             :, self.window_size - 1 : self.window_size - 1 + self.rollout_size
         ]
@@ -118,10 +132,10 @@ class OnlineBezierToyProvider:
         volume_noise = torch.randn(
             batch_size, self.ticks, device=device, generator=generator
         ) * 0.35
-        observed_returns = torch.nn.functional.pad(prices[:, 1:] / prices[:, :-1] - 1.0, (1, 0))
-        volumes = torch.exp(6.0 + volume_noise + 10.0 * observed_returns.abs())
+        padded_returns = torch.nn.functional.pad(observed_log_returns, (1, 0))
+        volumes = torch.exp(6.0 + volume_noise + 10.0 * padded_returns.abs())
         progress = torch.linspace(-1.0, 1.0, self.ticks, device=device).expand(batch_size, -1)
-        return BezierToyBatch(prices, volumes, progress, target_positions, anchor_counts)
+        return BezierToyBatch(prices, volumes, progress, target_positions, anchor_counts, latent_returns)
 
 
 class MarketDayDataset(Dataset):

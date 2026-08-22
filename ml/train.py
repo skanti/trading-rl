@@ -375,7 +375,7 @@ def main(cfg: DictConfig) -> None:
         toy_provider = OnlineBezierToyProvider(
             window_size=n,
             rollout_size=t,
-            noise_std=float(toy_cfg.get("noise_std", 3e-4)),
+            return_noise_std=float(toy_cfg.get("return_noise_std", 3e-4)),
             flat_return_threshold=float(toy_cfg.get("flat_return_threshold", 2.5e-4)),
         )
         logger.info(
