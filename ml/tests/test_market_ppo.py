@@ -8,7 +8,7 @@ import torch
 from omegaconf import OmegaConf
 
 import model
-from dataset import MarketDayDataset
+from dataset import MarketDayDataset, OnlineBezierToyProvider
 from train import (
     FEATURE_DIM,
     build_market_features,
@@ -40,18 +40,29 @@ class ConstantActor(model.TradingActor):
 
 
 class MarketPPOTest(unittest.TestCase):
-    def test_action_space_is_flat_plus_five_sizes_each_direction(self):
-        actions = torch.arange(model.ACTION_DIM)
-        positions = model.action_to_position(actions)
-        self.assertEqual(positions.tolist(), list(range(-5, 6)))
-        self.assertTrue(torch.equal(model.position_to_action(positions), actions))
-        self.assertEqual(model.position_to_action(torch.tensor([0])).item(), 5)
+    def test_actions_move_bounded_inventory_one_step(self):
+        previous = torch.tensor([0, 1, 1, 0, -1, -1, 1, -1])
+        actions = torch.tensor(
+            [
+                model.BUY_ACTION,
+                model.BUY_ACTION,
+                model.SELL_ACTION,
+                model.SELL_ACTION,
+                model.SELL_ACTION,
+                model.BUY_ACTION,
+                model.NOTHING_ACTION,
+                model.NOTHING_ACTION,
+            ]
+        )
+        self.assertEqual(model.ACTION_DIM, 3)
+        self.assertEqual(model.ACTION_NAMES, ("buy", "nothing", "sell"))
+        self.assertEqual(model.apply_action(previous, actions).tolist(), [1, 1, 0, -1, -1, 0, 1, -1])
 
     def test_models_are_flat_window_mlps(self):
         actor = model.TradingActor(window_size=8, hidden_dim=16, depth=2)
         critic = model.TradingCritic(window_size=8, hidden_dim=16, depth=2)
         inputs = torch.randn(3, 4, 8, FEATURE_DIM)
-        self.assertEqual(actor(inputs).shape, (3, 4, 11))
+        self.assertEqual(actor(inputs).shape, (3, 4, 3))
         self.assertEqual(critic(inputs).shape, (3, 4))
         self.assertFalse(any("transformer" in type(module).__name__.lower() for module in actor.modules()))
 
@@ -63,20 +74,37 @@ class MarketPPOTest(unittest.TestCase):
         b = build_market_features(prices * 137.0, volumes, progress, window_size=4, rollout_size=2)
         self.assertTrue(torch.allclose(a, b, atol=2e-4))
 
+    def test_online_bezier_provider_is_fresh_bounded_and_reproducible(self):
+        provider = OnlineBezierToyProvider(window_size=8, rollout_size=4)
+        first_generator = torch.Generator().manual_seed(123)
+        repeated_generator = torch.Generator().manual_seed(123)
+        first = provider.sample(32, "cpu", first_generator)
+        repeated = provider.sample(32, "cpu", repeated_generator)
+        fresh = provider.sample(32, "cpu")
+
+        self.assertEqual(first.prices.shape, (32, 12))
+        self.assertEqual(first.target_positions.shape, (32, 4))
+        self.assertTrue(first.prices.gt(0).all())
+        self.assertTrue(first.anchor_counts.ge(3).logical_and(first.anchor_counts.le(4)).all())
+        self.assertTrue(first.target_positions.ge(-1).logical_and(first.target_positions.le(1)).all())
+        self.assertTrue(torch.equal(first.prices, repeated.prices))
+        self.assertFalse(torch.equal(first.prices, fresh.prices))
+
     def test_rollout_is_autoregressive_over_selected_positions(self):
-        # Action 10 maps to long size five. It is absent from the initial state
-        # and appears at the newest tick of the next state.
-        actor = ConstantActor(window_size=4, action=10)
+        # Buy opens a unit long. Repeating buy at the upper bound is a no-op,
+        # and the held position appears at the newest tick of the next state.
+        actor = ConstantActor(window_size=4, action=model.BUY_ACTION)
         prices = torch.arange(100.0, 106.0).reshape(1, -1)
         volumes = torch.ones_like(prices)
         progress = torch.linspace(-1, 1, 6).reshape(1, -1)
         rollout = collect_rollout(actor, prices, volumes, progress, rollout_size=2)
         self.assertTrue(rollout.states[:, 0, :, -1].eq(0).all())
         self.assertEqual(rollout.states[0, 1, -1, -1].item(), 1.0)
-        self.assertEqual(rollout.positions.tolist(), [[5, 5]])
+        self.assertEqual(rollout.positions.tolist(), [[1, 1]])
+        self.assertEqual(rollout.trades.tolist(), [[True, False]])
 
-    def test_rewards_charge_resizing_and_force_close(self):
-        positions = torch.tensor([[5, 2, 0], [-5, -5, -5]])
+    def test_rewards_charge_position_changes_and_force_close(self):
+        positions = torch.tensor([[1, 0, 0], [-1, -1, -1]])
         now = torch.tensor([[100.0, 101.0, 102.0], [100.0, 99.0, 98.0]])
         nxt = torch.tensor([[101.0, 102.0, 103.0], [99.0, 98.0, 97.0]])
         rewards, info = market_rewards(positions, now, nxt, transaction_cost=0.001)
@@ -177,7 +205,6 @@ class MarketPPOTest(unittest.TestCase):
                     "ppo_clip": 0.2,
                     "ppo_value_clip": 0.2,
                     "max_grad_norm": 1.0,
-                    "entropy_target": 2.5,
                 },
                 "train": {"ppo_epochs": 1},
             }
@@ -185,7 +212,8 @@ class MarketPPOTest(unittest.TestCase):
         before = [p.detach().clone() for p in actor.parameters()]
         losses = ppo_update(actor, critic, optimizer, rollout, old_logprobs, old_values, returns, advantages, cfg)
         self.assertTrue(all(np.isfinite(value) for value in losses.values()))
-        self.assertGreater(losses["loss_entropy"], 0.0)
+        self.assertLess(losses["loss_entropy"], 0.0)
+        self.assertAlmostEqual(losses["loss_entropy"], -losses["entropy"], places=6)
         self.assertLessEqual(losses["entropy"], np.log(model.ACTION_DIM) + 1e-6)
         self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, actor.parameters())))
 

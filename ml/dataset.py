@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+from dataclasses import dataclass
 from datetime import datetime
 
 import fsspec
@@ -17,6 +19,109 @@ from torch.utils.data import DataLoader, Dataset
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)
 logger = logging.getLogger("DATASET")
+
+
+@dataclass(frozen=True)
+class BezierToyBatch:
+    prices: torch.Tensor
+    volumes: torch.Tensor
+    progress: torch.Tensor
+    target_positions: torch.Tensor
+    anchor_counts: torch.Tensor
+
+
+class OnlineBezierToyProvider:
+    """Generate fresh scale-randomized noisy Bezier curves in memory."""
+
+    def __init__(
+        self,
+        window_size: int,
+        rollout_size: int,
+        noise_std: float = 3e-4,
+        flat_return_threshold: float = 2.5e-4,
+    ):
+        if window_size < 2 or rollout_size < 1:
+            raise ValueError("window_size must be >= 2 and rollout_size must be >= 1")
+        if noise_std < 0 or flat_return_threshold < 0:
+            raise ValueError("noise_std and flat_return_threshold must be non-negative")
+        self.window_size = int(window_size)
+        self.rollout_size = int(rollout_size)
+        self.noise_std = float(noise_std)
+        self.flat_return_threshold = float(flat_return_threshold)
+
+    @property
+    def ticks(self) -> int:
+        return self.window_size + self.rollout_size
+
+    @staticmethod
+    def _bernstein_matrix(points: torch.Tensor, degree: int) -> torch.Tensor:
+        columns = []
+        for i in range(degree + 1):
+            coefficient = float(math.comb(degree, i))
+            columns.append(coefficient * points.pow(i) * (1.0 - points).pow(degree - i))
+        return torch.stack(columns, dim=-1)
+
+    def _sample_curve(
+        self,
+        anchor_count: int,
+        batch_size: int,
+        device: torch.device,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        degree = anchor_count - 1
+        anchor_steps = torch.randn(
+            batch_size, anchor_count - 1, device=device, generator=generator
+        ) * 0.035
+        anchors = torch.cat(
+            (torch.zeros(batch_size, 1, device=device), anchor_steps.cumsum(dim=1)), dim=1
+        )
+        anchor_u = torch.linspace(0.0, 1.0, anchor_count, device=device)
+        controls = torch.linalg.solve(self._bernstein_matrix(anchor_u, degree), anchors.T).T
+        sample_u = torch.linspace(0.0, 1.0, self.ticks, device=device)
+        return controls @ self._bernstein_matrix(sample_u, degree).T
+
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device | str,
+        generator: torch.Generator | None = None,
+    ) -> BezierToyBatch:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        device = torch.device(device)
+        anchor_counts = torch.randint(3, 5, (batch_size,), device=device, generator=generator)
+        latent_log_prices = torch.empty(batch_size, self.ticks, device=device)
+        for anchor_count in (3, 4):
+            selected = anchor_counts.eq(anchor_count)
+            count = int(selected.sum().item())
+            if count:
+                latent_log_prices[selected] = self._sample_curve(anchor_count, count, device, generator)
+
+        base_log_price = torch.empty(batch_size, 1, device=device).uniform_(
+            np.log(8.0), np.log(800.0), generator=generator
+        )
+        observation_noise = torch.randn(
+            batch_size, self.ticks, device=device, generator=generator
+        ) * self.noise_std
+        prices = torch.exp(base_log_price + latent_log_prices + observation_noise)
+
+        latent_returns = latent_log_prices[:, 1:] - latent_log_prices[:, :-1]
+        future_returns = latent_returns[
+            :, self.window_size - 1 : self.window_size - 1 + self.rollout_size
+        ]
+        target_positions = torch.where(
+            future_returns.abs() > self.flat_return_threshold,
+            future_returns.sign(),
+            torch.zeros_like(future_returns),
+        ).to(torch.long)
+
+        volume_noise = torch.randn(
+            batch_size, self.ticks, device=device, generator=generator
+        ) * 0.35
+        observed_returns = torch.nn.functional.pad(prices[:, 1:] / prices[:, :-1] - 1.0, (1, 0))
+        volumes = torch.exp(6.0 + volume_noise + 10.0 * observed_returns.abs())
+        progress = torch.linspace(-1.0, 1.0, self.ticks, device=device).expand(batch_size, -1)
+        return BezierToyBatch(prices, volumes, progress, target_positions, anchor_counts)
 
 
 class MarketDayDataset(Dataset):
@@ -89,7 +194,7 @@ class MarketDayDataset(Dataset):
         context_floor = int(sample.ctx_idx) if "ctx_idx" in sample.index and not pd.isna(sample.ctx_idx) else 0
 
         # The action at last_context_idx receives the preceding N ticks. Every
-        # selected target position must have a subsequent price inside RTH.
+        # selected position must have a subsequent price inside RTH.
         last_context_low = max(sod_idx, context_floor + n - 1)
         last_context_high = eod_idx - t
         if last_context_high < last_context_low:

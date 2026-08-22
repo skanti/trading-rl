@@ -15,13 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from tqdm import tqdm
 
 import model
 import utils
-from dataset import make_dataloader
+from dataset import OnlineBezierToyProvider, make_dataloader
 
 
 logger = logging.getLogger("RL")
@@ -36,7 +36,7 @@ FEATURE_DIM = len(FEATURE_NAMES)
 class MarketRollout:
     states: torch.Tensor  # (batch, rollout, window, features)
     actions: torch.Tensor  # categorical indices (batch, rollout)
-    positions: torch.Tensor  # target levels -5..5 (batch, rollout)
+    positions: torch.Tensor  # held inventory in {-1, 0, +1} (batch, rollout)
     rewards: torch.Tensor
     price_returns: torch.Tensor
     costs: torch.Tensor
@@ -116,10 +116,10 @@ def market_rewards(
     risk_penalty: float = 0.0,
     max_position: int = model.MAX_POSITION,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Mark target positions to market and charge proportional turnover.
+    """Mark positions to market and charge proportional turnover.
 
-    Exposure is normalized so size five is 1.0 and size one is 0.2. A final
-    liquidation charge is always applied when the rollout ends non-flat.
+    Positions are unit short, flat, or unit long. A final liquidation charge
+    is always applied when the rollout ends non-flat.
     """
     if positions.shape != price_now.shape or positions.shape != price_next.shape:
         raise ValueError("positions, price_now, and price_next must have the same shape")
@@ -165,32 +165,35 @@ def collect_rollout(
     market = build_market_features(prices, volumes, progress, n, t_steps, price_feature_scale)
     b = prices.shape[0]
     position_history = torch.zeros((b, n + t_steps), dtype=torch.float32, device=prices.device)
+    current_position = torch.zeros(b, dtype=torch.long, device=prices.device)
     states: list[torch.Tensor] = []
     actions: list[torch.Tensor] = []
+    positions: list[torch.Tensor] = []
 
     for t in range(t_steps):
         action_window = position_history[:, t : t + n].unsqueeze(-1)
         state = torch.cat((market[:, t], action_window), dim=-1)
         action = actor.play(state, sampling=sampling)
-        position = model.action_to_position(action)
+        current_position = model.apply_action(current_position, action)
         states.append(state)
         actions.append(action)
+        positions.append(current_position)
         # At the next observed tick, this records the position that was held
         # over the just-completed price interval.
-        position_history[:, n + t] = position.to(torch.float32) / model.MAX_POSITION
+        position_history[:, n + t] = current_position.to(torch.float32) / model.MAX_POSITION
 
     states_tensor = torch.stack(states, dim=1)
     actions_tensor = torch.stack(actions, dim=1)
-    positions = model.action_to_position(actions_tensor)
+    positions_tensor = torch.stack(positions, dim=1)
     price_now = prices[:, n - 1 : n - 1 + t_steps]
     price_next = prices[:, n : n + t_steps]
     rewards, info = market_rewards(
-        positions, price_now, price_next, transaction_cost=transaction_cost, risk_penalty=risk_penalty
+        positions_tensor, price_now, price_next, transaction_cost=transaction_cost, risk_penalty=risk_penalty
     )
     return MarketRollout(
         states=states_tensor,
         actions=actions_tensor,
-        positions=positions,
+        positions=positions_tensor,
         rewards=rewards,
         price_returns=info["returns"],
         costs=info["costs"],
@@ -251,21 +254,13 @@ def ppo_update(
     for _ in range(ppo_epochs):
         dist = actor.distribution(rollout.states)
         logprobs = dist.log_prob(rollout.actions)
-        entropy = dist.entropy()
-        entropy_mean = entropy.mean()
+        entropy_mean = dist.entropy().mean()
         values = critic(rollout.states)
 
         ratio = torch.exp(logprobs - logprobs_old)
         clipped_ratio = ratio.clamp(1.0 - ppo_clip, 1.0 + ppo_clip)
         loss_policy = -torch.minimum(ratio * advantages, clipped_ratio * advantages).mean()
-        entropy_target = cfg.model.get("entropy_target", None)
-        if entropy_target is None:
-            loss_entropy = -entropy_mean
-        else:
-            # PPO can otherwise become nearly deterministic before it has seen
-            # enough noisy market contexts. Only push entropy upward when a
-            # state's entropy falls below the requested diversity floor.
-            loss_entropy = F.relu(float(entropy_target) - entropy).mean()
+        loss_entropy = -entropy_mean
         values_clipped = values_old + (values - values_old).clamp(-value_clip, value_clip)
         value_unclipped = F.mse_loss(values, returns, reduction="none")
         value_clipped = F.mse_loss(values_clipped, returns, reduction="none")
@@ -283,7 +278,6 @@ def ppo_update(
         "loss_value": float(loss_value.item()),
         "loss_entropy": float(loss_entropy.item()),
         "entropy": float(entropy_mean.item()),
-        "entropy_target": float(entropy_target) if entropy_target is not None else -1.0,
     }
 
 
@@ -372,8 +366,27 @@ def main(cfg: DictConfig) -> None:
     exp_dir = cfg.general.experiment_dir
     os.makedirs(exp_dir, exist_ok=True)
     device = torch.device(cfg.model.device)
-    loader = make_dataloader(cfg.data, cfg.train, int(cfg.train.get("seed", 0)))
-    iterator = utils.cycle(loader)
+    n, t = int(cfg.data.window_size), int(cfg.data.rollout_size)
+    use_toy = bool(cfg.data.get("use_toy", False))
+    toy_provider: OnlineBezierToyProvider | None = None
+    iterator = None
+    if use_toy:
+        toy_cfg = cfg.data.get("toy", {})
+        toy_provider = OnlineBezierToyProvider(
+            window_size=n,
+            rollout_size=t,
+            noise_std=float(toy_cfg.get("noise_std", 3e-4)),
+            flat_return_threshold=float(toy_cfg.get("flat_return_threshold", 2.5e-4)),
+        )
+        logger.info(
+            "Using online Bezier toy data, window_size=%d, rollout_size=%d, batch_size=%d",
+            n,
+            t,
+            int(cfg.train.batch_size),
+        )
+    else:
+        loader = make_dataloader(cfg.data, cfg.train, int(cfg.train.get("seed", 0)))
+        iterator = utils.cycle(loader)
 
     actor = model.TradingActor(**OmegaConf.to_container(cfg.model.actor, resolve=True)).to(device)
     critic = model.TradingCritic(**OmegaConf.to_container(cfg.model.critic, resolve=True)).to(device)
@@ -389,6 +402,11 @@ def main(cfg: DictConfig) -> None:
     if checkpoint_path:
         logger.info("Loading checkpoint, checkpoint_path=%s", checkpoint_path)
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        checkpoint_use_toy = bool(state.get("config", {}).get("data", {}).get("use_toy", False))
+        if checkpoint_use_toy != use_toy:
+            raise ValueError(
+                "checkpoint data source does not match data.use_toy; use a different experiment_name"
+            )
         actor.load_state_dict(state["actor"], strict=True)
         critic.load_state_dict(state["critic"], strict=True)
         optimizer.load_state_dict(state["optimizer"])
@@ -401,27 +419,23 @@ def main(cfg: DictConfig) -> None:
         critic.load_state_dict(state["critic"], strict=True)
 
     total_steps = int(cfg.train.steps_num)
-    entropy_target_schedule = cfg.model.get("entropy_target", None)
-    if isinstance(entropy_target_schedule, ListConfig):
-        entropy_target_schedule = list(entropy_target_schedule)
-    if isinstance(entropy_target_schedule, list) and len(entropy_target_schedule) != 2:
-        raise ValueError("entropy_target schedule must contain [start, end]")
     logger.info("Starting training, global_step=%d, total_steps=%d", start_step, total_steps)
     for step in tqdm(range(start_step, total_steps), desc=cfg.general.experiment_name):
-        if isinstance(entropy_target_schedule, list):
-            cfg.model.entropy_target = float(
-                np.interp(step, [0, max(total_steps - 1, 1)], [float(entropy_target_schedule[0]), float(entropy_target_schedule[1])])
-            )
-        batch = next(iterator)
-        prices, volumes, secs, progress = prepare_batch(batch, device, cfg.data.anno)
-        n, t = int(cfg.data.window_size), int(cfg.data.rollout_size)
-        if cfg.data.get("enforce_market_hours", True):
-            action_secs = secs[:, n - 1 : n - 1 + t]
-            reward_secs = secs[:, n : n + t]
-            if not regular_session_mask(action_secs, cfg.data.anno).all():
-                raise ValueError("action ticks must remain inside regular market hours")
-            if not regular_session_mask(reward_secs, cfg.data.anno).all():
-                raise ValueError("reward/exit ticks must remain inside regular market hours")
+        if toy_provider is not None:
+            toy_batch = toy_provider.sample(int(cfg.train.batch_size), device)
+            prices, volumes, progress = toy_batch.prices, toy_batch.volumes, toy_batch.progress
+        else:
+            if iterator is None:
+                raise RuntimeError("market data iterator was not initialized")
+            batch = next(iterator)
+            prices, volumes, secs, progress = prepare_batch(batch, device, cfg.data.anno)
+            if cfg.data.get("enforce_market_hours", True):
+                action_secs = secs[:, n - 1 : n - 1 + t]
+                reward_secs = secs[:, n : n + t]
+                if not regular_session_mask(action_secs, cfg.data.anno).all():
+                    raise ValueError("action ticks must remain inside regular market hours")
+                if not regular_session_mask(reward_secs, cfg.data.anno).all():
+                    raise ValueError("reward/exit ticks must remain inside regular market hours")
 
         rollout, losses = train_step(actor, critic, optimizer, prices, volumes, progress, cfg)
         scheduler.step()

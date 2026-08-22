@@ -1,8 +1,7 @@
 """MLP actor and critic for fixed-window market observations.
 
-The policy chooses a *target position* rather than issuing ambiguous buy/sell
-orders. The 11 discrete actions map to positions -5 through +5, where zero
-means flat and the absolute value is the requested bet-size level.
+The policy issues one of three commands: sell, do nothing, or buy. Commands
+move inventory one step and positions are bounded to short, flat, or long.
 """
 
 from __future__ import annotations
@@ -13,24 +12,34 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 
-MAX_POSITION = 5
-ACTION_DIM = MAX_POSITION * 2 + 1
+BUY_ACTION = 0
+NOTHING_ACTION = 1
+SELL_ACTION = 2
+ACTION_DIM = 3
+MAX_POSITION = 1
+ACTION_NAMES = ("buy", "nothing", "sell")
 
 
-def action_to_position(actions: torch.Tensor) -> torch.Tensor:
-    """Map categorical actions [0, 10] to position levels [-5, 5]."""
+def apply_action(previous_positions: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    """Apply sell/nothing/buy commands to bounded integer positions.
+
+    Repeating buy while long or sell while short is an idempotent no-op.
+    Reversing therefore takes two commands: close, then open the other side.
+    """
     if actions.dtype not in (torch.int32, torch.int64):
         raise TypeError("actions must contain integer categorical indices")
+    if previous_positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("previous_positions must contain integer inventory levels")
     if actions.numel() and ((actions < 0).any() or (actions >= ACTION_DIM).any()):
         raise ValueError(f"actions must be in [0, {ACTION_DIM - 1}]")
-    return actions - MAX_POSITION
-
-
-def position_to_action(positions: torch.Tensor) -> torch.Tensor:
-    """Map integer position levels [-5, 5] to categorical actions [0, 10]."""
-    if positions.numel() and ((positions < -MAX_POSITION).any() or (positions > MAX_POSITION).any()):
-        raise ValueError(f"positions must be in [-{MAX_POSITION}, {MAX_POSITION}]")
-    return positions.to(torch.long) + MAX_POSITION
+    if previous_positions.shape != actions.shape:
+        raise ValueError("previous_positions and actions must have the same shape")
+    if previous_positions.numel() and (
+        (previous_positions < -MAX_POSITION).any() or (previous_positions > MAX_POSITION).any()
+    ):
+        raise ValueError(f"previous_positions must be in [-{MAX_POSITION}, {MAX_POSITION}]")
+    delta = NOTHING_ACTION - actions.to(torch.long)
+    return (previous_positions.to(torch.long) + delta).clamp(-MAX_POSITION, MAX_POSITION)
 
 
 def init_orthogonal(module: nn.Module) -> None:
@@ -70,7 +79,7 @@ class WindowMLP(nn.Module):
 
 
 class TradingActor(WindowMLP):
-    """Categorical policy over flat, five short sizes, and five long sizes."""
+    """Categorical policy over sell, nothing, and buy commands."""
 
     def __init__(
         self,
@@ -81,7 +90,7 @@ class TradingActor(WindowMLP):
         action_dim: int = ACTION_DIM,
     ):
         if action_dim != ACTION_DIM:
-            raise ValueError(f"target-position policy requires action_dim={ACTION_DIM}")
+            raise ValueError(f"buy/nothing/sell policy requires action_dim={ACTION_DIM}")
         super().__init__(window_size, feature_dim, hidden_dim, action_dim, depth)
         nn.init.orthogonal_(self.main[-1].weight, gain=0.01)
 

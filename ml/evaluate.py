@@ -60,7 +60,6 @@ def evaluate_checkpoint(
     opens: list[int] = []
     closes: list[int] = []
     reversals: list[int] = []
-    resizes: list[int] = []
 
     for sample in tqdm(days.itertuples(index=False), total=len(days), desc="full-session backtest"):
         data = np.load(f"{cfg.data.data_dir}/{sample.sample_id}.npy", mmap_mode="r")
@@ -100,22 +99,18 @@ def evaluate_checkpoint(
         opens.append(int(((previous_positions == 0) & (day_positions != 0)).sum()))
         closes.append(int(((previous_positions != 0) & (day_positions == 0)).sum()))
         reversals.append(int((previous_positions * day_positions < 0).sum()))
-        resizes.append(
-            int(
-                (
-                    (previous_positions * day_positions > 0)
-                    & (np.abs(previous_positions) != np.abs(day_positions))
-                ).sum()
-            )
-        )
         price_now = prices[:, n - 1 : -1]
         price_next = prices[:, n:]
         reward_kwargs = {
             "transaction_cost": float(cfg.model.get("transaction_cost", 0.0)),
             "risk_penalty": float(cfg.model.get("risk_penalty", 0.0)),
         }
-        long_reward, _ = market_rewards(torch.full_like(price_now, 5, dtype=torch.long), price_now, price_next, **reward_kwargs)
-        short_reward, _ = market_rewards(torch.full_like(price_now, -5, dtype=torch.long), price_now, price_next, **reward_kwargs)
+        long_reward, _ = market_rewards(
+            torch.full_like(price_now, model.MAX_POSITION, dtype=torch.long), price_now, price_next, **reward_kwargs
+        )
+        short_reward, _ = market_rewards(
+            torch.full_like(price_now, -model.MAX_POSITION, dtype=torch.long), price_now, price_next, **reward_kwargs
+        )
         long_rewards.append(long_reward.sum().item())
         short_rewards.append(short_reward.sum().item())
 
@@ -161,14 +156,11 @@ def evaluate_checkpoint(
         "mean_opens": float(np.mean(opens)),
         "mean_voluntary_closes": float(np.mean(closes)),
         "mean_reversals": float(np.mean(reversals)),
-        "mean_resizes": float(np.mean(resizes)),
-        "mean_abs_bet_size": float(np.abs(all_positions).mean()),
+        "mean_abs_position": float(np.abs(all_positions).mean()),
         "long_fraction": float((all_positions > 0).mean()),
         "short_fraction": float((all_positions < 0).mean()),
         "flat_fraction": float((all_positions == 0).mean()),
     }
-    for size in range(model.MAX_POSITION + 1):
-        summary[f"bet_size_{size}_fraction"] = float((np.abs(all_positions) == size).mean())
     return summary
 
 

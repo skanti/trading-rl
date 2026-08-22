@@ -1,26 +1,26 @@
 # MLP PPO trading policy
 
 This directory trains an autoregressive PPO policy that uses the most recent
-`N` ticks and chooses a target position on every market tick. The default
+`N` ticks and issues one inventory command on every market tick. The default
 window is 4,096 ticks; change both resolved `window_size` values by setting
 `model.actor.window_size=8192` in the config for an 8,192-tick model.
 
 ## Action semantics
 
-The categorical action is a target position, so opening, closing, reversing,
-and resizing are all well-defined:
+The categorical action is a unit-free inventory command:
 
-| Action index | Target | Meaning |
-|---:|---:|---|
-| 0–4 | -5…-1 | short, size 5…1 |
-| 5 | 0 | close / stay flat |
-| 6–10 | +1…+5 | long, size 1…5 |
+| Action index | Command | Position transition |
+|---:|---|---|
+| 0 | buy | short → flat → long |
+| 1 | nothing | retain the current position |
+| 2 | sell | long → flat → short |
 
-Changing the target incurs proportional turnover cost. A configurable squared
-inventory penalty makes the five sizes express risk-adjusted conviction rather
-than always rewarding maximum leverage. Every sampled rollout
-is liquidated at its final regular-session price, including the corresponding
-cost, and never carries an overnight position.
+Positions are bounded to `{-1, 0, +1}`. A repeated `buy` while already long or
+`sell` while already short is a valid no-op: it adds no exposure, turnover, or
+transaction cost. Reversing takes two decisions (close, then open the other
+side). A configurable squared inventory penalty lets the policy prefer staying
+flat. Every sampled rollout is liquidated at its final regular-session price,
+including the corresponding cost, and never carries an overnight position.
 
 ## Policy input
 
@@ -39,33 +39,43 @@ ticks independently.
 
 The actor and critic are separate Spider-style MLPs: the complete
 `N × 5` window is flattened, passed through ReLU hidden layers, and mapped to
-11 policy logits or one value. No transformer is used by the training path.
-Real-market training uses an annealed target-entropy floor so noisy early
-rewards cannot collapse the 11-way policy before it explores long, short,
-close, and sizing decisions. The default target decreases from 1.5 to 0.2,
-allowing decisive execution after broad early exploration.
+3 policy logits or one value. No transformer is used by the training path.
+Real-market training uses standard clipped PPO with a small fixed entropy
+bonus. There is no target-entropy floor or entropy schedule.
 
 ## Verify on toy data
 
-The toy market randomizes absolute price over two orders of magnitude and
-randomly generates rising or falling episodes followed by a flat regime. Its
-known behavior is long/short size 5 while the signal is active, then close when
-the signal disappears.
+The online toy provider samples three or four random log-price anchors, fits a
+quadratic or cubic Bezier curve through them, samples a full price path from the
+curve, and adds observation noise. Absolute price is independently randomized
+over two orders of magnitude. Training batches are generated in memory and are
+never written to disk; evaluation uses a fixed seed and a held-out batch.
+
+The normal trainer selects this provider when `data.use_toy: true`. Set it to
+`false` to load the configured market-day files instead. Toy mode uses the same
+configured window, rollout, model, PPO loop, metrics, and checkpoint path; only
+the batch source and market-hours validation change. Give toy and market runs
+different `general.experiment_name` values; the trainer rejects resuming a
+checkpoint whose recorded data source does not match the flag.
 
 ```bash
 python -m unittest discover -s tests -v
 python toy_train.py --updates 400 --device cpu
 ```
 
-The second command fails unless held-out direction accuracy reaches 95%, close
-accuracy reaches 90%, mean active bet size reaches 4, and reward is positive.
-It prints the verification summary without writing generated files.
+The second command fails unless held-out position accuracy reaches 85%, active
+direction accuracy reaches 90%, and reward is both positive and better than the
+untrained policy. It prints the verification summary without writing generated
+files. Flat accuracy remains in the report as a diagnostic rather than a gate:
+with transaction costs, closing on every isolated low-slope tick is not always
+the reward-maximizing behavior.
 
 ## Train on market data
 
 Input `.npy` files must contain at least `[seconds, price_mills, volume]`. Build
 the day/index CSV (including the inclusive regular-session `eod_idx`) once,
-then configure `DATA_DIR`, `EXP_DIR`, and the paths in [main.yaml](main.yaml):
+then set `data.use_toy: false`, choose a new experiment name, and configure
+`DATA_DIR`, `EXP_DIR`, and the paths in [main.yaml](main.yaml):
 
 ```bash
 python prepare_days.py \
@@ -83,12 +93,12 @@ feature ordering, which is enough to resume training or construct the same
 policy for greedy inference.
 
 Training CSVs track net `return`, timestep `profit_factor`, worst
-`max_drawdown`, and mean target-position changes in `trades` for every logged
+`max_drawdown`, and mean position changes in `trades` for every logged
 batch. Backtest JSONs report `return`, `total_return`, `profit_factor`,
 `maximum_cumulative_drawdown`, `mean_trades`, and `total_trades`. Profit factor
 uses positive versus negative net timestep P&L after transaction and risk
-costs; a trade is any change in target position, including a resize or
-reversal.
+costs; a trade is any change in the bounded position. Repeated commands at a
+position boundary are therefore not trades.
 
 Backtest a checkpoint over complete held-out sessions (positions and action
 history persist from the open until mandatory end-of-day liquidation):
@@ -102,16 +112,9 @@ Use one date range for checkpoint selection and keep a later range untouched
 for the final test. For the bundled snapshot, December 1–5 supplies 50
 validation symbol-days and December 8–9 supplies 20 final-test symbol-days.
 
-## Trained checkpoint
+## Checkpoint compatibility
 
-The selected 4k-window model is
-`$EXP_DIR/trading/train-rl-mlp-4k-full-session/cp-0003000.ckpt`. It was chosen
-only from the December 1–5 selection split, where its mean daily net reward was
-`+0.001623`, annualized reward Sharpe was `4.53`, and maximum cumulative
-drawdown was `0.0232` after the configured costs.
-
-The subsequently opened December 8–9 final split was mixed: mean daily net
-reward `-0.000312`, median `+0.000808`, 55% positive symbol-days, and maximum
-cumulative drawdown `0.0278`. Gross reward remained positive, but transaction
-and risk costs made mean net reward negative. These are research backtests over
-a small temporal holdout, not evidence of live-trading profitability.
+Checkpoints from the former 11-action sized-position policy are intentionally
+incompatible with this 3-action policy head. The default experiment name is
+new so training starts from scratch instead of attempting to resume one of
+those checkpoints.

@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-mlp-4k-full-session"
+  experiment_name: "train-rl-mlp-4k-3action-bezier-toy"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
   pretrained_path: null
@@ -10,18 +10,17 @@ model:
   gamma: 0.99
   gae_lambda: 0.95
   transaction_cost: 1e-4
-  # Penalizes inventory variance so bet sizes represent risk-adjusted conviction.
+  # Penalizes inventory variance so the policy can prefer staying flat.
   risk_penalty: 1e-6
   ppo_clip: 0.2
   ppo_value_clip: 0.2
   max_grad_norm: 1.0
-  entropy_target: [1.5, 0.2]
   actor:
     window_size: 4096  # set to 8192 to test an 8k-tick receptive field
     feature_dim: 5
     hidden_dim: 256
     depth: 4
-    action_dim: 11
+    action_dim: 3
   critic:
     window_size: ${model.actor.window_size}
     feature_dim: ${model.actor.feature_dim}
@@ -30,10 +29,11 @@ model:
   loss_weights:
     policy: 1.0
     value: 0.5
-    entropy: 0.05
+    entropy: 0.001
 data:
+  use_toy: true
   window_size: ${model.actor.window_size}
-  # One action for every minute from 09:30 through the 15:59-to-16:00 return.
+  # In market mode, 390 spans 09:30 through the 15:59-to-16:00 return.
   rollout_size: 390
   require_full_session: true
   price_feature_scale: 100.0
@@ -42,6 +42,11 @@ data:
   data_dir: "${oc.env:DATA_DIR}/ppv1/updates/ppv1_latest"
   date_val: "2025-12-01"
   enforce_market_hours: true
+  toy:
+    noise_std: 3e-4
+    # Per-tick threshold is smaller than toy_train.py's because this curve is
+    # sampled across 4,486 rather than 44 points.
+    flat_return_threshold: 2.5e-6
 train:
   batch_size: 16
   steps_num: 50000
