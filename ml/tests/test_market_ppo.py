@@ -8,7 +8,13 @@ import torch
 from omegaconf import OmegaConf
 
 import model
-from dataset import MarketDayDataset, OnlineBezierToyProvider
+from dataset import (
+    EXTENDED_SESSION_BARS,
+    MarketDayDataset,
+    OnlineBezierToyProvider,
+    market_context_window_size,
+)
+from prepare_days import rows_for_file
 from train import (
     FEATURE_DIM,
     build_market_features,
@@ -40,6 +46,10 @@ class ConstantActor(model.TradingActor):
 
 
 class MarketPPOTest(unittest.TestCase):
+    def test_ten_extended_sessions_produce_9601_tick_window(self):
+        self.assertEqual(EXTENDED_SESSION_BARS, 960)
+        self.assertEqual(market_context_window_size(10), 9601)
+
     def test_actions_move_bounded_inventory_one_step(self):
         previous = torch.tensor([0, 1, 1, 0, -1, -1, 1, -1])
         actions = torch.tensor(
@@ -160,7 +170,7 @@ class MarketPPOTest(unittest.TestCase):
             path = Path(tmp)
             raw = np.stack(
                 (
-                    np.arange(12, dtype=np.int64),
+                    np.arange(12, dtype=np.int64) * 60,
                     np.arange(100000, 101200, 100),
                     np.arange(1, 13),
                 ),
@@ -188,6 +198,179 @@ class MarketPPOTest(unittest.TestCase):
             self.assertEqual(item["prices"].shape, (8,))
             self.assertAlmostEqual(item["prices"][3], 100.3, places=4)
             self.assertAlmostEqual(item["prices"][-1], 100.7, places=4)
+
+    def test_prepare_days_rejects_missing_and_count_preserving_tick_gaps(self):
+        session = pd.date_range(
+            "2025-01-02 09:30:00",
+            "2025-01-02 16:00:00",
+            freq="min",
+            tz="US/Eastern",
+        )
+        session_secs = np.array(
+            [int((ts.tz_convert("UTC") - pd.Timestamp(ANNO, tz="UTC")).total_seconds()) for ts in session],
+            dtype=np.int64,
+        )
+        context_secs = session_secs[0] - np.arange(3, 0, -1, dtype=np.int64) * 60
+
+        def write_bars(path: Path, regular_secs: np.ndarray) -> None:
+            secs = np.concatenate((context_secs, regular_secs))
+            raw = np.stack(
+                (
+                    secs,
+                    np.arange(len(secs), dtype=np.int64) + 100_000,
+                    np.ones(len(secs), dtype=np.int64),
+                ),
+                axis=1,
+            )
+            np.save(path, raw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            full_path = path / "FULL.npy"
+            sparse_path = path / "SPARSE.npy"
+            malformed_path = path / "MALFORMED.npy"
+            write_bars(full_path, session_secs)
+            sparse_secs = np.delete(session_secs, np.arange(30, 51))
+            self.assertEqual(sparse_secs.size, 370)
+            write_bars(sparse_path, sparse_secs)
+            malformed = np.sort(np.concatenate((np.delete(session_secs, 30), [session_secs[29] + 30])))
+            write_bars(malformed_path, malformed)
+
+            self.assertEqual(len(rows_for_file(full_path, ANNO, window_size=4, rollout_size=390)), 1)
+            self.assertEqual(rows_for_file(sparse_path, ANNO, window_size=4, rollout_size=390), [])
+            self.assertEqual(rows_for_file(malformed_path, ANNO, window_size=4, rollout_size=390), [])
+
+    def test_full_session_loader_revalidates_one_minute_cadence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            secs = np.array([0, 60, 120, 180, 240, 330, 360, 420], dtype=np.int64)
+            raw = np.stack(
+                (secs, np.arange(100_000, 100_800, 100), np.ones(8, dtype=np.int64)), axis=1
+            )
+            np.save(path / "GAP.npy", raw)
+            days = pd.DataFrame([{"sample_id": "GAP", "ctx_idx": 0, "sod_idx": 3, "eod_idx": 7}])
+            dataset = MarketDayDataset(
+                days,
+                str(path),
+                window_size=4,
+                rollout_size=4,
+                require_full_session=True,
+            )
+            with self.assertRaisesRegex(ValueError, "contiguous one-minute intervals"):
+                dataset[0]
+
+    def test_full_session_loader_completes_sparse_ticks_on_the_fly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            secs = np.array([0, 60, 120, 180, 240, 360, 420], dtype=np.int64)
+            prices = np.array([100_000, 100_100, 100_200, 100_300, 100_400, 100_600, 100_700])
+            volumes = np.arange(1, 8, dtype=np.int64)
+            np.save(path / "SPARSE.npy", np.stack((secs, prices, volumes), axis=1))
+            days = pd.DataFrame(
+                [
+                    {
+                        "sample_id": "SPARSE",
+                        "ctx_idx": 0,
+                        "sod_idx": 3,
+                        "eod_idx": 6,
+                        "sod_sec": 180,
+                        "eod_sec": 420,
+                        "context_sod_sec": 180,
+                        "context_eod_sec": 420,
+                        "missing_ticks": 1,
+                    }
+                ]
+            )
+            calendar_days = pd.concat(
+                (
+                    pd.DataFrame(
+                        [
+                            {
+                                "sample_id": "SPARSE",
+                                "ctx_idx": 0,
+                                "sod_idx": 0,
+                                "eod_idx": 2,
+                                "sod_sec": 0,
+                                "eod_sec": 120,
+                                "context_sod_sec": 0,
+                                "context_eod_sec": 120,
+                                "missing_ticks": 0,
+                            }
+                        ]
+                    ),
+                    days,
+                ),
+                ignore_index=True,
+            )
+            dataset = MarketDayDataset(
+                days,
+                str(path),
+                window_size=4,
+                rollout_size=4,
+                require_full_session=True,
+                calendar_days=calendar_days,
+            )
+            item = dataset[0]
+
+            self.assertEqual(item["secs"].tolist(), [0, 60, 120, 180, 240, 300, 360, 420])
+            self.assertAlmostEqual(item["prices"][5], 100.4, places=4)
+            self.assertEqual(item["volumes"][5], 0.0)
+            self.assertEqual(item["volumes"][6], 6.0)
+
+    def test_completely_missing_working_day_is_context_but_not_a_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            secs = np.array([0, 60, 120, 360, 420, 540, 600], dtype=np.int64)
+            prices = np.array([100_000, 100_100, 100_200, 100_600, 100_700, 100_900, 101_000])
+            np.save(path / "MISSING_DAY.npy", np.stack((secs, prices, np.ones(7)), axis=1))
+            calendar_days = pd.DataFrame(
+                [
+                    {
+                        "sample_id": "MISSING_DAY",
+                        "sod_idx": 0,
+                        "eod_idx": 2,
+                        "sod_sec": 0,
+                        "eod_sec": 120,
+                        "context_sod_sec": 0,
+                        "context_eod_sec": 120,
+                        "is_tradable": True,
+                    },
+                    {
+                        "sample_id": "MISSING_DAY",
+                        "sod_idx": -1,
+                        "eod_idx": -1,
+                        "sod_sec": 180,
+                        "eod_sec": 300,
+                        "context_sod_sec": 180,
+                        "context_eod_sec": 300,
+                        "is_tradable": False,
+                    },
+                    {
+                        "sample_id": "MISSING_DAY",
+                        "sod_idx": 3,
+                        "eod_idx": 6,
+                        "sod_sec": 360,
+                        "eod_sec": 600,
+                        "context_sod_sec": 360,
+                        "context_eod_sec": 600,
+                        "is_tradable": True,
+                    },
+                ]
+            )
+            target = calendar_days.iloc[[2]]
+            dataset = MarketDayDataset(
+                target,
+                str(path),
+                window_size=4,
+                rollout_size=4,
+                require_full_session=True,
+                calendar_days=calendar_days,
+            )
+            item = dataset[0]
+
+            self.assertEqual(item["secs"].tolist(), [180, 240, 300, 360, 420, 480, 540, 600])
+            self.assertEqual(item["volumes"][:3].tolist(), [0.0, 0.0, 0.0])
+            self.assertTrue(np.allclose(item["prices"][:3], 100.2))
 
     def test_market_hours(self):
         secs = torch.tensor(

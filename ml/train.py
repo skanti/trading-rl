@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 import model
 import utils
-from dataset import OnlineBezierToyProvider, make_dataloader
+from dataset import OnlineBezierToyProvider, make_dataloader, market_context_window_size
 
 
 logger = logging.getLogger("RL")
@@ -361,12 +361,27 @@ def rollout_metrics(rollout: MarketRollout) -> dict[str, float]:
 
 
 def main(cfg: DictConfig) -> None:
+    if cfg.data.get("reference_symbol", None):
+        # Keep main.yaml and the standard launch command as the single entry
+        # point while isolating the two-stream, one-position rollout code.
+        from reference_train import main as reference_main
+
+        reference_main(cfg)
+        return
     torch.manual_seed(int(cfg.train.get("seed", 0)))
     np.random.seed(int(cfg.train.get("seed", 0)))
     exp_dir = cfg.general.experiment_dir
     os.makedirs(exp_dir, exist_ok=True)
     device = torch.device(cfg.model.device)
     n, t = int(cfg.data.window_size), int(cfg.data.rollout_size)
+    context_days = cfg.data.get("context_days", None)
+    if context_days is not None:
+        expected_window = market_context_window_size(int(context_days))
+        if n != expected_window:
+            raise ValueError(
+                f"data.window_size must be {expected_window} for "
+                f"context_days={int(context_days)} (got {n})"
+            )
     use_toy = bool(cfg.data.get("use_toy", False))
     toy_provider: OnlineBezierToyProvider | None = None
     iterator = None

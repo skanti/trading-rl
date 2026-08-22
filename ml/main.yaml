@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-mlp-4k-3action-bezier-integrated-noise"
+  experiment_name: "train-rl-mlp-10d-3action-real-spy-reference"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
   pretrained_path: null
@@ -16,8 +16,8 @@ model:
   ppo_value_clip: 0.2
   max_grad_norm: 1.0
   actor:
-    window_size: 4096  # set to 8192 to test an 8k-tick receptive field
-    feature_dim: 5
+    window_size: ${data.window_size}
+    feature_dim: 8
     hidden_dim: 256
     depth: 4
     action_dim: 3
@@ -31,36 +31,35 @@ model:
     value: 0.5
     entropy: 0.001
 data:
-  use_toy: true
-  window_size: ${model.actor.window_size}
-  # In market mode, 390 spans 09:30 through the 15:59-to-16:00 return.
+  use_toy: false
+  reference_symbol: "ST-SPY"
+  context_days: 10
+  window_size: 9601
   rollout_size: 390
   require_full_session: true
   price_feature_scale: 100.0
   anno: "2010-01-01"
-  days_path: "${oc.env:DATA_DIR}/ppv1/updates/ppv1_latest_days_4k.csv"
-  data_dir: "${oc.env:DATA_DIR}/ppv1/updates/ppv1_latest"
-  date_val: "2025-12-01"
+  days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_top500_days_10d.csv"
+  data_dir: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22"
+  # The dataset ends 2026-08-21, so 2026-07-25 begins its trailing four weeks.
+  validation_weeks: 4
+  date_val: "2026-07-25"
   enforce_market_hours: true
-  toy:
-    # IID innovations are added to log returns, then integrated into price.
-    return_noise_std: 3e-4
-    # Per-tick threshold is smaller than toy_train.py's because this curve is
-    # sampled across 4,486 rather than 44 points.
-    flat_return_threshold: 2.5e-6
 train:
-  batch_size: 16
+  batch_size: 8
   steps_num: 50000
   ppo_epochs: 4
-  workers_num: 8
+  workers_num: 4
   split: "train"
   should_augment: true
   seed: 0
 val:
-  batch_size: 8
-  workers_num: 0
+  batch_size: 4
+  workers_num: 2
   split: "val"
   should_augment: false
+  validation_batches: 4
 loop:
   log_interval: 20
+  validation_interval: 500
   checkpoint_interval: 500

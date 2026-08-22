@@ -10,6 +10,11 @@ import pandas as pd
 from tqdm import tqdm
 
 
+RTH_OPEN_MINUTE = 9 * 60 + 30
+RTH_CLOSE_MINUTE = 16 * 60
+FULL_SESSION_INTERVALS = RTH_CLOSE_MINUTE - RTH_OPEN_MINUTE
+
+
 def rows_for_file(
     npy_path: Path,
     anno: str,
@@ -25,11 +30,23 @@ def rows_for_file(
     dt = pd.to_datetime(secs, unit="s", origin=anno, utc=True).tz_convert("US/Eastern")
     dates = np.asarray(dt.date)
     minutes = np.asarray(dt.hour * 60 + dt.minute)
+    seconds = np.asarray(dt.second)
     rows: list[tuple[str, str, int, int, int]] = []
     for day in np.unique(dates):
-        valid = np.flatnonzero((dates == day) & (minutes >= 9 * 60 + 30) & (minutes <= 16 * 60))
+        valid = np.flatnonzero((dates == day) & (minutes >= RTH_OPEN_MINUTE) & (minutes <= RTH_CLOSE_MINUTE))
         if valid.size < rollout_size + 1:
             continue
+        if rollout_size == FULL_SESSION_INTERVALS:
+            session_secs = secs[valid]
+            is_complete = (
+                valid.size == FULL_SESSION_INTERVALS + 1
+                and minutes[valid[0]] == RTH_OPEN_MINUTE
+                and minutes[valid[-1]] == RTH_CLOSE_MINUTE
+                and np.all(seconds[valid] == 0)
+                and np.all(np.diff(session_secs) == 60)
+            )
+            if not is_complete:
+                continue
         sod_idx, eod_idx = int(valid[0]), int(valid[-1])
         if sod_idx < window_size - 1 or eod_idx - sod_idx < rollout_size:
             continue

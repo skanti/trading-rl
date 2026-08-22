@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 import model
 import utils
+from dataset import MarketDayDataset
 from train import collect_rollout, market_rewards, regular_session_mask, session_progress
 
 
@@ -38,8 +39,9 @@ def evaluate_checkpoint(
     actor.load_state_dict(state["actor"], strict=True)
     actor.eval()
 
-    days = pd.read_csv(cfg.data.days_path)
-    days.date = pd.to_datetime(days.date)
+    calendar_days = pd.read_csv(cfg.data.days_path)
+    calendar_days.date = pd.to_datetime(calendar_days.date)
+    days = calendar_days
     date_from = date_from or str(cfg.data.date_val)
     days = days[days.date >= pd.Timestamp(date_from)]
     if date_to is not None:
@@ -48,6 +50,15 @@ def evaluate_checkpoint(
     if max_days is not None:
         days = days.iloc[:max_days]
     n = actor.window_size
+    rollout_size = int(cfg.data.rollout_size)
+    dataset = MarketDayDataset(
+        days=days,
+        data_dir=str(cfg.data.data_dir),
+        window_size=n,
+        rollout_size=rollout_size,
+        require_full_session=True,
+        calendar_days=calendar_days,
+    )
     day_rewards: list[float] = []
     step_rewards: list[np.ndarray] = []
     day_market_returns: list[float] = []
@@ -61,19 +72,12 @@ def evaluate_checkpoint(
     closes: list[int] = []
     reversals: list[int] = []
 
-    for sample in tqdm(days.itertuples(index=False), total=len(days), desc="full-session backtest"):
-        data = np.load(f"{cfg.data.data_dir}/{sample.sample_id}.npy", mmap_mode="r")
-        sod_idx, eod_idx = int(sample.sod_idx), int(sample.eod_idx)
-        start = sod_idx - n + 1
-        if start < 0 or eod_idx <= sod_idx:
-            continue
-        segment = np.array(data[start : eod_idx + 1], copy=True)
-        rollout_size = eod_idx - sod_idx
-        if segment.shape[0] != n + rollout_size:
-            continue
-        prices = torch.as_tensor(segment[:, 1] / 1000.0, dtype=torch.float32, device=device).unsqueeze(0)
-        volumes = torch.as_tensor(segment[:, 2], dtype=torch.float32, device=device).unsqueeze(0)
-        secs = torch.as_tensor(segment[:, 0], dtype=torch.long, device=device).unsqueeze(0)
+    for index in tqdm(range(len(dataset)), total=len(dataset), desc="full-session backtest"):
+        sample = dataset.days.iloc[index]
+        item = dataset[index]
+        prices = torch.as_tensor(item["prices"], dtype=torch.float32, device=device).unsqueeze(0)
+        volumes = torch.as_tensor(item["volumes"], dtype=torch.float32, device=device).unsqueeze(0)
+        secs = torch.as_tensor(item["secs"], dtype=torch.long, device=device).unsqueeze(0)
         if not regular_session_mask(secs[:, n - 1 :], cfg.data.anno).all():
             raise ValueError(f"{sample.sample_id} {sample.date} contains an out-of-session decision/exit tick")
         rollout = collect_rollout(
