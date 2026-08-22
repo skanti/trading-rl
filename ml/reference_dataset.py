@@ -95,9 +95,7 @@ class MarketReferenceDataset(Dataset):
         return {
             "_id": asset["_id"],
             "prices": asset["prices"],
-            "volumes": asset["volumes"],
             "reference_prices": reference["prices"],
-            "reference_volumes": reference["volumes"],
             "secs": asset["secs"],
         }
 
@@ -115,9 +113,9 @@ def make_reference_dataloader(
     days.date = pd.to_datetime(days.date, format="%Y-%m-%d")
     context_days = int(cfg_data.context_days)
     expected_window = market_context_window_size(context_days)
-    if int(cfg_data.window_size) != expected_window:
+    if int(cfg_data.loader_window_size) != expected_window:
         raise ValueError(
-            f"window_size must be {expected_window} for context_days={context_days}"
+            f"loader_window_size must be {expected_window} for context_days={context_days}"
         )
 
     last_date = days.date.max()
@@ -160,7 +158,7 @@ def make_reference_dataloader(
         days=calendar_and_targets,
         data_dir=str(cfg_data.data_dir),
         reference_symbol=str(cfg_data.reference_symbol),
-        window_size=int(cfg_data.window_size),
+        window_size=int(cfg_data.loader_window_size),
         rollout_size=int(cfg_data.rollout_size),
         limit=cfg_split.get("samples_num", None),
     )

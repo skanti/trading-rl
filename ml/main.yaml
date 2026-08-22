@@ -1,12 +1,13 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-mlp-10d-3action-real-spy-reference"
+  experiment_name: "train-rl-gpt2-10d-3action-real-spy-reference"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
   pretrained_path: null
   device: "cuda:0"
   lr: 3e-4
+  weight_decay: 0.01
   gamma: 0.99
   gae_lambda: 0.95
   transaction_cost: 1e-4
@@ -15,17 +16,16 @@ model:
   ppo_clip: 0.2
   ppo_value_clip: 0.2
   max_grad_norm: 1.0
-  actor:
-    window_size: ${data.window_size}
-    feature_dim: 8
-    hidden_dim: 256
-    depth: 4
+  transformer:
+    vocab_size: 4096
+    # 9,600 context tokens + 390 decision tokens; the final price is reward-only.
+    max_seq_len: 9990
+    dim: 256
+    n_layer: 6
+    n_head: 8
+    mlp_ratio: 4
+    dropout: 0.0
     action_dim: 3
-  critic:
-    window_size: ${model.actor.window_size}
-    feature_dim: ${model.actor.feature_dim}
-    hidden_dim: ${model.actor.hidden_dim}
-    depth: ${model.actor.depth}
   loss_weights:
     policy: 1.0
     value: 0.5
@@ -34,10 +34,11 @@ data:
   use_toy: false
   reference_symbol: "ST-SPY"
   context_days: 10
-  window_size: 9601
+  context_ticks: 9600
+  # Loader sample boundary only; the transformer itself has no sliding window.
+  loader_window_size: 9601
   rollout_size: 390
   require_full_session: true
-  price_feature_scale: 100.0
   anno: "2010-01-01"
   days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_top500_days_10d.csv"
   data_dir: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22"
@@ -45,17 +46,22 @@ data:
   validation_weeks: 4
   date_val: "2026-07-25"
   enforce_market_hours: true
+  tokenizer:
+    vocab_size: 4096
+    bins_per_price: 64
+    max_abs_log_return: 0.20
+    mu: 255.0
 train:
-  batch_size: 8
+  batch_size: 2
   steps_num: 50000
   ppo_epochs: 4
-  workers_num: 4
+  workers_num: 2
   split: "train"
   should_augment: true
   seed: 0
 val:
-  batch_size: 4
-  workers_num: 2
+  batch_size: 2
+  workers_num: 1
   split: "val"
   should_augment: false
   validation_batches: 4

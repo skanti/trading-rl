@@ -1,10 +1,11 @@
-# MLP PPO trading policy
+# Tokenized causal-GPT PPO trading policy
 
-This directory trains an autoregressive PPO policy that uses the most recent
-`N` ticks and issues one inventory command on every market tick. The default
+This directory trains an autoregressive PPO policy that preserves the complete
+causal sequence and issues one inventory command on every market tick. The default
 context is the previous 10 trading days completed onto 04:00--19:59 Eastern
-one-minute grids. At the opening decision, the window contains those 9,600
-historical bars plus the current 09:30 observation, for 9,601 ticks total.
+one-minute grids. The 9,600 historical tokens prime the transformer's KV cache
+once. The current trading day then grows the sequence one token at a time from
+09:30 through 15:59; the 16:00 price supplies the final reward and liquidation.
 
 ## Action semantics
 
@@ -23,26 +24,27 @@ side). A configurable squared inventory penalty lets the policy prefer staying
 flat. Every sampled rollout is liquidated at its final regular-session price,
 including the corresponding cost, and never carries an overnight position.
 
-## Policy input
+## Policy input and model
 
-Each tick contains five features:
+Only active-asset and SPY prices are market inputs. Each price series is first
+converted to scale-free log returns. A mu-law quantizer maps each return to one
+of 64 levels, and the pair is combined into one token:
 
-1. log price relative to the newest price in the window;
-2. one-tick log return;
-3. window-normalized `log(1 + volume)`;
-4. regular-session progress from -1 to +1;
-5. the normalized position held over that tick's preceding interval.
+`token = asset_level * 64 + spy_level`
 
-Absolute price and symbol identity are excluded. During rollout, a selected
-position is written into the next observation window. Consequently later
-decisions condition on the actual preceding actions instead of evaluating all
-ticks independently.
+That Cartesian product is exactly a 4,096-entry dictionary while retaining one
+token per timestamp. The position held over the preceding interval is supplied
+through a separate three-state short/flat/long embedding, and the previous
+command through a buy/nothing/sell/no-prior-command embedding. This one-tick
+shift keeps action history causal. Volume, absolute price, and symbol identity
+are excluded.
 
-The actor and critic are separate Spider-style MLPs: the complete
-`N × 5` window is flattened, passed through ReLU hidden layers, and mapped to
-3 policy logits or one value. No transformer is used by the training path.
-Real-market training uses standard clipped PPO with a small fixed entropy
-bonus. There is no target-entropy floor or entropy schedule.
+The policy and value function share a GPT-2-style causal trunk with learned
+position embeddings and separate three-logit policy and scalar value heads.
+The default 6-layer, 256-wide model has about 8.3M parameters. Rollout uses a KV
+cache, so earlier context is never re-tokenized or truncated as the trading day
+grows. PPO optimization uses the equivalent full causal forward pass with a
+small fixed entropy bonus and no entropy schedule.
 
 ## Verify on toy data
 
@@ -54,12 +56,9 @@ price-level noise. Absolute price is independently randomized over two orders
 of magnitude. Training batches are generated in memory and are never written
 to disk; evaluation uses a fixed seed and a held-out batch.
 
-The normal trainer selects this provider when `data.use_toy: true`. Set it to
-`false` to load the configured market-day files instead. Toy mode uses the same
-configured window, rollout, model, PPO loop, metrics, and checkpoint path; only
-the batch source and market-hours validation change. Give toy and market runs
-different `general.experiment_name` values; the trainer rejects resuming a
-checkpoint whose recorded data source does not match the flag.
+The toy provider remains a focused legacy MLP verification harness. The default
+`main.yaml` path is the tokenized real-market GPT experiment and does not mix
+synthetic paths into its training or validation data.
 
 ```bash
 python -m unittest discover -s tests -v
@@ -95,9 +94,9 @@ day before mandatory close liquidation. Missing bars in both the historical
 extended sessions and current regular session are completed in memory by
 carrying the last price forward and assigning zero volume. Weekends, holidays,
 and half days are absent from the session metadata rather than being invented.
-Checkpoints contain actor, critic, optimizer, scheduler, resolved config, and
-feature ordering, which is enough to resume training or construct the same
-policy for greedy inference.
+Checkpoints contain the shared transformer, optimizer, scheduler, tokenizer,
+resolved config, and input ordering, which is enough to resume training or
+construct the same policy for greedy inference.
 
 Training CSVs track net `return`, timestep `profit_factor`, worst
 `max_drawdown`, and mean position changes in `trades` for every logged
@@ -107,38 +106,27 @@ uses positive versus negative net timestep P&L after transaction and risk
 costs; a trade is any change in the bounded position. Repeated commands at a
 position boundary are therefore not trades.
 
-Backtest a checkpoint over complete held-out sessions (positions and action
-history persist from the open until mandatory end-of-day liquidation):
-
-```bash
-python evaluate.py --config_path main.yaml --max_days 100 \
-  --date_from 2025-12-01 --date_to 2025-12-05
-```
-
-Use one date range for checkpoint selection and keep a later range untouched
-for the final test. For the bundled snapshot, December 1–5 supplies 50
-validation symbol-days and December 8–9 supplies 20 final-test symbol-days.
+The trainer evaluates greedy rollouts on the reserved trailing four weeks every
+500 updates. These rows use `stage=1` in `metrics.csv`; training rows use
+`stage=0`.
 
 ## Checkpoint compatibility
 
-Checkpoints from the former 11-action sized-position policy are intentionally
-incompatible with this 3-action policy head. The default experiment name is
-new so training starts from scratch instead of attempting to resume one of
-those checkpoints.
+Checkpoints from the former MLP and 11-action policies are intentionally
+incompatible with the shared GPT actor-critic. The default experiment name is
+new so training starts from scratch.
 
 ## SPY-reference experiment
 
-`main.yaml` trains the same three-action, single-asset policy on real
+`main.yaml` trains the three-action, single-asset policy on real
 market data while adding SPY as an observation-only reference. SPY is present
 in `top500.txt` and the day index, but `MarketReferenceDataset` explicitly
 excludes it from tradable targets. Reward, turnover, risk, and liquidation are
 therefore calculated only from the selected asset.
 
-Each tick has eight channels: relative log price, log return, and normalized
-volume for both the asset and SPY; regular-session progress; and the asset's
-position/action history. Absolute price and symbol identity remain excluded.
-Both instruments are independently completed on the same expected minute grid,
-then their timestamps are checked for exact equality.
+Each tick contains the joint asset/SPY price-return token plus the asset's
+position/action state. Both instruments are independently completed on the
+same expected minute grid, then their timestamps are checked for exact equality.
 
 The final four calendar weeks are reserved for validation. For this snapshot,
 whose last session is 2026-08-21, validation begins on 2026-07-25 (the first
