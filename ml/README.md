@@ -1,11 +1,11 @@
-# Tokenized causal-GPT PPO trading policy
+# Autoregressive PPO trading policies
 
-This directory trains an autoregressive PPO policy that preserves the complete
-causal sequence and issues one inventory command on every market tick. The default
-context is the previous 10 trading days completed onto 04:00--19:59 Eastern
-one-minute grids. The 9,600 historical tokens prime the transformer's KV cache
-once. The current trading day then grows the sequence one token at a time from
-09:30 through 15:59; the 16:00 price supplies the final reward and liquidation.
+This directory provides a tokenized causal GPT and a shifted-window MLP, both
+trained with PPO and the same three inventory commands. `main.yaml` currently
+selects the time-anchored MLP. The GPT option preserves the complete causal
+sequence: 9,600 historical tokens prime its KV cache once, then the current day
+grows one token at a time from 09:30 through 15:59. The 16:00 price supplies the
+final reward and liquidation for both architectures.
 
 ## Action semantics
 
@@ -56,9 +56,9 @@ price-level noise. Absolute price is independently randomized over two orders
 of magnitude. Training batches are generated in memory and are never written
 to disk; evaluation uses a fixed seed and a held-out batch.
 
-The toy provider remains a focused legacy MLP verification harness. The default
-`main.yaml` path is the tokenized real-market GPT experiment and does not mix
-synthetic paths into its training or validation data.
+The toy provider remains a focused legacy MLP verification harness. The real
+asset/SPY path selected by `main.yaml` does not mix synthetic paths into its
+training or validation data.
 
 ```bash
 python -m unittest discover -s tests -v

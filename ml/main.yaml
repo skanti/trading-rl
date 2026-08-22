@@ -62,7 +62,7 @@ data:
     max_abs_log_return: 0.20
     mu: 255.0
 train:
-  batch_size: 2
+  batch_size: 16
   steps_num: 50000
   ppo_epochs: 4
   workers_num: 2
@@ -70,11 +70,11 @@ train:
   should_augment: true
   seed: 0
 val:
-  batch_size: 2
+  batch_size: 8
   workers_num: 1
   split: "val"
   should_augment: false
-  validation_batches: 4
+  validation_batches: 10
 loop:
   log_interval: 20
   validation_interval: 500
