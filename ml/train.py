@@ -43,6 +43,7 @@ class MarketRollout:
     risk_costs: torch.Tensor
     trades: torch.Tensor
     forced_closes: torch.Tensor
+    scalars: torch.Tensor | None = None
 
 
 def _market_datetimes(secs: torch.Tensor | np.ndarray, anno: str) -> tuple[np.ndarray, tuple[int, ...]]:
@@ -252,10 +253,10 @@ def ppo_update(
     loss = loss_policy = loss_value = loss_entropy = torch.tensor(0.0, device=rollout.states.device)
     entropy_mean = torch.tensor(0.0, device=rollout.states.device)
     for _ in range(ppo_epochs):
-        dist = actor.distribution(rollout.states)
+        dist = actor.distribution(rollout.states, rollout.scalars)
         logprobs = dist.log_prob(rollout.actions)
         entropy_mean = dist.entropy().mean()
-        values = critic(rollout.states)
+        values = critic(rollout.states, rollout.scalars)
 
         ratio = torch.exp(logprobs - logprobs_old)
         clipped_ratio = ratio.clamp(1.0 - ppo_clip, 1.0 + ppo_clip)
@@ -485,4 +486,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, required=True)
 
 if __name__ == "__main__":
-    main(OmegaConf.load(parser.parse_args().config_path))
+    known, overrides = parser.parse_known_args()
+    config = OmegaConf.load(known.config_path)
+    if overrides:
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(overrides))
+    main(config)

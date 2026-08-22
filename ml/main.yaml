@@ -1,9 +1,10 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-gpt2-10d-3action-real-spy-reference"
+  experiment_name: "train-rl-mlp-4k-3action-real-spy-reference-time-to-close"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
+  architecture: "mlp"
   pretrained_path: null
   device: "cuda:0"
   lr: 3e-4
@@ -26,6 +27,14 @@ model:
     mlp_ratio: 4
     dropout: 0.0
     action_dim: 3
+  # Autoregressive shifted-window policy with one scalar time-to-close anchor.
+  mlp:
+    window_size: 4096
+    feature_dim: 8
+    hidden_dim: 256
+    depth: 4
+    action_dim: 3
+    scalar_dim: 1
   loss_weights:
     policy: 1.0
     value: 0.5
@@ -35,7 +44,7 @@ data:
   reference_symbol: "ST-SPY"
   context_days: 10
   context_ticks: 9600
-  # Loader sample boundary only; the transformer itself has no sliding window.
+  # Retain full context + 09:30; GPT uses it all and the MLP slices its window.
   loader_window_size: 9601
   rollout_size: 390
   require_full_session: true
@@ -46,6 +55,7 @@ data:
   validation_weeks: 4
   date_val: "2026-07-25"
   enforce_market_hours: true
+  price_feature_scale: 100.0
   tokenizer:
     vocab_size: 4096
     bins_per_price: 64

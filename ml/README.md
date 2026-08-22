@@ -137,6 +137,31 @@ written to `metrics.csv` with `stage=1`; training rows use `stage=0`.
 python train.py --config_path main.yaml
 ```
 
+## Shifted-window MLP baseline
+
+The default `main.yaml` selects the price-only MLP baseline and retains the GPT
+settings for architecture comparisons. Its first decision uses a 4,096-minute
+window ending at 09:30. After
+each sampled command, the resulting inventory and a one-hot copy of that
+command are written at the newest position of the next one-minute-shifted
+window. Historical state channels are zero, so the context contains prices
+rather than fabricated no-op actions.
+
+Each window position has eight features: relative log price and log return for
+the asset and SPY, active-asset inventory, and three previous-action indicators.
+The fixed flattened input coordinates already encode oldest-to-newest window
+position, so the MLP does not add a transformer-style positional encoding. A
+single normalized `time_to_close` scalar is appended after the flattened
+window: it starts at `1.0` at 09:30 and falls to `1/390` at 15:59. It is supplied
+once rather than repeated across every window row. The default actor and critic
+contain 17,174,020 parameters in total.
+
+Train the configured MLP directly; no second YAML file is required:
+
+```bash
+python train.py --config_path main.yaml
+```
+
 # Relative-value pair policy
 
 A second policy trades two time-matched symbols at once. Every tick it issues

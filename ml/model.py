@@ -121,22 +121,34 @@ class TradingActor(WindowMLP):
         hidden_dim: int = 256,
         depth: int = 4,
         action_dim: int = ACTION_DIM,
+        scalar_dim: int = 0,
     ):
         if action_dim != ACTION_DIM:
             raise ValueError(f"buy/nothing/sell policy requires action_dim={ACTION_DIM}")
-        super().__init__(window_size, feature_dim, hidden_dim, action_dim, depth)
+        super().__init__(
+            window_size, feature_dim, hidden_dim, action_dim, depth, scalar_dim
+        )
         nn.init.orthogonal_(self.main[-1].weight, gain=0.01)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        flat, leading = self.forward_features(inputs)
+    def forward(
+        self, inputs: torch.Tensor, scalars: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        flat, leading = self.forward_features(inputs, scalars)
         return self.main(flat).reshape(*leading, ACTION_DIM)
 
-    def distribution(self, inputs: torch.Tensor) -> Categorical:
-        return Categorical(logits=self(inputs))
+    def distribution(
+        self, inputs: torch.Tensor, scalars: torch.Tensor | None = None
+    ) -> Categorical:
+        return Categorical(logits=self(inputs, scalars))
 
     @torch.no_grad()
-    def play(self, inputs: torch.Tensor, sampling: str = "multinomial") -> torch.Tensor:
-        logits = self(inputs)
+    def play(
+        self,
+        inputs: torch.Tensor,
+        scalars: torch.Tensor | None = None,
+        sampling: str = "multinomial",
+    ) -> torch.Tensor:
+        logits = self(inputs, scalars)
         if sampling == "multinomial":
             return Categorical(logits=logits).sample()
         if sampling in ("argmax", "greedy"):
@@ -151,15 +163,18 @@ class TradingCritic(WindowMLP):
         feature_dim: int = 5,
         hidden_dim: int = 256,
         depth: int = 4,
+        scalar_dim: int = 0,
     ):
-        super().__init__(window_size, feature_dim, hidden_dim, 1, depth)
+        super().__init__(window_size, feature_dim, hidden_dim, 1, depth, scalar_dim)
         # Market windows can contain rare large moves. A small initial value
         # head keeps the first advantages reward-driven instead of dominated by
         # arbitrary critic predictions.
         nn.init.orthogonal_(self.main[-1].weight, gain=0.01)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        flat, leading = self.forward_features(inputs)
+    def forward(
+        self, inputs: torch.Tensor, scalars: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        flat, leading = self.forward_features(inputs, scalars)
         return self.main(flat).reshape(*leading)
 
 
