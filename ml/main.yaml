@@ -42,7 +42,7 @@ data:
 train:
   batch_size: 64
   steps_num: 50000
-  workers_num: 8
+  workers_num: 16
   split: "train"
   # A fresh regular-session time is drawn per visit during training.
   should_augment: true
