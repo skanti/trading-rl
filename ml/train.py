@@ -362,10 +362,18 @@ def rollout_metrics(rollout: MarketRollout) -> dict[str, float]:
 
 
 def main(cfg: DictConfig) -> None:
+    # Keep main.yaml and the standard launch command as the single entry point
+    # while isolating each two-stream, one-position rollout in its own module.
+    rollout_mode = str(cfg.data.get("rollout_mode", "session")).lower()
+    if rollout_mode == "week":
+        from week_train import main as week_main
+
+        week_main(cfg)
+        return
+    if rollout_mode != "session":
+        raise ValueError("data.rollout_mode must be 'session' or 'week'")
     if cfg.data.get("reference_symbol", None):
-        # Keep main.yaml and the standard launch command as the single entry
-        # point while isolating the two-stream, one-position rollout code.
-        from reference_train import main as reference_main
+        from reference_mlp_train import main as reference_main
 
         reference_main(cfg)
         return

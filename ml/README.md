@@ -162,6 +162,118 @@ Train the configured MLP directly; no second YAML file is required:
 python train.py --config_path main.yaml
 ```
 
+## Intraweek experiment on 10-minute bars
+
+`week.yaml` keeps the three-action policy, the SPY reference, and the ten-day
+context of the intraday experiment, and changes two things: the clock runs at
+ten minutes instead of one minute, and one rollout is a complete Monday--Friday
+week instead of a single session. Inventory therefore persists across the four
+weeknights and the reachable holding period grows from hours to days.
+
+```bash
+python week_train.py --config_path week.yaml
+```
+
+### Grid
+
+| | intraday (`main.yaml`) | intraweek (`week.yaml`) |
+|---|---:|---:|
+| bar | 1 min | 10 min |
+| context | 9,600 ticks (10 extended sessions) | 960 ticks (10 extended sessions) |
+| MLP window | 4,096 ticks (~4.3 days) | 960 ticks (10 days) |
+| rollout | 390 decisions (one session) | 199 decisions (five sessions) |
+| liquidation | every 16:00 | Friday 16:00 only |
+
+A regular session contributes 40 grid points at ten-minute spacing, 09:30
+through 16:00 inclusive, so a week holds 200 points and 199 of them are
+decisions. The last point is Friday's close: it prices the final interval and
+liquidates, and is never itself a decision. Each 04:00--19:59 extended session
+contributes 96 context points, so the ten-day context is 960 ticks and the MLP
+window now spans the whole context rather than a slice of it.
+
+### Bars are subsampled, not averaged
+
+A ten-minute bar here is the last trade price at or before the ten-minute
+boundary, produced by the same forward-fill the one-minute loader uses; volume
+is the sum over the ten minutes ending at that boundary. Averaging the ten
+constituent minute prices was rejected for two reasons. The average of minutes
+`t..t+9` is not known at `t`, so a policy marked to market against it is reading
+its own decision interval; and no order executes at the mean of a ten-minute
+window, so the resulting P&L is not attainable. Subsampling keeps every quoted
+price one the rollout could actually have traded at.
+
+### The weekend is structural, not penalized
+
+Nothing in the reward discourages a weekend position, because the grid makes one
+unreachable. The 200 week ticks are regular-session ticks on five weekdays, the
+final one is Friday 16:00, and `market_rewards` liquidates whatever is held
+after the last interval — the same mechanism that closes the intraday policy at
+16:00, applied once per week instead of once per day.
+`week.validate_week_hours` re-checks every sampled batch: no tick may fall on a
+Saturday or Sunday, every tick must sit on the ten-minute grid inside 09:30
+through 16:00, the first must be a Monday 09:30 and the last a Friday 16:00, and
+the five sessions must run Monday through Friday in order. It runs on training
+and validation batches alike while `data.enforce_market_hours` is set.
+
+The four weeknight gaps are real held intervals and are priced as such: the
+09:30 print after an overnight hold is the next price, gap included. Metrics add
+`overnight_fraction` (share of the four 16:00 decisions that carry inventory)
+and `overnight_holds` (their mean count per week).
+
+### Anchoring the price at Monday 09:30
+
+The per-tick price channels stay anchored to the newest tick in the window, as
+in the intraday policy. That is what keeps the input stationary: the newest
+element is always zero and the rest are log distances from it, so a Friday
+window and a Monday window are on the same scale and the same weights read both.
+Re-anchoring all 960 window rows to Monday 09:30 would replace that with a
+feature whose typical magnitude grows through the week and whose zero drifts
+backwards out of the window, which is a harder input for a flat MLP and buys
+nothing the window does not already contain — Monday 09:30 is still inside the
+960-tick window at Friday's close.
+
+Week-to-date return is still worth stating explicitly, because it prices the
+decision the policy is actually being asked to make, so it is supplied as two
+scalars appended once per decision rather than broadcast across the window:
+
+| scalar | meaning |
+|---|---|
+| `time_to_week_close` | 1.0 at Monday 09:30, falling to 1/199 at the last decision |
+| `time_to_day_close` | 1.0 at each 09:30, reaching 0.0 at each 16:00 |
+| `asset_week_to_date_return` | `100 * log(P_t / P_monday_0930)` |
+| `spy_week_to_date_return` | the same for SPY |
+
+`time_to_day_close` is the one clock the window genuinely cannot supply: it hits
+zero exactly on the decision that chooses whether to carry inventory overnight,
+which is the only decision in the day whose next interval is seventeen hours
+long. The intraday policy needed no such marker because it had one deadline.
+
+The actor and critic are 512 wide and four deep over `960 * 8 + 4` inputs,
+9,447,428 parameters in total.
+
+### Weeks are all-or-nothing
+
+A week is offered only when the exchange calendar holds five sessions, all five
+are tradable for that symbol, they are contiguous in the symbol's own session
+sequence, and ten earlier sessions exist to fill the context. Holiday weeks are
+dropped rather than padded, because a shorter rollout would not share the fixed
+policy input shape, and `scripts/split.py` already excludes scheduled 13:00
+half-days from the calendar, so the weeks containing them are four-session weeks
+and are dropped too. On the bundled 2026-08-22 snapshot that leaves 454 of 555
+calendar weeks, and 769,027 training symbol-weeks against 7,772 validation
+symbol-weeks.
+
+Splitting is by whole week: a training week must end before `date_val`, and a
+validation week must start on or after it, so no rollout straddles the boundary.
+With the snapshot's last session on Friday 2026-08-21, the trailing four weeks
+begin Saturday 2026-07-25 and the first validation week opens Monday 2026-07-27.
+
+`model.gamma` is raised from 0.99 to 0.999. At one decision per ten minutes the
+old value discounts Friday's close to about 1e-9 seen from Monday, which would
+make the multi-day holding period the experiment exists to test invisible to the
+advantage estimate.
+
+
 # Relative-value pair policy
 
 A second policy trades two time-matched symbols at once. Every tick it issues

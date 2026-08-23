@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-rl-mlp-4k-3action-real-spy-reference-time-to-close"
+  experiment_name: "train-rl-mlp-week-10min"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
 model:
   architecture: "mlp"
@@ -9,7 +9,9 @@ model:
   device: "cuda:0"
   lr: 3e-4
   weight_decay: 0.01
-  gamma: 0.99
+  # One step is now ten minutes, so the same 0.99 would discount Friday to
+  # nothing from Monday. 0.999 keeps a full week roughly undiscounted.
+  gamma: 0.999
   gae_lambda: 0.95
   transaction_cost: 1e-4
   # Penalizes inventory variance so the policy can prefer staying flat.
@@ -17,50 +19,39 @@ model:
   ppo_clip: 0.2
   ppo_value_clip: 0.2
   max_grad_norm: 1.0
-  transformer:
-    vocab_size: 4096
-    # 9,600 context tokens + 390 decision tokens; the final price is reward-only.
-    max_seq_len: 9990
-    dim: 256
-    n_layer: 6
-    n_head: 8
-    mlp_ratio: 4
-    dropout: 0.0
-    action_dim: 3
-  # Autoregressive shifted-window policy with one scalar time-to-close anchor.
+  # Shifted-window policy over ten days of 10-minute bars.
   mlp:
-    window_size: 4096
+    window_size: 960
     feature_dim: 8
-    hidden_dim: 256
+    hidden_dim: 512
     depth: 4
     action_dim: 3
-    scalar_dim: 1
+    scalar_dim: 4
   loss_weights:
     policy: 1.0
     value: 0.5
-    entropy: 0.001
+    entropy: 0.01
 data:
   use_toy: false
+  # Selects the Mon--Fri week rollout over the one-session rollout.
+  rollout_mode: "week"
   reference_symbol: "ST-SPY"
+  tick_minutes: 10
   context_days: 10
-  context_ticks: 9600
-  # Retain full context + 09:30; GPT uses it all and the MLP slices its window.
-  loader_window_size: 9601
-  rollout_size: 390
-  require_full_session: true
+  # 10 extended sessions x 96 ten-minute bars.
+  context_ticks: 960
+  # 5 sessions x 40 grid points (09:30..16:00 inclusive), minus the final
+  # Friday 16:00 tick, which prices the last interval and liquidates.
+  rollout_size: 199
   anno: "2010-01-01"
-  days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_top500_days_10d.csv"
+  days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_10d.csv"
   data_dir: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22"
-  # The dataset ends 2026-08-21, so 2026-07-25 begins its trailing four weeks.
+  # The dataset ends Friday 2026-08-21, so 2026-07-25 begins its trailing four
+  # calendar weeks and the first validation week starts Monday 2026-07-27.
   validation_weeks: 4
   date_val: "2026-07-25"
   enforce_market_hours: true
   price_feature_scale: 100.0
-  tokenizer:
-    vocab_size: 4096
-    bins_per_price: 64
-    max_abs_log_return: 0.20
-    mu: 255.0
 train:
   batch_size: 16
   steps_num: 50000
