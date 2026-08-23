@@ -104,6 +104,7 @@ class RelativeDirectionDataset(Dataset):
         targets: pd.DataFrame | None = None,
         limit: int | None = None,
         seed: int = 0,
+        anchor_minute: int | None = None,
     ):
         self.data_dir = str(data_dir)
         self.reference_symbol = str(reference_symbol)
@@ -116,6 +117,14 @@ class RelativeDirectionDataset(Dataset):
         self.seed = int(seed)
         self.day_ticks = session_tick_count(self.tick_minutes)
         self.first_offset, self.last_offset = regular_hours_offsets(self.tick_minutes)
+        self.fixed_anchor_offset: int | None = None
+        if anchor_minute is not None:
+            minute = int(anchor_minute)
+            if not RTH_OPEN_MINUTE <= minute <= RTH_CLOSE_MINUTE:
+                raise ValueError("anchor minute must be inside 09:30..16:00 Eastern")
+            if (minute - EXTENDED_OPEN_MINUTE) % self.tick_minutes:
+                raise ValueError("anchor minute must lie on the configured tick grid")
+            self.fixed_anchor_offset = (minute - EXTENDED_OPEN_MINUTE) // self.tick_minutes
         if self.horizon_days < 1:
             raise ValueError("horizon_days must be positive")
         # The window ends at the anchor, which sits at least at 09:30 of the
@@ -213,17 +222,30 @@ class RelativeDirectionDataset(Dataset):
         from the row index so its number does not move between runs.
         """
         low, high = self.first_offset, self.last_offset
+        if self.fixed_anchor_offset is not None:
+            return self.fixed_anchor_offset
         if self.should_augment:
             return int(np.random.randint(low, high + 1))
         generator = np.random.default_rng(self.seed + int(index))
         return int(generator.integers(low, high + 1))
 
-    def sample_seconds(self, session: int, offset: int) -> np.ndarray:
-        """Window timestamps ending at the anchor, then the labelled tick."""
+    def sample_seconds(
+        self, session: int, offset: int, minute_shift: int = 0
+    ) -> np.ndarray:
+        """Window timestamps ending at the anchor, then the labelled tick.
+
+        ``minute_shift`` supports evaluation between training-grid points while
+        retaining the same 10-minute cadence and 960-value input shape.
+        """
+        shift = int(minute_shift)
+        if not 0 <= shift < self.tick_minutes:
+            raise ValueError("minute_shift must be in [0, tick_minutes)")
         first = session - self.context_days
         grid = np.concatenate(
             [
-                self.context_sod[day] + np.arange(self.day_ticks, dtype=np.int64) * self.tick_seconds
+                self.context_sod[day]
+                + shift * 60
+                + np.arange(self.day_ticks, dtype=np.int64) * self.tick_seconds
                 for day in range(first, session + 1)
             ]
         )
@@ -231,7 +253,11 @@ class RelativeDirectionDataset(Dataset):
         window = grid[anchor - self.window_size + 1 : anchor + 1]
         if window.size != self.window_size:
             raise AssertionError("window construction produced the wrong length")
-        target = self.context_sod[session + self.horizon_days] + offset * self.tick_seconds
+        target = (
+            self.context_sod[session + self.horizon_days]
+            + shift * 60
+            + offset * self.tick_seconds
+        )
         return np.concatenate((window, [target]))
 
     def __getitem__(self, index: int) -> dict:
@@ -246,6 +272,14 @@ class RelativeDirectionDataset(Dataset):
         return {
             "_id": str(row.sample_id),
             "date": str(pd.Timestamp(row.date).date()),
+            "target_date": str(
+                pd.Timestamp(self.calendar_dates[int(row.session) + self.horizon_days]).date()
+            ),
+            "weekday": np.int64(pd.Timestamp(row.date).dayofweek),
+            "anchor_time": (
+                f"{(EXTENDED_OPEN_MINUTE + offset * self.tick_minutes) // 60:02d}:"
+                f"{(EXTENDED_OPEN_MINUTE + offset * self.tick_minutes) % 60:02d}"
+            ),
             "prices": prices.astype(np.float32),
             "reference_prices": reference.astype(np.float32),
             "secs": secs,

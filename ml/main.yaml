@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-cls-rel-2d"
+  experiment_name: "train-cls-rel-weekday-2d"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
   # Selects the supervised classifier over the PPO trading policies.
   task: "classification"
@@ -17,7 +17,8 @@ model:
     feature_dim: 1
     hidden_dim: 512
     depth: 4
-    scalar_dim: 1
+    # Anchor progress plus a five-way Monday--Friday one-hot encoding.
+    scalar_dim: 6
 data:
   reference_symbol: "ST-SPY"
   tick_minutes: 10

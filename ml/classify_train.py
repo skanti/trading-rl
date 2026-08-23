@@ -22,6 +22,7 @@ from classify import (
     CLASSIFY_SCALAR_NAMES,
     RelativeDirectionClassifier,
     binary_metrics,
+    build_classify_scalars,
     build_relative_features,
     relative_labels,
 )
@@ -56,7 +57,9 @@ def build_classifier(cfg: DictConfig, device: torch.device) -> RelativeDirection
 def prepare_batch(batch: dict, device: torch.device, cfg: DictConfig):
     prices = batch["prices"].to(device=device, dtype=torch.float32, non_blocking=True)
     reference = batch["reference_prices"].to(device=device, dtype=torch.float32, non_blocking=True)
-    scalars = batch["anchor_progress"].to(device=device, dtype=torch.float32).unsqueeze(-1)
+    anchor_progress = batch["anchor_progress"].to(device=device, dtype=torch.float32)
+    weekday = batch["weekday"].to(device=device, dtype=torch.long)
+    scalars = build_classify_scalars(anchor_progress, weekday)
     features = build_relative_features(
         prices, reference, float(cfg.data.get("price_feature_scale", 100.0))
     )

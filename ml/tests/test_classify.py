@@ -15,6 +15,7 @@ from classify import (
     CLASSIFY_SCALAR_DIM,
     RelativeDirectionClassifier,
     binary_metrics,
+    build_classify_scalars,
     build_relative_features,
     relative_labels,
     relative_log_prices,
@@ -26,6 +27,8 @@ from classify_dataset import (
     session_tick_count,
 )
 from classify_train import MAX_PARAMETERS, MIN_PARAMETERS, build_classifier
+from classify_evaluate import RegularMinuteSweepDataset
+from week_dataset import forward_filled_prices
 
 
 ANNO = datetime(2010, 1, 1, tzinfo=ZoneInfo("UTC"))
@@ -162,12 +165,34 @@ class ClassifierConfigTest(unittest.TestCase):
         parameters = sum(p.numel() for p in classifier.parameters())
         self.assertGreaterEqual(parameters, MIN_PARAMETERS)
         self.assertLessEqual(parameters, MAX_PARAMETERS)
-        self.assertEqual(parameters, 1_281_025)
+        self.assertEqual(parameters, 1_283_585)
 
     def test_classifier_emits_one_logit_per_window(self):
         classifier = RelativeDirectionClassifier(window_size=4, hidden_dim=8, depth=2)
-        logits = classifier(torch.randn(5, 4, CLASSIFY_FEATURE_DIM), torch.rand(5, 1))
+        logits = classifier(
+            torch.randn(5, 4, CLASSIFY_FEATURE_DIM),
+            torch.rand(5, CLASSIFY_SCALAR_DIM),
+        )
         self.assertEqual(logits.shape, (5,))
+
+    def test_scalars_contain_clock_and_weekday_one_hot(self):
+        scalars = build_classify_scalars(
+            torch.tensor([0.0, 0.5, 1.0]), torch.tensor([0, 2, 4])
+        )
+        self.assertEqual(scalars.shape, (3, CLASSIFY_SCALAR_DIM))
+        self.assertTrue(torch.equal(scalars[:, 0], torch.tensor([0.0, 0.5, 1.0])))
+        self.assertTrue(
+            torch.equal(
+                scalars[:, 1:],
+                torch.tensor(
+                    [
+                        [1.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 1.0],
+                    ]
+                ),
+            )
+        )
 
 
 class ClassifyDatasetTest(unittest.TestCase):
@@ -219,6 +244,40 @@ class ClassifyDatasetTest(unittest.TestCase):
         self.assertGreaterEqual(min(offsets), 33)
         self.assertLessEqual(max(offsets), 72)
 
+    def test_evaluation_can_pin_every_sample_to_one_minute(self):
+        dataset = self.dataset(anchor_minute=13 * 60)
+        self.assertEqual({dataset.anchor_offset(i) for i in range(len(dataset))}, {54})
+        sample = dataset[0]
+        self.assertEqual(sample["target_date"], str(pd.Timestamp(self.sessions[4]).date()))
+        stamps = pd.to_datetime(
+            [sample["secs"][-2], sample["secs"][-1]],
+            unit="s",
+            origin="2010-01-01",
+            utc=True,
+        ).tz_convert("US/Eastern")
+        self.assertEqual([(stamp.hour, stamp.minute) for stamp in stamps], [(13, 0), (13, 0)])
+
+    def test_evaluation_can_sweep_every_regular_minute(self):
+        base = self.dataset()
+        sweep = RegularMinuteSweepDataset(base)
+        self.assertEqual(len(sweep), len(base) * 390)
+        first, second, last = sweep[0], sweep[1], sweep[389]
+        self.assertEqual(
+            [first["anchor_time"], second["anchor_time"], last["anchor_time"]],
+            ["09:30", "09:31", "15:59"],
+        )
+        for sample in (first, second, last):
+            self.assertEqual(sample["target_date"], str(pd.Timestamp(self.sessions[4]).date()))
+        # 13:01 shifts the complete 10-minute lattice by one minute, while
+        # preserving the same model input length and two-session target clock.
+        at_1301 = sweep[211]
+        row = base.samples.iloc[0]
+        expected_secs = base.sample_seconds(int(row.session), 54, minute_shift=1)
+        expected = forward_filled_prices(
+            str(self.directory), str(row.sample_id), expected_secs
+        )
+        self.assertTrue(np.allclose(at_1301["prices"], expected))
+
     def test_label_tick_is_the_same_time_of_day_two_sessions_later(self):
         dataset = self.dataset()
         sample = dataset[0]
@@ -266,6 +325,7 @@ class ClassifyDatasetTest(unittest.TestCase):
         self.assertIn(relative_labels(prices, reference).item(), (0.0, 1.0))
         self.assertGreaterEqual(float(sample["anchor_progress"]), 0.0)
         self.assertLessEqual(float(sample["anchor_progress"]), 1.0)
+        self.assertEqual(int(sample["weekday"]), pd.Timestamp(sample["date"]).dayofweek)
 
 
 if __name__ == "__main__":

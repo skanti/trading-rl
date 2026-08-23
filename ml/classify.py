@@ -9,13 +9,18 @@ stock outperformed the reference".
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 import model
 
 
 CLASSIFY_FEATURE_NAMES = ("relative_log_price",)
 CLASSIFY_FEATURE_DIM = len(CLASSIFY_FEATURE_NAMES)
-CLASSIFY_SCALAR_NAMES = ("anchor_progress",)
+WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday")
+CLASSIFY_SCALAR_NAMES = (
+    "anchor_progress",
+    *(f"weekday_{name}" for name in WEEKDAY_NAMES),
+)
 CLASSIFY_SCALAR_DIM = len(CLASSIFY_SCALAR_NAMES)
 
 
@@ -63,6 +68,31 @@ def relative_labels(prices: torch.Tensor, reference_prices: torch.Tensor) -> tor
     """
     relative = relative_log_prices(prices, reference_prices)
     return (relative[:, -1] > relative[:, -2]).float()
+
+
+def build_classify_scalars(
+    anchor_progress: torch.Tensor, weekday: torch.Tensor
+) -> torch.Tensor:
+    """Current-session clock plus an explicit Monday--Friday one-hot vector."""
+    if anchor_progress.ndim != 1 or weekday.shape != anchor_progress.shape:
+        raise ValueError("anchor_progress and weekday must share one-dimensional shape")
+    if not torch.isfinite(anchor_progress).all():
+        raise ValueError("anchor_progress must be finite")
+    if anchor_progress.numel() and (
+        anchor_progress.lt(0).any() or anchor_progress.gt(1).any()
+    ):
+        raise ValueError("anchor_progress must be in [0, 1]")
+    weekday_long = weekday.to(torch.long)
+    if weekday.numel() and (
+        weekday.ne(weekday_long).any()
+        or weekday_long.lt(0).any()
+        or weekday_long.ge(len(WEEKDAY_NAMES)).any()
+    ):
+        raise ValueError("weekday must contain Monday=0 through Friday=4")
+    weekday_one_hot = F.one_hot(
+        weekday_long, num_classes=len(WEEKDAY_NAMES)
+    ).to(anchor_progress.dtype)
+    return torch.cat((anchor_progress.unsqueeze(-1), weekday_one_hot), dim=-1)
 
 
 def binary_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
