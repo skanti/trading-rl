@@ -6,3 +6,4 @@ pandas
 rich
 omegaconf
 fsspec
+pillow
