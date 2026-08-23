@@ -16,7 +16,7 @@ model:
     # One anchored log(stock/reference) path; neither raw path is exposed.
     feature_dim: 1
     # The narrower projection keeps the 9,600-point model near 1.3M parameters.
-    hidden_dim: 256
+    hidden_dim: 128
     depth: 4
     # Anchor progress plus a five-way Monday--Friday one-hot encoding.
     scalar_dim: 6
