@@ -15,7 +15,13 @@ from omegaconf import DictConfig
 
 import model
 from reference_mlp import MLP_REFERENCE_FEATURE_DIM, build_shifted_price_features
-from train import MarketRollout, generalized_advantages, market_rewards, ppo_update
+from train import (
+    MarketRollout,
+    generalized_advantages,
+    market_rewards,
+    ppo_update,
+    reward_metrics,
+)
 from week_dataset import SESSIONS_PER_WEEK, ticks_per_session
 
 
@@ -250,6 +256,32 @@ def overnight_metrics(positions: torch.Tensor, session_ticks: int) -> dict[str, 
     return {
         "overnight_fraction": held.mean().item(),
         "overnight_holds": held.sum(dim=1).mean().item(),
+    }
+
+
+WEEK_METRIC_FIELDS = (
+    "positions",
+    "rewards",
+    "costs",
+    "risk_costs",
+    "trades",
+    "forced_closes",
+)
+
+
+def week_metrics(
+    positions: torch.Tensor,
+    rewards: torch.Tensor,
+    costs: torch.Tensor,
+    risk_costs: torch.Tensor,
+    trades: torch.Tensor,
+    forced_closes: torch.Tensor,
+    session_ticks: int,
+) -> dict[str, float]:
+    """Full week report over any number of pooled rollouts."""
+    return {
+        **reward_metrics(positions, rewards, costs, risk_costs, trades, forced_closes),
+        **overnight_metrics(positions, session_ticks),
     }
 
 

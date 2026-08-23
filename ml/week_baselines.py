@@ -22,24 +22,11 @@ import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
 
+from week_dataset import forward_filled_prices
+
 
 MAG7 = ("ST-AAPL", "ST-MSFT", "ST-GOOGL", "ST-AMZN", "ST-NVDA", "ST-META", "ST-TSLA")
 WEEKS_PER_YEAR = 52.0
-
-
-def forward_filled_prices(data_dir: str, sample_id: str, secs: np.ndarray) -> np.ndarray:
-    """Last trade price at or before each timestamp, as the loaders resolve it."""
-    source = np.load(f"{data_dir}/{sample_id}.npy", mmap_mode="r")
-    if source.ndim != 2 or source.shape[1] < 3:
-        raise ValueError(f"{sample_id} must contain [seconds, price_mills, volume]")
-    source_secs = np.ascontiguousarray(source[:, 0]).astype(np.int64)
-    position = np.searchsorted(source_secs, secs, side="right") - 1
-    if (position < 0).any():
-        raise ValueError(f"{sample_id} has no print at or before the requested time")
-    prices = np.asarray(source[position, 1], dtype=np.float64) / 1000.0
-    if not np.isfinite(prices).all() or (prices <= 0).any():
-        raise ValueError(f"{sample_id} produced non-positive or non-finite prices")
-    return prices
 
 
 def week_schedule(

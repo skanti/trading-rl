@@ -320,50 +320,99 @@ def train_step(
     return rollout, losses
 
 
+def profit_factor(values: torch.Tensor) -> float:
+    """Gross gains over gross losses, with the degenerate cases named.
+
+    ``nan`` means nothing was ever at risk and ``inf`` means there was no losing
+    side. An epsilon-guarded ratio instead reports 0.0 for a policy that never
+    traded, which reads as a total loss and is the opposite of the truth, and
+    reports an arbitrary ``gross_profit / 1e-12`` when there are no losses.
+    """
+    gross_profit = float(values.clamp_min(0.0).sum())
+    gross_loss = float(-values.clamp_max(0.0).sum())
+    if gross_loss > 0.0:
+        return gross_profit / gross_loss
+    return float("inf") if gross_profit > 0.0 else float("nan")
+
+
 def performance_metrics(rewards: torch.Tensor) -> dict[str, float]:
     """Summarize net return paths used by both training and diagnostics.
 
-    Profit factor is total positive net timestep P&L divided by the absolute
-    total negative net timestep P&L. Drawdown is the worst peak-to-trough loss
-    within any rollout, with every rollout starting from zero equity.
+    ``profit_factor`` aggregates each rollout to a single net P&L before taking
+    the ratio, so it reads as "gains from winning rollouts over losses from
+    losing ones". Ratioing raw timesteps instead splits one week-long position
+    into ~199 fragments whose signs are mostly noise, which pins the result near
+    1.0 whatever the policy does; that version is kept as
+    ``profit_factor_timestep``. The rollout-level figure is the same statistic
+    ``week_baselines.py`` quotes, so validation and the rule-based baselines are
+    directly comparable. Drawdown is the worst peak-to-trough loss within any
+    rollout, with every rollout starting from zero equity.
     """
     if rewards.ndim != 2 or not rewards.numel():
         raise ValueError("rewards must have non-empty shape (batch, time)")
-    gross_profit = rewards.clamp_min(0.0).sum()
-    gross_loss = -rewards.clamp_max(0.0).sum()
-    profit_factor = gross_profit / gross_loss.clamp_min(1e-12)
 
     cumulative = rewards.cumsum(dim=1)
     cumulative_with_origin = torch.cat((torch.zeros_like(cumulative[:, :1]), cumulative), dim=1)
     running_peak = cumulative_with_origin.cummax(dim=1).values[:, 1:]
     max_drawdown = (running_peak - cumulative).amax()
+    rollout_pnl = rewards.sum(dim=1)
     return {
-        "return": rewards.sum(dim=1).mean().item(),
-        "profit_factor": profit_factor.item(),
+        "return": rollout_pnl.mean().item(),
+        "profit_factor": profit_factor(rollout_pnl),
+        "profit_factor_timestep": profit_factor(rewards),
         "max_drawdown": max_drawdown.item(),
     }
 
 
-def rollout_metrics(rollout: MarketRollout) -> dict[str, float]:
-    exposure = rollout.positions.float() / model.MAX_POSITION
+def reward_metrics(
+    positions: torch.Tensor,
+    rewards: torch.Tensor,
+    costs: torch.Tensor,
+    risk_costs: torch.Tensor,
+    trades: torch.Tensor,
+    forced_closes: torch.Tensor,
+) -> dict[str, float]:
+    """Aggregate rollout outcomes without needing the observation tensors.
+
+    Kept separate from :func:`rollout_metrics` so a validation pass can pool
+    every batch and summarize once. Ratio metrics such as profit factor are not
+    means, so averaging them per batch gives the wrong answer.
+    """
+    exposure = positions.float() / model.MAX_POSITION
     return {
-        **performance_metrics(rollout.rewards),
-        "reward": rollout.rewards.sum(dim=1).mean().item(),
-        "gross_reward": (rollout.rewards + rollout.costs + rollout.risk_costs).sum(dim=1).mean().item(),
-        "transaction_cost": rollout.costs.sum(dim=1).mean().item(),
-        "risk_cost": rollout.risk_costs.sum(dim=1).mean().item(),
+        **performance_metrics(rewards),
+        "reward": rewards.sum(dim=1).mean().item(),
+        "gross_reward": (rewards + costs + risk_costs).sum(dim=1).mean().item(),
+        "transaction_cost": costs.sum(dim=1).mean().item(),
+        "risk_cost": risk_costs.sum(dim=1).mean().item(),
         "position_abs": exposure.abs().mean().item(),
-        "trades": rollout.trades.float().sum(dim=1).mean().item(),
-        "forced_closes": rollout.forced_closes.float().mean().item(),
-        "long_fraction": rollout.positions.gt(0).float().mean().item(),
-        "short_fraction": rollout.positions.lt(0).float().mean().item(),
-        "flat_fraction": rollout.positions.eq(0).float().mean().item(),
+        "trades": trades.float().sum(dim=1).mean().item(),
+        "forced_closes": forced_closes.float().mean().item(),
+        "long_fraction": positions.gt(0).float().mean().item(),
+        "short_fraction": positions.lt(0).float().mean().item(),
+        "flat_fraction": positions.eq(0).float().mean().item(),
     }
+
+
+def rollout_metrics(rollout: MarketRollout) -> dict[str, float]:
+    return reward_metrics(
+        rollout.positions,
+        rollout.rewards,
+        rollout.costs,
+        rollout.risk_costs,
+        rollout.trades,
+        rollout.forced_closes,
+    )
 
 
 def main(cfg: DictConfig) -> None:
     # Keep main.yaml and the standard launch command as the single entry point
-    # while isolating each two-stream, one-position rollout in its own module.
+    # while isolating each experiment in its own module.
+    if str(cfg.general.get("task", "rl")).lower() == "classification":
+        from classify_train import main as classify_main
+
+        classify_main(cfg)
+        return
     rollout_mode = str(cfg.data.get("rollout_mode", "session")).lower()
     if rollout_mode == "week":
         from week_train import main as week_main

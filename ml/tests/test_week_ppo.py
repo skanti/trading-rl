@@ -113,23 +113,31 @@ class WeekGridTest(unittest.TestCase):
             pd.Timestamp("2026-07-25"),
         )
 
-    def test_week_config_matches_the_ten_minute_grid(self):
-        cfg = OmegaConf.load(Path(__file__).parents[1] / "main.yaml")
+    def test_week_model_dimensions_match_the_ten_minute_grid(self):
+        # The active main.yaml is intentionally a classification experiment;
+        # keep this legacy policy unit test independent of an active config.
+        cfg = OmegaConf.create(
+            {
+                "model": {
+                    "mlp": {
+                        "window_size": 960,
+                        "feature_dim": WEEK_FEATURE_DIM,
+                        "hidden_dim": 512,
+                        "depth": 4,
+                        "action_dim": 3,
+                        "scalar_dim": WEEK_SCALAR_DIM,
+                    }
+                }
+            }
+        )
         actor, critic = build_week_models(cfg, torch.device("cpu"))
         parameters = sum(
             parameter.numel()
             for parameter in chain(actor.parameters(), critic.parameters())
         )
-        self.assertEqual(str(cfg.data.rollout_mode), "week")
-        self.assertEqual(int(cfg.data.tick_minutes), 10)
-        self.assertEqual(
-            int(cfg.data.context_ticks),
-            week_context_ticks(int(cfg.data.context_days), int(cfg.data.tick_minutes)),
-        )
-        self.assertEqual(
-            int(cfg.data.rollout_size), week_rollout_size(int(cfg.data.tick_minutes))
-        )
-        self.assertLessEqual(actor.window_size, int(cfg.data.context_ticks) + 1)
+        self.assertEqual(week_context_ticks(10, 10), 960)
+        self.assertEqual(week_rollout_size(10), 199)
+        self.assertEqual(actor.window_size, 960)
         self.assertEqual(actor.scalar_dim, WEEK_SCALAR_DIM)
         self.assertLess(parameters, MAX_MLP_PARAMETERS)
 

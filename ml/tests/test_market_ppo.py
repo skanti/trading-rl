@@ -1,4 +1,5 @@
 import tempfile
+import math
 import unittest
 from pathlib import Path
 
@@ -146,11 +147,32 @@ class MarketPPOTest(unittest.TestCase):
         self.assertGreater(flat_reward.sum().item(), exposed_reward.sum().item())
 
     def test_performance_metrics_track_return_profit_factor_and_drawdown(self):
-        rewards = torch.tensor([[0.10, -0.04, 0.02], [-0.02, 0.01, 0.01]])
+        rewards = torch.tensor([[0.10, -0.04, 0.02], [-0.02, 0.01, -0.03]])
         metrics = performance_metrics(rewards)
-        self.assertAlmostEqual(metrics["return"], 0.04, places=6)
-        self.assertAlmostEqual(metrics["profit_factor"], 0.14 / 0.06, places=5)
+        self.assertAlmostEqual(metrics["return"], 0.02, places=6)
+        # Rollouts net to +0.08 and -0.04 before the ratio is taken.
+        self.assertAlmostEqual(metrics["profit_factor"], 0.08 / 0.04, places=5)
+        self.assertAlmostEqual(metrics["profit_factor_timestep"], 0.13 / 0.09, places=5)
         self.assertAlmostEqual(metrics["max_drawdown"], 0.04, places=6)
+
+    def test_profit_factor_names_its_degenerate_cases(self):
+        # A policy that never traded risked nothing; reporting 0.0 would read as
+        # a total loss, which is the opposite of the truth.
+        flat = performance_metrics(torch.zeros(3, 4))
+        self.assertTrue(math.isnan(flat["profit_factor"]))
+        self.assertTrue(math.isnan(flat["profit_factor_timestep"]))
+        self.assertEqual(flat["return"], 0.0)
+        winners = performance_metrics(torch.tensor([[0.01, 0.02], [0.03, 0.01]]))
+        self.assertEqual(winners["profit_factor"], float("inf"))
+        losers = performance_metrics(torch.tensor([[-0.01, -0.02]]))
+        self.assertEqual(losers["profit_factor"], 0.0)
+
+    def test_profit_factor_is_pooled_not_averaged_over_batches(self):
+        rewards = torch.tensor([[0.10, -0.04, 0.02], [-0.02, 0.01, -0.03]])
+        pooled = performance_metrics(rewards)["profit_factor"]
+        halves = [performance_metrics(rewards[i : i + 1])["profit_factor"] for i in (0, 1)]
+        self.assertEqual(halves[0], float("inf"))
+        self.assertNotAlmostEqual(pooled, halves[1], places=3)
 
     def test_dataset_returns_raw_window_without_symbol_or_absolute_context(self):
         with tempfile.TemporaryDirectory() as tmp:

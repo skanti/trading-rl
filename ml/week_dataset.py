@@ -58,6 +58,26 @@ def read_universe(path: str, size: int | None, exclude: str | None = None) -> tu
     return tuple(symbols)
 
 
+def forward_filled_prices(data_dir: str, sample_id: str, secs: np.ndarray) -> np.ndarray:
+    """Last trade price at or before each timestamp.
+
+    A missing bar means no new trade-derived observation, so the most recent
+    print is carried forward. This is the single price convention every loader
+    and baseline in this directory resolves prices with.
+    """
+    source = np.load(f"{data_dir}/{sample_id}.npy", mmap_mode="r")
+    if source.ndim != 2 or source.shape[1] < 3:
+        raise ValueError(f"{sample_id} must contain [seconds, price_mills, volume]")
+    source_secs = np.ascontiguousarray(source[:, 0]).astype(np.int64)
+    position = np.searchsorted(source_secs, secs, side="right") - 1
+    if (position < 0).any():
+        raise ValueError(f"{sample_id} has no print at or before the requested time")
+    prices = np.asarray(source[position, 1], dtype=np.float64) / 1000.0
+    if not np.isfinite(prices).all() or (prices <= 0).any():
+        raise ValueError(f"{sample_id} produced non-positive or non-finite prices")
+    return prices
+
+
 def ticks_per_context_day(tick_minutes: int) -> int:
     """Context bars kept from one 04:00--19:59 extended session."""
     if tick_minutes < 1 or EXTENDED_SESSION_BARS % tick_minutes:

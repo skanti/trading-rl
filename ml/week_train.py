@@ -18,6 +18,7 @@ import model
 import utils
 from train import rollout_metrics
 from week import (
+    WEEK_METRIC_FIELDS,
     WEEK_FEATURE_DIM,
     WEEK_FEATURE_NAMES,
     WEEK_SCALAR_DIM,
@@ -25,6 +26,7 @@ from week import (
     collect_week_rollout,
     overnight_metrics,
     validate_week_hours,
+    week_metrics,
     week_train_step,
 )
 from week_dataset import (
@@ -96,8 +98,7 @@ def validation_metrics(
     is ever made large enough for that to matter.
     """
     session_ticks = ticks_per_session(int(cfg.data.tick_minutes))
-    totals: dict[str, float] = {}
-    weight = 0.0
+    pooled: dict[str, list[torch.Tensor]] = {name: [] for name in WEEK_METRIC_FIELDS}
     for index, batch in enumerate(loader):
         if batches is not None and index >= int(batches):
             break
@@ -122,15 +123,15 @@ def validation_metrics(
             sampling="greedy",
             price_feature_scale=float(cfg.data.get("price_feature_scale", 100.0)),
         )
-        # Batches may differ in size once the tail batch is kept, so average by
-        # symbol-week rather than by batch.
-        count = float(prices.shape[0])
-        weight += count
-        for key, value in week_rollout_report(rollout, session_ticks).items():
-            totals[key] = totals.get(key, 0.0) + float(value) * count
-    if not weight:
+        # Collect the outcome tensors rather than per-batch summaries: profit
+        # factor and drawdown are not means, so they must be computed once over
+        # the pooled universe. Observation tensors are deliberately not kept.
+        for name in WEEK_METRIC_FIELDS:
+            pooled[name].append(getattr(rollout, name).cpu())
+    if not pooled["rewards"]:
         raise ValueError("validation loader produced no batches")
-    return {key: value / weight for key, value in totals.items()}
+    joined = {name: torch.cat(values, dim=0) for name, values in pooled.items()}
+    return week_metrics(session_ticks=session_ticks, **joined)
 
 
 def main(cfg: DictConfig) -> None:

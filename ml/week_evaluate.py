@@ -77,6 +77,7 @@ def evaluate(
     device: str,
     date_from: str | None = None,
     batch_size: int = 8,
+    date_to: str | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     cfg = OmegaConf.load(config_path)
     checkpoint_path = checkpoint_path or utils.load_most_recent_checkpoint(
@@ -105,9 +106,12 @@ def evaluate(
     days.date = pd.to_datetime(days.date, format="%Y-%m-%d")
     date_from = pd.Timestamp(date_from or str(cfg.data.date_val))
     targets = week_targets(days)
-    targets = targets[
-        targets.week_start.ge(date_from) & targets.sample_id.isin(symbols)
-    ].reset_index(drop=True)
+    selected = targets.week_start.ge(date_from) & targets.sample_id.isin(symbols)
+    if date_to is not None:
+        # Inclusive of the week that starts on ``date_to``, so a caller names
+        # the first and last Monday of the window rather than a boundary.
+        selected &= targets.week_start.le(pd.Timestamp(date_to))
+    targets = targets[selected].reset_index(drop=True)
     if not len(targets):
         raise ValueError(f"no weeks on or after {date_from.date()} for {sorted(symbols)}")
     absent = set(symbols).difference(targets.sample_id)
@@ -190,6 +194,8 @@ def evaluate(
         "symbols": sorted(set(frame.sample_id)),
         "weeks": sorted(set(frame.week_start)),
         "symbol_weeks": int(len(frame)),
+        "date_from": str(date_from.date()),
+        "date_to": None if date_to is None else str(pd.Timestamp(date_to).date()),
         **performance_metrics(rewards),
         "total_return": float(frame.policy_return.sum()),
         "mean_long_hold_return": float(frame.long_hold_return.mean()),
@@ -208,6 +214,7 @@ parser.add_argument("--checkpoint", default=None)
 parser.add_argument("--symbols", default=None, help="explicit comma-separated list")
 parser.add_argument("--top", type=int, default=None, help="top N of the ranked ticker list")
 parser.add_argument("--date_from", default=None)
+parser.add_argument("--date_to", default=None, help="last week_start to include")
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--batch_size", type=int, default=8)
 parser.add_argument("--output_path", default=None)
@@ -221,6 +228,7 @@ if __name__ == "__main__":
         args.device,
         args.date_from,
         args.batch_size,
+        args.date_to,
     )
     pd.set_option("display.width", 200)
     print(frame.to_string(index=False))
