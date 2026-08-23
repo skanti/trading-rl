@@ -12,6 +12,8 @@ from __future__ import annotations
 import logging
 import os
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -29,6 +31,31 @@ logger = logging.getLogger("WEEK_DATASET")
 FULL_SESSION_INTERVALS = 390  # 09:30 through 16:00 Eastern.
 SESSIONS_PER_WEEK = 5
 SCHEDULE_COLUMNS = ("sod_sec", "eod_sec", "context_sod_sec", "context_eod_sec")
+
+
+def read_universe(path: str, size: int | None, exclude: str | None = None) -> tuple[str, ...]:
+    """First ``size`` symbols of a rank-ordered ticker list.
+
+    ``tickers_all.txt`` is ordered by liquidity, so the head of the file is the
+    most-traded names. The reference symbol leads that file and is dropped, so
+    ``size=50`` means fifty tradable stocks rather than forty-nine plus SPY.
+    Relative paths resolve against this module, not the working directory.
+    """
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = Path(__file__).resolve().parent / resolved
+    symbols = [line.strip() for line in resolved.read_text().splitlines() if line.strip()]
+    if exclude is not None:
+        symbols = [symbol for symbol in symbols if symbol != exclude]
+    if size is not None:
+        if int(size) < 1:
+            raise ValueError("universe size must be positive")
+        if len(symbols) < int(size):
+            raise ValueError(f"{resolved} holds {len(symbols)} tradable symbols, fewer than {size}")
+        symbols = symbols[: int(size)]
+    if not symbols:
+        raise ValueError(f"{resolved} yielded no symbols")
+    return tuple(symbols)
 
 
 def ticks_per_context_day(tick_minutes: int) -> int:
@@ -358,7 +385,24 @@ def make_week_dataloader(cfg_data: DictConfig, cfg_split: DictConfig, seed: int)
         raise ValueError("split must be 'train' or 'val'")
 
     reference_symbol = str(cfg_data.reference_symbol)
-    asset_targets = targets[~targets.sample_id.eq(reference_symbol)].reset_index(drop=True)
+    asset_targets = targets[~targets.sample_id.eq(reference_symbol)]
+    # Validation is pinned to a fixed, liquid universe so its number means the
+    # same thing at every step and can be compared with the rule-based
+    # baselines, which are quoted on the same names.
+    universe = cfg_data.get("val_universe", None)
+    if cfg_split.split == "val" and universe is not None:
+        symbols = read_universe(
+            str(universe.path), universe.get("size", None), reference_symbol
+        )
+        asset_targets = asset_targets[asset_targets.sample_id.isin(symbols)]
+        missing = set(symbols).difference(asset_targets.sample_id)
+        if missing:
+            logger.warning(
+                "Validation universe symbols absent from the split, missing_num=%d, first=%s",
+                len(missing),
+                sorted(missing)[:5],
+            )
+    asset_targets = asset_targets.reset_index(drop=True)
     rank_indices = np.array_split(np.arange(len(asset_targets)), world_size)[rank]
     asset_targets = asset_targets.iloc[rank_indices]
 
@@ -388,6 +432,8 @@ def make_week_dataloader(cfg_data: DictConfig, cfg_split: DictConfig, seed: int)
         num_workers=int(cfg_split.workers_num),
         shuffle=bool(cfg_split.get("should_augment", False)),
         pin_memory=True,
-        drop_last=True,
+        # Validation must cover its whole universe, so its final partial batch
+        # is kept; training samples indefinitely and drops it.
+        drop_last=cfg_split.split != "val",
         persistent_workers=int(cfg_split.workers_num) > 0,
     )

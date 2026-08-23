@@ -1,11 +1,10 @@
 # Autoregressive PPO trading policies
 
-This directory provides a tokenized causal GPT and a shifted-window MLP, both
-trained with PPO and the same three inventory commands. `main.yaml` currently
-selects the time-anchored MLP. The GPT option preserves the complete causal
-sequence: 9,600 historical tokens prime its KV cache once, then the current day
-grows one token at a time from 09:30 through 15:59. The 16:00 price supplies the
-final reward and liquidation for both architectures.
+This directory trains shifted-window MLP trading policies with PPO over three
+inventory commands. `main.yaml` selects the intraweek policy: one rollout is a
+complete Monday--Friday week of 10-minute bars, so inventory persists across the
+four weeknights and is liquidated once, at Friday's close. A second policy,
+described at the end, trades two time-matched symbols at once.
 
 ## Action semantics
 
@@ -21,175 +20,61 @@ Positions are bounded to `{-1, 0, +1}`. A repeated `buy` while already long or
 `sell` while already short is a valid no-op: it adds no exposure, turnover, or
 transaction cost. Reversing takes two decisions (close, then open the other
 side). A configurable squared inventory penalty lets the policy prefer staying
-flat. Every sampled rollout is liquidated at its final regular-session price,
-including the corresponding cost, and never carries an overnight position.
+flat. Every sampled rollout is liquidated at its final price, including the
+corresponding cost, so nothing survives the end of the rollout — Friday's 16:00
+close for the intraweek policy, 16:00 the same day for the intraday one.
 
 ## Policy input and model
 
-Only active-asset and SPY prices are market inputs. Each price series is first
-converted to scale-free log returns. A mu-law quantizer maps each return to one
-of 64 levels, and the pair is combined into one token:
+Only active-asset and SPY prices are market inputs. SPY is observation-only: it
+is present in the day index but `WeekReferenceDataset` excludes it from tradable
+targets, so reward, turnover, risk, and liquidation come from the selected asset
+alone. Both instruments are completed on the same expected grid and their
+timestamps are then checked for exact equality. Volume, absolute price, and
+symbol identity are excluded.
 
-`token = asset_level * 64 + spy_level`
+The first decision uses the window ending at Monday 09:30. After each sampled
+command, the resulting inventory and a one-hot copy of that command are written
+at the newest position of the next one-bar-shifted window. Historical state
+channels are zero, so the context contains prices rather than fabricated no-op
+actions.
 
-That Cartesian product is exactly a 4,096-entry dictionary while retaining one
-token per timestamp. The position held over the preceding interval is supplied
-through a separate three-state short/flat/long embedding, and the previous
-command through a buy/nothing/sell/no-prior-command embedding. This one-tick
-shift keeps action history causal. Volume, absolute price, and symbol identity
-are excluded.
+Each window position carries eight features:
 
-The policy and value function share a GPT-2-style causal trunk with learned
-position embeddings and separate three-logit policy and scalar value heads.
-The default 6-layer, 256-wide model has about 8.3M parameters. Rollout uses a KV
-cache, so earlier context is never re-tokenized or truncated as the trading day
-grows. PPO optimization uses the equivalent full causal forward pass with a
-small fixed entropy bonus and no entropy schedule.
+| # | feature |
+|---:|---|
+| 1--2 | relative log price, asset and SPY |
+| 3--4 | one-bar log return, asset and SPY |
+| 5 | active-asset inventory |
+| 6--8 | previous-command indicators (buy / nothing / sell) |
 
-## Verify on toy data
-
-The online toy provider samples three or four random log-price anchors, fits a
-quadratic or cubic Bezier curve through them, samples a full price path from the
-curve, and adds IID innovations to its log returns before integrating them into
-price. This avoids the predictable mean reversion produced by independent
-price-level noise. Absolute price is independently randomized over two orders
-of magnitude. Training batches are generated in memory and are never written
-to disk; evaluation uses a fixed seed and a held-out batch.
-
-The toy provider remains a focused legacy MLP verification harness. The real
-asset/SPY path selected by `main.yaml` does not mix synthetic paths into its
-training or validation data.
-
-```bash
-python -m unittest discover -s tests -v
-python toy_train.py --updates 400 --device cpu
-```
-
-The second command fails unless held-out position accuracy reaches 85%, active
-direction accuracy reaches 90%, and reward is both positive and better than the
-untrained policy. It prints the verification summary without writing generated
-files. Flat accuracy remains in the report as a diagnostic rather than a gate:
-with transaction costs, closing on every isolated low-slope tick is not always
-the reward-maximizing behavior.
-
-## Train on market data
-
-Input `.npy` files must contain at least `[seconds, price_mills, volume]`. Build
-the day/index CSV (including expected extended- and regular-session times) once,
-then set `data.use_toy: false`, choose a new experiment name, and configure
-`DATA_DIR`, `EXP_DIR`, and the paths in [main.yaml](main.yaml):
-
-```bash
-python ../scripts/split.py \
-  --sample_ids ../data/top500.txt \
-  --npy_dir "$DATA_DIR/ppv1/updates/full_2026-08-22" \
-  --out_path "$DATA_DIR/ppv1/updates/full_2026-08-22_top500_days_10d.csv" \
-  --rollout_size 390
-python train.py --config_path main.yaml
-```
-
-The configured 390-step rollout spans the complete 09:30–16:00 US/Eastern
-session, so positions and autoregressive action history persist for the entire
-day before mandatory close liquidation. Missing bars in both the historical
-extended sessions and current regular session are completed in memory by
-carrying the last price forward and assigning zero volume. Weekends, holidays,
-and half days are absent from the session metadata rather than being invented.
-Checkpoints contain the shared transformer, optimizer, scheduler, tokenizer,
-resolved config, and input ordering, which is enough to resume training or
-construct the same policy for greedy inference.
-
-Training CSVs track net `return`, timestep `profit_factor`, worst
-`max_drawdown`, and mean position changes in `trades` for every logged
-batch. Backtest JSONs report `return`, `total_return`, `profit_factor`,
-`maximum_cumulative_drawdown`, `mean_trades`, and `total_trades`. Profit factor
-uses positive versus negative net timestep P&L after transaction and risk
-costs; a trade is any change in the bounded position. Repeated commands at a
-position boundary are therefore not trades.
-
-The trainer evaluates greedy rollouts on the reserved trailing four weeks every
-500 updates. These rows use `stage=1` in `metrics.csv`; training rows use
-`stage=0`.
-
-## Checkpoint compatibility
-
-Checkpoints from the former MLP and 11-action policies are intentionally
-incompatible with the shared GPT actor-critic. The default experiment name is
-new so training starts from scratch.
-
-## SPY-reference experiment
-
-`main.yaml` trains the three-action, single-asset policy on real
-market data while adding SPY as an observation-only reference. SPY is present
-in `top500.txt` and the day index, but `MarketReferenceDataset` explicitly
-excludes it from tradable targets. Reward, turnover, risk, and liquidation are
-therefore calculated only from the selected asset.
-
-Each tick contains the joint asset/SPY price-return token plus the asset's
-position/action state. Both instruments are independently completed on the
-same expected minute grid, then their timestamps are checked for exact equality.
-
-The final four calendar weeks are reserved for validation. For this snapshot,
-whose last session is 2026-08-21, validation begins on 2026-07-25 (the first
-session is Monday, 2026-07-27). Greedy validation is run every 500 updates and
-written to `metrics.csv` with `stage=1`; training rows use `stage=0`.
-
-```bash
-python train.py --config_path main.yaml
-```
-
-## Shifted-window MLP baseline
-
-The default `main.yaml` selects the price-only MLP baseline and retains the GPT
-settings for architecture comparisons. Its first decision uses a 4,096-minute
-window ending at 09:30. After
-each sampled command, the resulting inventory and a one-hot copy of that
-command are written at the newest position of the next one-minute-shifted
-window. Historical state channels are zero, so the context contains prices
-rather than fabricated no-op actions.
-
-Each window position has eight features: relative log price and log return for
-the asset and SPY, active-asset inventory, and three previous-action indicators.
 The fixed flattened input coordinates already encode oldest-to-newest window
-position, so the MLP does not add a transformer-style positional encoding. A
-single normalized `time_to_close` scalar is appended after the flattened
-window: it starts at `1.0` at 09:30 and falls to `1/390` at 15:59. It is supplied
-once rather than repeated across every window row. The default actor and critic
-contain 17,174,020 parameters in total.
+position, so the MLP adds no transformer-style positional encoding. Scalars that
+carry a single number are appended once after the flattened window rather than
+broadcast across every row, which would spend hundreds of inputs to say one
+thing.
 
-Train the configured MLP directly; no second YAML file is required:
+The actor and critic are 512 wide and four deep over `960 * 8 + 4` inputs,
+9,447,428 parameters in total.
 
-```bash
-python train.py --config_path main.yaml
-```
-
-## Intraweek experiment on 10-minute bars
-
-`week.yaml` keeps the three-action policy, the SPY reference, and the ten-day
-context of the intraday experiment, and changes two things: the clock runs at
-ten minutes instead of one minute, and one rollout is a complete Monday--Friday
-week instead of a single session. Inventory therefore persists across the four
-weeknights and the reachable holding period grows from hours to days.
-
-```bash
-python week_train.py --config_path week.yaml
-```
+## Intraweek rollout
 
 ### Grid
 
-| | intraday (`main.yaml`) | intraweek (`week.yaml`) |
+| | intraweek (`main.yaml`) | intraday predecessor |
 |---|---:|---:|
-| bar | 1 min | 10 min |
-| context | 9,600 ticks (10 extended sessions) | 960 ticks (10 extended sessions) |
-| MLP window | 4,096 ticks (~4.3 days) | 960 ticks (10 days) |
-| rollout | 390 decisions (one session) | 199 decisions (five sessions) |
-| liquidation | every 16:00 | Friday 16:00 only |
+| bar | 10 min | 1 min |
+| context | 960 ticks (10 extended sessions) | 9,600 ticks (10 extended sessions) |
+| MLP window | 960 ticks (10 days) | 4,096 ticks (~4.3 days) |
+| rollout | 199 decisions (five sessions) | 390 decisions (one session) |
+| liquidation | Friday 16:00 only | every 16:00 |
 
 A regular session contributes 40 grid points at ten-minute spacing, 09:30
 through 16:00 inclusive, so a week holds 200 points and 199 of them are
 decisions. The last point is Friday's close: it prices the final interval and
 liquidates, and is never itself a decision. Each 04:00--19:59 extended session
 contributes 96 context points, so the ten-day context is 960 ticks and the MLP
-window now spans the whole context rather than a slice of it.
+window spans the whole context rather than a slice of it.
 
 ### Bars are subsampled, not averaged
 
@@ -222,19 +107,35 @@ and `overnight_holds` (their mean count per week).
 
 ### Anchoring the price at Monday 09:30
 
-The per-tick price channels stay anchored to the newest tick in the window, as
-in the intraday policy. That is what keeps the input stationary: the newest
-element is always zero and the rest are log distances from it, so a Friday
-window and a Monday window are on the same scale and the same weights read both.
-Re-anchoring all 960 window rows to Monday 09:30 would replace that with a
-feature whose typical magnitude grows through the week and whose zero drifts
-backwards out of the window, which is a harder input for a flat MLP and buys
-nothing the window does not already contain — Monday 09:30 is still inside the
-960-tick window at Friday's close.
+The per-tick price channels stay anchored to the newest tick in the window. That
+is what keeps the input stationary: the newest element is always zero and the
+rest are log distances from it, so a Friday window and a Monday window are on
+the same scale and the same weights read both. Re-anchoring all 960 window rows
+to Monday 09:30 would break that. Coordinate `j` of the rolling window is always
+a return over exactly `959 - j` bars ending now; against a fixed anchor its lag
+depends on where the decision sits in the week, and the first layer has one
+weight row per coordinate to encode one meaning. Measured on real weeks, the
+newest coordinate under a Monday anchor is identically zero at Monday's open and
+has a cross-sample std of 8.3 by Friday, a distribution shift inside a single
+rollout. Overall input magnitude is unaffected — it is the per-coordinate
+meaning that degrades.
+
+Re-anchoring is also cheap. Consecutive windows differ by a pure constant equal
+to minus the latest return, verified constant across all 959 shared ticks: a
+median 0.135 against a median within-window spread of 2.36, and the return
+channels do not move at all because a constant cancels in a first difference.
+An MLP recomputes from scratch every step, so nothing is being invalidated; the
+same choice would have broken the retired GPT path, whose KV cache needs a
+tick's encoding to stay fixed once written.
+
+Anchoring on the first context bar is worse still. Extended-hours coverage is
+thin — a median 623 of 960 minute bars are missing on tradable symbol-days, and
+97% of days are more than half missing — so that print is usually a stale carry
+forward, and its error would enter all 7,684 inputs.
 
 Week-to-date return is still worth stating explicitly, because it prices the
-decision the policy is actually being asked to make, so it is supplied as two
-scalars appended once per decision rather than broadcast across the window:
+decision the policy is actually being asked to make, so it is supplied as two of
+the four appended scalars:
 
 | scalar | meaning |
 |---|---|
@@ -247,9 +148,6 @@ scalars appended once per decision rather than broadcast across the window:
 zero exactly on the decision that chooses whether to carry inventory overnight,
 which is the only decision in the day whose next interval is seventeen hours
 long. The intraday policy needed no such marker because it had one deadline.
-
-The actor and critic are 512 wide and four deep over `960 * 8 + 4` inputs,
-9,447,428 parameters in total.
 
 ### Weeks are all-or-nothing
 
@@ -268,10 +166,91 @@ validation week must start on or after it, so no rollout straddles the boundary.
 With the snapshot's last session on Friday 2026-08-21, the trailing four weeks
 begin Saturday 2026-07-25 and the first validation week opens Monday 2026-07-27.
 
-`model.gamma` is raised from 0.99 to 0.999. At one decision per ten minutes the
-old value discounts Friday's close to about 1e-9 seen from Monday, which would
-make the multi-day holding period the experiment exists to test invisible to the
-advantage estimate.
+`model.gamma` is 0.999 rather than the intraday 0.99. At one decision per ten
+minutes the smaller value discounts Friday's close to about 1e-9 seen from
+Monday, which would make the multi-day holding period the experiment exists to
+test invisible to the advantage estimate.
+
+## Train on market data
+
+Input `.npy` files must contain at least `[seconds, price_mills, volume]`. Build
+the day/index CSV (including expected extended- and regular-session times) once,
+then configure `DATA_DIR`, `EXP_DIR`, and the paths in [main.yaml](main.yaml):
+
+```bash
+python ../scripts/split.py \
+  --sample_ids ../data/top500.txt \
+  --npy_dir "$DATA_DIR/ppv1/updates/full_2026-08-22" \
+  --out_path "$DATA_DIR/ppv1/updates/full_2026-08-22_10d.csv" \
+  --rollout_size 390
+python train.py --config_path main.yaml
+```
+
+`train.py` dispatches on `data.rollout_mode`: `week` runs the intraweek trainer,
+`session` runs the intraday one. The day index is shared — it is always built at
+one-minute resolution, and the week loader subsamples it.
+
+Missing bars in both the historical extended sessions and the traded regular
+sessions are completed in memory by carrying the last price forward. Weekends,
+holidays, and half days are absent from the session metadata rather than being
+invented. Checkpoints contain the actor, critic, optimizer, scheduler, resolved
+config, and input ordering, which is enough to resume training or construct the
+same policy for greedy inference.
+
+Training CSVs track net `return`, timestep `profit_factor`, worst
+`max_drawdown`, and mean position changes in `trades` for every logged
+batch. Backtest JSONs report `return`, `total_return`, `profit_factor`,
+`maximum_cumulative_drawdown`, `mean_trades`, and `total_trades`. Profit factor
+uses positive versus negative net timestep P&L after transaction and risk
+costs; a trade is any change in the bounded position. Repeated commands at a
+position boundary are therefore not trades.
+
+The trainer evaluates greedy rollouts on the reserved trailing four weeks every
+500 updates. These rows use `stage=1` in `metrics.csv`; training rows use
+`stage=0`.
+
+## Verify on toy data
+
+The online toy provider samples three or four random log-price anchors, fits a
+quadratic or cubic Bezier curve through them, samples a full price path from the
+curve, and adds IID innovations to its log returns before integrating them into
+price. This avoids the predictable mean reversion produced by independent
+price-level noise. Absolute price is independently randomized over two orders
+of magnitude. Training batches are generated in memory and are never written
+to disk; evaluation uses a fixed seed and a held-out batch.
+
+The toy provider remains a focused legacy MLP verification harness. The real
+asset/SPY path selected by `main.yaml` does not mix synthetic paths into its
+training or validation data.
+
+```bash
+python -m unittest discover -s tests -v
+python toy_train.py --updates 400 --device cpu
+```
+
+The second command fails unless held-out position accuracy reaches 85%, active
+direction accuracy reaches 90%, and reward is both positive and better than the
+untrained policy. It prints the verification summary without writing generated
+files. Flat accuracy remains in the report as a diagnostic rather than a gate:
+with transaction costs, closing on every isolated low-slope tick is not always
+the reward-maximizing behavior.
+
+## Intraday predecessor
+
+`reference_mlp.py` and `reference_mlp_train.py` keep the one-session policy the
+intraweek experiment grew out of, reachable with `data.rollout_mode: session`.
+It decides once per minute from a 4,096-minute window, appends a single
+`time_to_close` scalar that starts at `1.0` at 09:30 and falls to `1/390` at
+15:59, and is liquidated at every 16:00. The intraweek code reuses its window
+builder and its trailing-validation split, so the two policies differ only in
+clock, rollout span, and appended scalars.
+
+## Checkpoint compatibility
+
+Intraweek checkpoints record `feature_names` and `scalar_names` and are refused
+by the intraday trainer, and vice versa: the two disagree on `scalar_dim`, so
+loading one into the other would silently mismatch the input layout. Checkpoints
+from the retired tokenized-GPT and 11-action policies are incompatible with both.
 
 
 # Relative-value pair policy

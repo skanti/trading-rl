@@ -33,8 +33,6 @@ model:
     entropy: 0.01
 data:
   use_toy: false
-  # Selects the Mon--Fri week rollout over the one-session rollout.
-  rollout_mode: "week"
   reference_symbol: "ST-SPY"
   tick_minutes: 10
   context_days: 10
@@ -52,11 +50,6 @@ data:
   date_val: "2026-07-25"
   enforce_market_hours: true
   price_feature_scale: 100.0
-  # Validation is pinned to the 50 most-traded stocks so its number is stable
-  # across steps and directly comparable with week_baselines.py.
-  val_universe:
-    path: "../data/tickers_all.txt"
-    size: 50
 train:
   batch_size: 64
   steps_num: 50000
@@ -70,8 +63,7 @@ val:
   workers_num: 1
   split: "val"
   should_augment: false
-  # null runs one full pass over the pinned universe; an integer caps it.
-  validation_batches: null
+  validation_batches: 10
 loop:
   log_interval: 20
   validation_interval: 500

@@ -84,15 +84,24 @@ def week_rollout_report(rollout, session_ticks: int) -> dict[str, float]:
 @torch.no_grad()
 def validation_metrics(
     actor: model.TradingActor,
-    iterator,
-    batches: int,
+    loader,
+    batches: int | None,
     cfg: DictConfig,
     device: torch.device,
 ) -> dict[str, float]:
+    """Greedy metrics over the pinned validation universe.
+
+    One full pass by default, so the number covers every held-out symbol-week
+    and does not move with sampling. ``batches`` caps the pass if the universe
+    is ever made large enough for that to matter.
+    """
     session_ticks = ticks_per_session(int(cfg.data.tick_minutes))
     totals: dict[str, float] = {}
-    for _ in range(batches):
-        prices, reference_prices, secs = prepare_week_batch(next(iterator), device)
+    weight = 0.0
+    for index, batch in enumerate(loader):
+        if batches is not None and index >= int(batches):
+            break
+        prices, reference_prices, secs = prepare_week_batch(batch, device)
         validate_week_hours(
             secs,
             int(cfg.data.context_ticks),
@@ -113,9 +122,15 @@ def validation_metrics(
             sampling="greedy",
             price_feature_scale=float(cfg.data.get("price_feature_scale", 100.0)),
         )
+        # Batches may differ in size once the tail batch is kept, so average by
+        # symbol-week rather than by batch.
+        count = float(prices.shape[0])
+        weight += count
         for key, value in week_rollout_report(rollout, session_ticks).items():
-            totals[key] = totals.get(key, 0.0) + float(value)
-    return {key: value / batches for key, value in totals.items()}
+            totals[key] = totals.get(key, 0.0) + float(value) * count
+    if not weight:
+        raise ValueError("validation loader produced no batches")
+    return {key: value / weight for key, value in totals.items()}
 
 
 def main(cfg: DictConfig) -> None:
@@ -140,7 +155,6 @@ def main(cfg: DictConfig) -> None:
     train_loader = make_week_dataloader(cfg.data, cfg.train, int(cfg.train.seed))
     validation_loader = make_week_dataloader(cfg.data, cfg.val, int(cfg.train.seed))
     train_iterator = utils.cycle(train_loader)
-    validation_iterator = utils.cycle(validation_loader)
     actor, critic = build_week_models(cfg, device)
     parameters = list(chain(actor.parameters(), critic.parameters()))
     optimizer = optim.AdamW(
@@ -156,7 +170,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(
         "Intraweek MLP summary, trainable_params_num=%.2fM, tick_minutes=%d, "
         "window_size=%d, context_ticks=%d, rollout_size=%d, train_weeks=%d, "
-        "validation_weeks=%d",
+        "validation_symbol_weeks=%d",
         sum(parameter.numel() for parameter in parameters) / 1e6,
         tick_minutes,
         window_size,
@@ -189,7 +203,8 @@ def main(cfg: DictConfig) -> None:
 
     total_steps = int(cfg.train.steps_num)
     validation_interval = int(cfg.loop.validation_interval)
-    validation_batches = int(cfg.val.validation_batches)
+    configured_batches = cfg.val.get("validation_batches", None)
+    validation_batches = None if configured_batches is None else int(configured_batches)
     enforce_hours = bool(cfg.data.get("enforce_market_hours", True))
     last_losses: dict[str, float] = {}
     logger.info(
@@ -226,7 +241,7 @@ def main(cfg: DictConfig) -> None:
             )
         if current_step % validation_interval == 0:
             metrics = validation_metrics(
-                actor, validation_iterator, validation_batches, cfg, device
+                actor, validation_loader, validation_batches, cfg, device
             )
             csv_logger.write(
                 {
