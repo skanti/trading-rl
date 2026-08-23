@@ -38,7 +38,7 @@ data:
     path: "../data/tickers_all.txt"
     size: 50
 train:
-  batch_size: 256
+  batch_size: 64
   steps_num: 50000
   workers_num: 8
   split: "train"
@@ -46,7 +46,7 @@ train:
   should_augment: true
   seed: 0
 val:
-  batch_size: 256
+  batch_size: 64
   workers_num: 4
   split: "val"
   should_augment: false
