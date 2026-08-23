@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-cls-rel-weekday-3d"
+  experiment_name: "train-cls-rel-weekday-1d"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
   # Selects the supervised classifier over the PPO trading policies.
   task: "classification"
@@ -27,7 +27,7 @@ data:
   # 10 extended sessions x 960 one-minute observations, ending at the anchor.
   window_size: 9600
   # Trading sessions ahead, evaluated at the same time of day.
-  horizon_days: 3
+  horizon_days: 1
   anno: "2010-01-01"
   days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_10d.csv"
   data_dir: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22"

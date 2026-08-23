@@ -8,7 +8,6 @@ from omegaconf import OmegaConf
 from classify_evaluate import (
     RegularMinuteSweepDataset,
     evaluate_bets,
-    evaluate_top_bottom,
     parse_anchor_time,
     summarize_trades,
 )
@@ -142,52 +141,41 @@ class ClassifyEvaluateTest(unittest.TestCase):
         self.assertAlmostEqual(frame.transaction_cost.item(), 0.002)
         self.assertAlmostEqual(frame.net_return_on_gross_capital.item(), 0.048, places=6)
 
-    def test_top_bottom_ranks_each_day_and_does_not_reopen_active_symbols(self):
-        symbols = ["A", "B", "C", "D", "E", "F"]
-        classifier = FixedClassifier(
-            [3.0, 2.0, 1.0, -1.0, -2.0, -3.0] * 2
-        )
-        exit_prices = torch.tensor(
-            [105.0, 104.0, 103.0, 99.0, 98.0, 97.0] * 2
-        )
-        prices = torch.full((12, 5), 100.0)
-        prices[:, -1] = exit_prices
-        reference = torch.full((12, 5), 100.0)
+    def test_top3_mode_keeps_only_the_most_confident_symbols_per_minute(self):
+        classifier = FixedClassifier([3.0, 2.0, -4.0, -1.0, 0.1])
+        prices = torch.full((5, 5), 100.0)
+        prices[:, -1] = torch.tensor([105.0, 104.0, 97.0, 99.0, 101.0])
+        reference = torch.full((5, 5), 100.0)
         batch = {
-            "_id": symbols * 2,
-            "date": ["2026-08-03"] * 6 + ["2026-08-04"] * 6,
-            "target_date": ["2026-08-05"] * 6 + ["2026-08-06"] * 6,
-            "anchor_time": ["13:00"] * 12,
-            "weekday": torch.tensor([0] * 6 + [1] * 6),
+            "_id": ["A", "B", "C", "D", "E"],
+            "date": ["2026-08-03"] * 5,
+            "target_date": ["2026-08-05"] * 5,
+            "anchor_time": ["13:00"] * 5,
+            "weekday": torch.tensor([0] * 5),
             "prices": prices,
             "reference_prices": reference,
-            "anchor_progress": torch.full((12,), 0.5),
+            "anchor_progress": torch.full((5,), 0.5),
         }
         cfg = OmegaConf.create({"data": {"price_feature_scale": 100.0}})
 
-        frame, logits, labels = evaluate_top_bottom(
+        frame, logits, labels = evaluate_bets(
             classifier,
             [batch],
             cfg,
             torch.device("cpu"),
-            top_k=1,
-            min_score_spread=0.0,
+            min_confidence=0.60,
             position_mode="stock",
-            transaction_cost_bps=10.0,
+            transaction_cost_bps=0.0,
+            max_trades_per_minute=3,
         )
 
-        self.assertEqual(frame.sample_id.tolist(), ["A", "F", "B", "E"])
-        self.assertEqual(frame.selection_bucket.tolist(), ["top", "bottom"] * 2)
-        self.assertEqual(frame.direction.tolist(), [1, -1, 1, -1])
-        self.assertEqual(frame.entry_date.tolist(), [
-            "2026-08-03", "2026-08-03", "2026-08-04", "2026-08-04"
-        ])
+        self.assertEqual(frame.sample_id.tolist(), ["C", "A", "B"])
+        self.assertEqual(frame.direction.tolist(), [-1, 1, 1])
+        self.assertTrue(frame.confidence.is_monotonic_decreasing)
         self.assertTrue(frame.signal_correct.all())
         self.assertTrue(frame.trade_won.all())
-        self.assertTrue(frame.transaction_cost.eq(0.002).all())
-        self.assertTrue(frame.score_spread.gt(0).all())
-        self.assertEqual(logits.numel(), 12)
-        self.assertEqual(labels.numel(), 12)
+        self.assertEqual(logits.numel(), 5)
+        self.assertEqual(labels.numel(), 5)
 
 
 if __name__ == "__main__":

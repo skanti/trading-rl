@@ -1,4 +1,4 @@
-"""Backtest confidence-filtered or cross-sectional classifier strategies."""
+"""Fixed-minute, two-session backtest for relative-direction checkpoints."""
 
 from __future__ import annotations
 
@@ -238,15 +238,12 @@ def summarize_trades(
     last_date: pd.Timestamp,
     anchor_time: str,
     horizon_days: int,
-    confidence_threshold: float | None,
+    confidence_threshold: float,
     position_mode: str,
     transaction_cost_bps: float,
     requested_symbols: tuple[str, ...],
     entry_minutes_per_stock_day: int = 1,
-    strategy: str = "confidence",
-    top_k: int | None = None,
-    min_score_spread: float | None = None,
-    allow_position_overlap: bool = False,
+    selection_mode: str = "threshold",
 ) -> dict[str, object]:
     candidate = binary_metrics(candidate_logits, candidate_labels)
     entry_minutes = int(entry_minutes_per_stock_day)
@@ -259,11 +256,9 @@ def summarize_trades(
         "data_last_date": str(last_date.date()),
         "anchor_time_eastern": anchor_time,
         "horizon_trading_days": horizon_days,
-        "strategy": strategy,
+        "selection_mode": selection_mode,
+        "max_trades_per_minute": 3 if selection_mode == "top3" else None,
         "confidence_threshold": confidence_threshold,
-        "top_k_per_side": top_k,
-        "min_score_spread": min_score_spread,
-        "allow_position_overlap": allow_position_overlap,
         "position_mode": position_mode,
         "transaction_cost_bps_per_side": transaction_cost_bps,
         "requested_symbols": len(requested_symbols),
@@ -282,7 +277,6 @@ def summarize_trades(
         summary.update(
             {
                 "symbols_traded": 0,
-                "entry_dates_traded": 0,
                 "long_trades": 0,
                 "short_trades": 0,
                 "signal_win_rate": float("nan"),
@@ -296,21 +290,10 @@ def summarize_trades(
                 "equal_weight_cohort_max_drawdown": float("nan"),
             }
         )
-        if strategy == "top_bottom":
-            summary.update(
-                {
-                    "cohorts_traded": 0,
-                    "mean_score_spread": float("nan"),
-                    "min_traded_score_spread": float("nan"),
-                    "mean_long_probability_outperform": float("nan"),
-                    "mean_short_probability_outperform": float("nan"),
-                }
-            )
         return summary
 
     returns = frame.net_return_on_gross_capital
-    cohort_keys = ["entry_date", "anchor_time"]
-    cohorts = frame.groupby(cohort_keys, sort=True).net_return_on_gross_capital.mean()
+    cohorts = frame.groupby("entry_date", sort=True).net_return_on_gross_capital.mean()
     equity = cohorts.cumsum()
     equity_with_origin = pd.concat((pd.Series([0.0]), equity), ignore_index=True)
     drawdown = equity_with_origin.cummax() - equity_with_origin
@@ -332,21 +315,6 @@ def summarize_trades(
             "equal_weight_cohort_max_drawdown": float(drawdown.max()),
         }
     )
-    if "score_spread" in frame:
-        cohort_spreads = frame.groupby(cohort_keys, sort=True).score_spread.first()
-        summary.update(
-            {
-                "cohorts_traded": int(len(cohort_spreads)),
-                "mean_score_spread": float(cohort_spreads.mean()),
-                "min_traded_score_spread": float(cohort_spreads.min()),
-                "mean_long_probability_outperform": float(
-                    frame.loc[frame.direction.gt(0), "probability_outperform"].mean()
-                ),
-                "mean_short_probability_outperform": float(
-                    frame.loc[frame.direction.lt(0), "probability_outperform"].mean()
-                ),
-            }
-        )
     return summary
 
 
@@ -360,6 +328,7 @@ def evaluate_bets(
     position_mode: str,
     transaction_cost_bps: float,
     show_progress: bool = False,
+    max_trades_per_minute: int | None = None,
 ) -> tuple[pd.DataFrame, torch.Tensor, torch.Tensor]:
     """Score candidates and return one row for every thresholded unit bet.
 
@@ -373,8 +342,11 @@ def evaluate_bets(
         raise ValueError("position_mode must be 'relative' or 'stock'")
     if transaction_cost_bps < 0:
         raise ValueError("transaction_cost_bps must be non-negative")
+    if max_trades_per_minute is not None and int(max_trades_per_minute) < 1:
+        raise ValueError("max_trades_per_minute must be positive")
 
     rows: list[dict[str, object]] = []
+    minute_candidates: dict[tuple[str, str], list[dict[str, object]]] = {}
     all_logits: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
     cost_rate = float(transaction_cost_bps) / 10_000.0
@@ -414,197 +386,52 @@ def evaluate_bets(
                 gross_capital = 1.0
                 side = "long_stock" if direction > 0 else "short_stock"
             net_pnl = gross_pnl - transaction_cost
-            rows.append(
-                {
-                    "sample_id": batch["_id"][index],
-                    "entry_date": batch["date"][index],
-                    "exit_date": batch["target_date"][index],
-                    "anchor_time": batch["anchor_time"][index],
-                    "side": side,
-                    "direction": int(direction),
-                    "probability_outperform": float(probabilities[index]),
-                    "confidence": float(confidence[index]),
-                    "actual_outperform": int(labels[index]),
-                    "signal_correct": bool(directions[index].gt(0).eq(labels[index].bool())),
-                    "stock_entry_price": float(prices[index, -2]),
-                    "stock_exit_price": float(prices[index, -1]),
-                    "spy_entry_price": float(reference[index, -2]),
-                    "spy_exit_price": float(reference[index, -1]),
-                    "stock_return": stock_return,
-                    "spy_return": reference_return,
-                    "gross_pnl_per_stock_leg": gross_pnl,
-                    "transaction_cost": transaction_cost,
-                    "net_pnl_per_stock_leg": net_pnl,
-                    "net_return_on_gross_capital": net_pnl / gross_capital,
-                    "trade_won": net_pnl > 0.0,
-                }
-            )
+            row = {
+                "sample_id": batch["_id"][index],
+                "entry_date": batch["date"][index],
+                "exit_date": batch["target_date"][index],
+                "anchor_time": batch["anchor_time"][index],
+                "side": side,
+                "direction": int(direction),
+                "probability_outperform": float(probabilities[index]),
+                "confidence": float(confidence[index]),
+                "actual_outperform": int(labels[index]),
+                "signal_correct": bool(directions[index].gt(0).eq(labels[index].bool())),
+                "stock_entry_price": float(prices[index, -2]),
+                "stock_exit_price": float(prices[index, -1]),
+                "spy_entry_price": float(reference[index, -2]),
+                "spy_exit_price": float(reference[index, -1]),
+                "stock_return": stock_return,
+                "spy_return": reference_return,
+                "gross_pnl_per_stock_leg": gross_pnl,
+                "transaction_cost": transaction_cost,
+                "net_pnl_per_stock_leg": net_pnl,
+                "net_return_on_gross_capital": net_pnl / gross_capital,
+                "trade_won": net_pnl > 0.0,
+            }
+            if max_trades_per_minute is None:
+                rows.append(row)
+            else:
+                cohort_key = (str(row["entry_date"]), str(row["anchor_time"]))
+                cohort = minute_candidates.setdefault(cohort_key, [])
+                cohort.append(row)
+                cohort.sort(
+                    key=lambda candidate: (
+                        -float(candidate["confidence"]),
+                        str(candidate["sample_id"]),
+                    )
+                )
+                del cohort[int(max_trades_per_minute) :]
     if not all_logits:
         raise ValueError("evaluation loader produced no candidate batches")
+    if max_trades_per_minute is not None:
+        rows = [
+            candidate
+            for cohort_key in sorted(minute_candidates)
+            for candidate in minute_candidates[cohort_key]
+        ]
     frame = pd.DataFrame(rows)
     return frame, torch.cat(all_logits), torch.cat(all_labels)
-
-
-@torch.no_grad()
-def evaluate_top_bottom(
-    classifier: RelativeDirectionClassifier,
-    loader,
-    cfg: DictConfig,
-    device: torch.device,
-    top_k: int,
-    min_score_spread: float,
-    position_mode: str,
-    transaction_cost_bps: float,
-    allow_position_overlap: bool = False,
-    show_progress: bool = False,
-) -> tuple[pd.DataFrame, torch.Tensor, torch.Tensor]:
-    """Open equal-weight long-top/short-bottom books once per trading day.
-
-    Candidates are ranked by predicted probability of outperforming SPY. By
-    default, a symbol cannot be selected again until its two-session position
-    has reached the exit timestamp.
-    """
-    if int(top_k) < 1:
-        raise ValueError("top_k must be positive")
-    if not 0.0 <= float(min_score_spread) <= 1.0:
-        raise ValueError("min_score_spread must be in [0, 1]")
-    if position_mode not in ("relative", "stock"):
-        raise ValueError("position_mode must be 'relative' or 'stock'")
-    if transaction_cost_bps < 0:
-        raise ValueError("transaction_cost_bps must be non-negative")
-
-    candidates: list[dict[str, object]] = []
-    all_logits: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
-    batches = (
-        tqdm(loader, desc="scoring daily candidates", unit="batch")
-        if show_progress
-        else loader
-    )
-    for batch in batches:
-        prices = batch["prices"].to(device=device, dtype=torch.float32)
-        reference = batch["reference_prices"].to(device=device, dtype=torch.float32)
-        anchor_progress = batch["anchor_progress"].to(
-            device=device, dtype=torch.float32
-        )
-        weekday = batch["weekday"].to(device=device, dtype=torch.long)
-        scalars = build_classify_scalars(anchor_progress, weekday)
-        features = build_relative_features(
-            prices, reference, float(cfg.data.get("price_feature_scale", 100.0))
-        )
-        logits = classifier(features, scalars)
-        labels = relative_labels(prices, reference)
-        probabilities = logits.sigmoid()
-        confidence = torch.maximum(probabilities, 1.0 - probabilities)
-        stock_returns = prices[:, -1] / prices[:, -2] - 1.0
-        reference_returns = reference[:, -1] / reference[:, -2] - 1.0
-        all_logits.append(logits.cpu())
-        all_labels.append(labels.cpu())
-
-        for index in range(len(logits)):
-            candidates.append(
-                {
-                    "sample_id": batch["_id"][index],
-                    "entry_date": batch["date"][index],
-                    "exit_date": batch["target_date"][index],
-                    "anchor_time": batch["anchor_time"][index],
-                    "score": float(probabilities[index]),
-                    "probability_outperform": float(probabilities[index]),
-                    "confidence": float(confidence[index]),
-                    "actual_outperform": int(labels[index]),
-                    "stock_entry_price": float(prices[index, -2]),
-                    "stock_exit_price": float(prices[index, -1]),
-                    "spy_entry_price": float(reference[index, -2]),
-                    "spy_exit_price": float(reference[index, -1]),
-                    "stock_return": float(stock_returns[index]),
-                    "spy_return": float(reference_returns[index]),
-                }
-            )
-
-    if not all_logits:
-        raise ValueError("evaluation loader produced no candidate batches")
-    candidate_frame = pd.DataFrame(candidates)
-    if candidate_frame.anchor_time.nunique() != 1:
-        raise ValueError("top_bottom requires one fixed --anchor_time per trading day")
-    duplicate = candidate_frame.duplicated(
-        ["entry_date", "anchor_time", "sample_id"]
-    )
-    if duplicate.any():
-        raise ValueError("top_bottom candidates contain duplicate symbol/date rows")
-
-    rows: list[dict[str, object]] = []
-    active_until: dict[str, pd.Timestamp] = {}
-    cost_rate = float(transaction_cost_bps) / 10_000.0
-    group_keys = ["entry_date", "anchor_time"]
-    for (entry_date, _), cohort in candidate_frame.groupby(group_keys, sort=True):
-        entry_timestamp = pd.Timestamp(entry_date)
-        if allow_position_overlap:
-            eligible = cohort
-        else:
-            eligible = cohort.loc[
-                cohort.sample_id.map(
-                    lambda symbol: active_until.get(str(symbol), entry_timestamp)
-                    <= entry_timestamp
-                )
-            ]
-        if len(eligible) < 2 * int(top_k):
-            continue
-
-        ranked = eligible.sort_values(
-            ["score", "sample_id"], ascending=[False, True], kind="stable"
-        )
-        longs = ranked.head(int(top_k))
-        shorts = ranked.tail(int(top_k)).sort_values(
-            ["score", "sample_id"], ascending=[True, True], kind="stable"
-        )
-        score_spread = float(longs.score.mean() - shorts.score.mean())
-        if score_spread < float(min_score_spread):
-            continue
-
-        for direction, selected in ((1, longs), (-1, shorts)):
-            for selection_rank, (_, candidate) in enumerate(selected.iterrows(), 1):
-                stock_return = float(candidate.stock_return)
-                reference_return = float(candidate.spy_return)
-                if position_mode == "relative":
-                    gross_pnl = direction * (stock_return - reference_return)
-                    transaction_cost = 4.0 * cost_rate
-                    gross_capital = 2.0
-                    side = (
-                        "long_stock_short_spy"
-                        if direction > 0
-                        else "short_stock_long_spy"
-                    )
-                else:
-                    gross_pnl = direction * stock_return
-                    transaction_cost = 2.0 * cost_rate
-                    gross_capital = 1.0
-                    side = "long_stock" if direction > 0 else "short_stock"
-                net_pnl = gross_pnl - transaction_cost
-                row = candidate.to_dict()
-                row.update(
-                    {
-                        "side": side,
-                        "direction": direction,
-                        "selection_bucket": "top" if direction > 0 else "bottom",
-                        "selection_rank": selection_rank,
-                        "score_spread": score_spread,
-                        "signal_correct": bool(
-                            (direction > 0) == bool(candidate.actual_outperform)
-                        ),
-                        "gross_pnl_per_stock_leg": gross_pnl,
-                        "transaction_cost": transaction_cost,
-                        "net_pnl_per_stock_leg": net_pnl,
-                        "net_return_on_gross_capital": net_pnl / gross_capital,
-                        "trade_won": net_pnl > 0.0,
-                    }
-                )
-                rows.append(row)
-                if not allow_position_overlap:
-                    active_until[str(candidate.sample_id)] = pd.Timestamp(
-                        candidate.exit_date
-                    )
-
-    return pd.DataFrame(rows), torch.cat(all_logits), torch.cat(all_labels)
 
 
 def evaluate(
@@ -618,20 +445,12 @@ def evaluate(
     device_name: str | None = None,
     batch_size: int = 390,
     workers: int = 4,
-    position_mode: str | None = None,
+    position_mode: str = "relative",
     transaction_cost_bps: float = 0.0,
-    strategy: str = "confidence",
-    top_k: int = 5,
-    min_score_spread: float = 0.0,
-    allow_position_overlap: bool = False,
+    selection_mode: str = "threshold",
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    if strategy not in ("confidence", "top_bottom"):
-        raise ValueError("strategy must be 'confidence' or 'top_bottom'")
-    if strategy == "top_bottom" and anchor_minute is None:
-        anchor_minute = 13 * 60
-    if position_mode is None:
-        position_mode = "stock" if strategy == "top_bottom" else "relative"
-
+    if selection_mode not in ("threshold", "top3"):
+        raise ValueError("selection_mode must be 'threshold' or 'top3'")
     cfg = OmegaConf.load(config_path)
     device = torch.device(device_name or str(cfg.model.device))
     classifier, state = load_classifier(checkpoint_path, device)
@@ -650,11 +469,6 @@ def evaluate(
         str(universe.path) if universe is not None else "../data/tickers_all.txt"
     )
     symbols = read_universe(ranked_path, int(top), str(cfg.data.reference_symbol))
-    if strategy == "top_bottom" and 2 * int(top_k) > len(symbols):
-        raise ValueError(
-            f"top_bottom needs at least {2 * int(top_k)} symbols for top_k={top_k}; "
-            f"the selected universe has {len(symbols)}"
-        )
     dataset, validation_start, last_date = make_evaluation_dataset(
         cfg, symbols, anchor_minute, weeks
     )
@@ -667,30 +481,17 @@ def evaluate(
         pin_memory=device.type == "cuda",
         persistent_workers=int(workers) > 0,
     )
-    if strategy == "top_bottom":
-        frame, logits, labels = evaluate_top_bottom(
-            classifier,
-            loader,
-            cfg,
-            device,
-            top_k,
-            min_score_spread,
-            position_mode,
-            transaction_cost_bps,
-            allow_position_overlap=allow_position_overlap,
-            show_progress=True,
-        )
-    else:
-        frame, logits, labels = evaluate_bets(
-            classifier,
-            loader,
-            cfg,
-            device,
-            min_confidence,
-            position_mode,
-            transaction_cost_bps,
-            show_progress=True,
-        )
+    frame, logits, labels = evaluate_bets(
+        classifier,
+        loader,
+        cfg,
+        device,
+        min_confidence,
+        position_mode,
+        transaction_cost_bps,
+        show_progress=True,
+        max_trades_per_minute=3 if selection_mode == "top3" else None,
+    )
     anchor_text = (
         "every minute 09:30..15:59"
         if anchor_minute is None
@@ -706,17 +507,14 @@ def evaluate(
         last_date,
         anchor_text,
         checkpoint_horizon,
-        min_confidence if strategy == "confidence" else None,
+        min_confidence,
         position_mode,
         transaction_cost_bps,
         symbols,
         len(dataset.anchor_minutes)
         if isinstance(dataset, RegularMinuteSweepDataset)
         else 1,
-        strategy=strategy,
-        top_k=top_k if strategy == "top_bottom" else None,
-        min_score_spread=min_score_spread if strategy == "top_bottom" else None,
-        allow_position_overlap=allow_position_overlap,
+        selection_mode=selection_mode,
     )
     return frame, summary
 
@@ -724,48 +522,31 @@ def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Backtest confidence-filtered or daily top/bottom classifier signals."
+            "Backtest a relative-direction checkpoint at every regular-session minute."
         )
     )
     parser.add_argument("--checkpoint", required=True, help="classifier .ckpt to evaluate")
     parser.add_argument("--config_path", default="main.yaml")
     parser.add_argument(
-        "--strategy",
-        choices=("confidence", "top_bottom"),
-        default="confidence",
-        help="confidence filters independent signals; top_bottom trades ranked daily books",
+        "--selection_mode",
+        choices=("threshold", "top3"),
+        default="threshold",
+        help=(
+            "threshold trades every qualifying signal; top3 keeps only the three "
+            "most-confident qualifying symbols per minute"
+        ),
     )
     parser.add_argument(
         "--anchor_time",
         type=parse_anchor_time,
         default=None,
-        help=(
-            "optional single HH:MM Eastern time; confidence defaults to every minute, "
-            "top_bottom defaults to 13:00"
-        ),
+        help="optional single HH:MM Eastern time; default sweeps every regular minute",
     )
     parser.add_argument(
         "--min_confidence",
         type=float,
         default=0.70,
         help="trade when max(p, 1-p) reaches this threshold, default: 0.70",
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=5,
-        help="top_bottom positions on each side per entry date, default: 5",
-    )
-    parser.add_argument(
-        "--min_score_spread",
-        type=float,
-        default=0.0,
-        help="minimum mean(top p)-mean(bottom p) needed to open a daily book",
-    )
-    parser.add_argument(
-        "--allow_position_overlap",
-        action="store_true",
-        help="allow reopening a symbol before its prior two-session position exits",
     )
     parser.add_argument("--top", type=int, default=50, help="ranked universe size")
     parser.add_argument("--universe_path", default=None)
@@ -781,11 +562,8 @@ def main() -> None:
     parser.add_argument(
         "--position_mode",
         choices=("relative", "stock"),
-        default=None,
-        help=(
-            "P&L legs; defaults to relative for confidence and stock for the "
-            "dollar-neutral top_bottom strategy"
-        ),
+        default="relative",
+        help="relative hedges every stock bet with SPY; stock trades the stock alone",
     )
     parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
     parser.add_argument("--output_csv", default=None, help="optional trade-level CSV path")
@@ -805,10 +583,7 @@ def main() -> None:
         workers=args.workers,
         position_mode=args.position_mode,
         transaction_cost_bps=args.transaction_cost_bps,
-        strategy=args.strategy,
-        top_k=args.top_k,
-        min_score_spread=args.min_score_spread,
-        allow_position_overlap=args.allow_position_overlap,
+        selection_mode=args.selection_mode,
     )
     print(json.dumps(summary, indent=2, default=str))
     if args.output_csv:
