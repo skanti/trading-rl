@@ -61,7 +61,7 @@ train:
   batch_size: 64
   steps_num: 50000
   ppo_epochs: 4
-  workers_num: 2
+  workers_num: 8
   split: "train"
   should_augment: true
   seed: 0
