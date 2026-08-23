@@ -158,14 +158,16 @@ class ClassifierConfigTest(unittest.TestCase):
         cfg = OmegaConf.load(Path(__file__).parents[1] / "main.yaml")
         classifier = build_classifier(cfg, torch.device("cpu"))
         self.assertEqual(str(cfg.general.task), "classification")
-        self.assertEqual(int(cfg.data.horizon_days), 2)
+        self.assertEqual(int(cfg.data.horizon_days), 3)
+        self.assertEqual(int(cfg.data.tick_minutes), 1)
+        self.assertEqual(int(cfg.data.window_size), 9_600)
         self.assertEqual(classifier.window_size, int(cfg.data.window_size))
         self.assertEqual(classifier.feature_dim, CLASSIFY_FEATURE_DIM)
         self.assertEqual(classifier.scalar_dim, CLASSIFY_SCALAR_DIM)
         parameters = sum(p.numel() for p in classifier.parameters())
         self.assertGreaterEqual(parameters, MIN_PARAMETERS)
         self.assertLessEqual(parameters, MAX_PARAMETERS)
-        self.assertEqual(parameters, 1_283_585)
+        self.assertEqual(parameters, 1_279_361)
 
     def test_classifier_emits_one_logit_per_window(self):
         classifier = RelativeDirectionClassifier(window_size=4, hidden_dim=8, depth=2)

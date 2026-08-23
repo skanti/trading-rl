@@ -12,19 +12,20 @@ model:
   max_grad_norm: 1.0
   eta_min: 1e-6
   mlp:
-    window_size: 960
+    window_size: 9600
     # One anchored log(stock/reference) path; neither raw path is exposed.
     feature_dim: 1
-    hidden_dim: 512
+    # The narrower projection keeps the 9,600-point model near 1.3M parameters.
+    hidden_dim: 256
     depth: 4
     # Anchor progress plus a five-way Monday--Friday one-hot encoding.
     scalar_dim: 6
 data:
   reference_symbol: "ST-SPY"
-  tick_minutes: 10
+  tick_minutes: 1
   context_days: 10
-  # 10 extended sessions x 96 ten-minute bars, ending at the anchor.
-  window_size: 960
+  # 10 extended sessions x 960 one-minute observations, ending at the anchor.
+  window_size: 9600
   # Trading sessions ahead, evaluated at the same time of day.
   horizon_days: 3
   anno: "2010-01-01"
