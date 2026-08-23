@@ -1,6 +1,7 @@
 import argparse
 import unittest
 
+import numpy as np
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -11,6 +12,7 @@ from classify_evaluate import (
     parse_anchor_time,
     summarize_trades,
 )
+from week_dataset import forward_fill_positions
 
 
 class FixedClassifier(torch.nn.Module):
@@ -25,6 +27,20 @@ class FixedClassifier(torch.nn.Module):
 
 
 class ClassifyEvaluateTest(unittest.TestCase):
+    def test_forward_fill_skips_an_invalid_zero_price_without_looking_ahead(self):
+        source = np.array(
+            [
+                [0, 1000, 1, 0],
+                [60, 0, 1, 0],
+                [120, 2000, 1, 0],
+            ],
+            dtype=np.int64,
+        )
+        positions = forward_fill_positions(
+            source, np.array([60, 119, 120]), "ST-BAD"
+        )
+        self.assertEqual(positions.tolist(), [0, 0, 2])
+
     def test_anchor_time_parser(self):
         self.assertEqual(parse_anchor_time("09:30"), 9 * 60 + 30)
         self.assertEqual(parse_anchor_time("13:00"), 13 * 60)

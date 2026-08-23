@@ -31,7 +31,7 @@ from classify_dataset import (
     RelativeDirectionDataset,
 )
 from reference_dataset import trailing_validation_start
-from week_dataset import read_universe
+from week_dataset import forward_fill_positions, read_universe
 
 
 @lru_cache(maxsize=256)
@@ -47,12 +47,8 @@ def _cached_forward_filled_prices(
     data_dir: str, sample_id: str, secs: np.ndarray
 ) -> np.ndarray:
     source = _cached_price_source(data_dir, sample_id)
-    position = np.searchsorted(source[:, 0], secs, side="right") - 1
-    if (position < 0).any():
-        raise ValueError(f"{sample_id} has no print at or before the requested time")
+    position = forward_fill_positions(source, secs, sample_id)
     prices = np.asarray(source[position, 1], dtype=np.float64) / 1000.0
-    if not np.isfinite(prices).all() or (prices <= 0).any():
-        raise ValueError(f"{sample_id} produced non-positive or non-finite prices")
     return prices
 
 
