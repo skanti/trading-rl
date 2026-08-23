@@ -58,7 +58,7 @@ data:
     path: "../data/tickers_all.txt"
     size: 50
 train:
-  batch_size: 64
+  batch_size: 128
   steps_num: 50000
   ppo_epochs: 4
   workers_num: 8
