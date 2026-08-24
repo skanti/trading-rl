@@ -1,15 +1,42 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import numpy as np
+import pandas as pd
+from rich.console import Console
 
 from baseline.overnight_liquidity import (
+    _symbol_daily_arrays,
+    activity_union_candidate_mask,
     causal_ema_log_liquidity,
+    causal_completed_trading_days,
+    company_universe_mask,
+    is_company_security,
+    liquidity_scores,
+    print_scheme_comparison,
+    print_symbol_trade_counts,
+    print_summary_table,
     strategy_metrics,
     top_liquid_indices,
 )
 
 
 class OvernightLiquidityBaselineTest(unittest.TestCase):
+    def test_completed_trading_day_count_is_strictly_lagged(self):
+        volume = np.array(
+            [
+                [100.0, np.nan],
+                [110.0, 200.0],
+                [np.nan, 210.0],
+                [120.0, 220.0],
+            ]
+        )
+
+        counts = causal_completed_trading_days(volume)
+
+        self.assertEqual(counts.tolist(), [[0, 0], [1, 0], [2, 1], [2, 2]])
+
     def test_liquidity_score_is_strictly_lagged(self):
         volume = np.array([[100.0], [110.0], [120.0], [130.0]])
         changed = volume.copy()
@@ -50,7 +77,239 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["total_return"], 0.045)
         self.assertAlmostEqual(metrics["max_drawdown"], 0.05)
 
+    def test_cli_summary_is_rendered_as_a_comparison_table(self):
+        metrics = strategy_metrics(np.array([0.01, -0.005]))
+        summary = {
+            "top": 50,
+            "exclude_top": 0,
+            "basket_size": 50,
+            "liquidity_scheme": "dollar_ema",
+            "liquidity_metric": "completed regular-session dollar volume",
+            "ranking_time_eastern": "15:15",
+            "entry_time_eastern": "15:55",
+            "exit_time_eastern": "09:45 next trading session",
+            "first_entry_date": "2026-08-19",
+            "last_exit_date": "2026-08-21",
+            "trades": 100,
+            "ema_span_sessions": 20,
+            "minimum_liquidity_history_sessions": 20,
+            "transaction_cost_bps_per_side": 1.0,
+            "unique_symbols_traded": 51,
+            "average_daily_membership_replacements": 1.0,
+            "maximum_daily_membership_replacements": 2,
+            "average_daily_membership_retention": 0.98,
+            "average_daily_membership_jaccard": 0.96,
+            "stale_exit_marks_over_10_minutes": 0,
+            "maximum_exit_staleness_minutes": 1.0,
+            "strategy_metrics": metrics,
+            "spy_overnight_metrics": metrics,
+            "spy_buy_and_hold_metrics": metrics,
+        }
+        console = Console(record=True, width=100, color_system=None)
+        print_summary_table(summary, console)
+        rendered = console.export_text()
+
+        self.assertIn("Overnight liquidity baseline", rendered)
+        self.assertIn("Top 50", rendered)
+        self.assertIn("SPY overnight", rendered)
+        self.assertIn("SPY buy & hold", rendered)
+        self.assertNotIn('"strategy_metrics"', rendered)
+
+    def test_alpaca_activity_schemes_use_same_day_raw_rankings(self):
+        dollar = np.array([[1_000.0, 10.0], [1_000.0, 10.0]])
+        shares = np.array([[10.0, 100.0], [20.0, 200.0]])
+        trades = np.array([[50.0, 5.0], [60.0, 6.0]])
+
+        volume_scores = liquidity_scores(dollar, shares, trades, "alpaca_volume", 20, 1)
+        trade_scores = liquidity_scores(dollar, shares, trades, "alpaca_trades", 20, 1)
+
+        self.assertEqual(volume_scores.tolist(), shares.tolist())
+        self.assertEqual(trade_scores.tolist(), trades.tolist())
+        self.assertGreater(volume_scores[0, 1], volume_scores[0, 0])
+        self.assertGreater(trade_scores[0, 0], trade_scores[0, 1])
+
+    def test_activity_union_is_rebuilt_each_day_without_carry_forward(self):
+        shares = np.array(
+            [
+                [100.0, 90.0, 1.0, 1.0],
+                [1.0, 1.0, 90.0, 100.0],
+            ]
+        )
+        trades = np.array(
+            [
+                [1.0, 1.0, 100.0, 90.0],
+                [1.0, 100.0, 1.0, 90.0],
+            ]
+        )
+        mask = activity_union_candidate_mask(
+            shares, trades, np.array(["A", "B", "C", "D"]), candidates_per_metric=1
+        )
+
+        self.assertEqual(mask[0].tolist(), [True, False, True, False])
+        self.assertEqual(mask[1].tolist(), [False, True, False, True])
+
+    def test_activity_union_ema_uses_lagged_dollar_history(self):
+        dollar = np.array([[100.0, 1_000.0], [110.0, 900.0], [120.0, 800.0]])
+        activity = np.ones_like(dollar)
+
+        union_scores = liquidity_scores(
+            dollar, activity, activity, "activity_union_ema", ema_span=2, min_history_days=1
+        )
+        full_scores = liquidity_scores(
+            dollar, activity, activity, "dollar_ema", ema_span=2, min_history_days=1
+        )
+
+        np.testing.assert_allclose(union_scores, full_scores, equal_nan=True)
+        self.assertTrue(np.isnan(union_scores[0]).all())
+
+    def test_activity_cutoff_excludes_the_ranking_minute_bar(self):
+        context_start = 1_000_000
+        regular_start = context_start + (9 * 60 + 30 - 4 * 60) * 60
+        ranking_second = context_start + (15 * 60 + 15 - 4 * 60) * 60
+        source = np.array(
+            [
+                [regular_start, 100_000, 10, 1],
+                [ranking_second - 60, 100_000, 20, 2],
+                [ranking_second, 100_000, 1_000, 100],
+                [ranking_second + 60, 100_000, 2_000, 200],
+            ],
+            dtype=np.int64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            np.save(Path(directory) / "ST-X.npy", source)
+            rows = pd.DataFrame(
+                {"date": [pd.Timestamp("2026-08-24")], "sod_idx": [0], "eod_idx": [3]}
+            )
+            result = _symbol_daily_arrays(
+                "ST-X",
+                rows,
+                {pd.Timestamp("2026-08-24"): 0},
+                np.array([context_start]),
+                Path(directory),
+                15 * 60 + 55,
+                9 * 60 + 45,
+                15 * 60 + 15,
+                1,
+            )
+
+        self.assertEqual(result[2][0], 30.0)
+        self.assertEqual(result[3][0], 3.0)
+        self.assertGreater(result[1][0], 300_000.0)
+
+    def test_scheme_comparison_reports_stability_kpis(self):
+        metrics = strategy_metrics(np.array([0.01, -0.005]))
+        summaries = {}
+        for index, scheme in enumerate(("dollar_ema", "alpaca_volume", "alpaca_trades")):
+            summaries[scheme] = {
+                "first_entry_date": "2026-08-19",
+                "last_exit_date": "2026-08-21",
+                "basket_size": 10,
+                "liquidity_scheme": scheme,
+                "liquidity_metric": {
+                    "dollar_ema": "completed regular-session dollar volume",
+                    "alpaca_volume": "share volume",
+                    "alpaca_trades": "trade count",
+                }[scheme],
+                "ranking_time_eastern": "15:15",
+                "ema_span_sessions": 20,
+                "minimum_liquidity_history_sessions": 20,
+                "strategy_metrics": metrics,
+                "average_daily_membership_replacements": float(index),
+                "average_daily_membership_retention": 1.0 - index * 0.1,
+                "average_daily_membership_jaccard": 1.0 - index * 0.2,
+                "unique_symbols_traded": 10 + index,
+            }
+        console = Console(record=True, width=120, color_system=None)
+
+        print_scheme_comparison(summaries, console)
+        rendered = console.export_text()
+
+        self.assertIn("Lagged $ EMA", rendered)
+        self.assertIn("Alpaca volume", rendered)
+        self.assertIn("Alpaca trades", rendered)
+        self.assertIn("Membership retention", rendered)
+
+    def test_company_filter_rejects_funds_and_non_common_instruments(self):
+        cases = (
+            ({"name": "Example Technology Inc. - Common Stock", "etf": "N"}, True),
+            ({"name": "Foreign Company plc - American Depositary Shares", "etf": "N"}, True),
+            ({"name": "Example Realty Trust Common Stock", "etf": "N"}, True),
+            ({"name": "Example Equity ETF", "etf": "Y"}, False),
+            ({"name": "Example Income Fund - Closed End Fund", "etf": "N"}, False),
+            ({"name": "Example Partners LP Common Units", "etf": "N"}, False),
+            ({"name": "Example Acquisition Corp. Common Stock", "etf": "N"}, False),
+            ({"name": "Example Royalty Trust Common Stock", "etf": "N"}, False),
+            ({"name": "BlackRock Income Trust", "etf": "N"}, False),
+        )
+        for record, expected in cases:
+            with self.subTest(name=record["name"]):
+                self.assertEqual(is_company_security(record)[0], expected)
+
+    def test_symbol_trade_frequency_shows_counts_and_session_percentages(self):
+        trades = {
+            "dollar_ema": pd.DataFrame(
+                {
+                    "entry_date": ["2026-08-20", "2026-08-21", "2026-08-21"],
+                    "sample_id": ["ST-AAPL", "ST-AAPL", "ST-MSFT"],
+                    "net_return": [0.01, 0.02, -0.01],
+                }
+            ),
+            "alpaca_volume": pd.DataFrame(
+                {
+                    "entry_date": ["2026-08-20", "2026-08-21"],
+                    "sample_id": ["ST-MSFT", "ST-MSFT"],
+                    "net_return": [0.03, 0.01],
+                }
+            ),
+        }
+        console = Console(record=True, width=120, color_system=None)
+
+        print_symbol_trade_counts(trades, console)
+        rendered = console.export_text()
+
+        self.assertIn("Per-symbol trade frequency", rendered)
+        self.assertIn("AAPL", rendered)
+        self.assertIn("MSFT", rendered)
+        self.assertIn("2 / 100.0%", rendered)
+        self.assertIn("+1.500%", rendered)
+        self.assertIn("-1.000%", rendered)
+
+    def test_company_mask_keeps_spy_only_as_reference_and_excludes_unknowns(self):
+        symbols = np.array(["ST-SPY", "ST-AAPL", "ST-ETHA", "ST-UNKNOWN"])
+        security_master = {
+            "SPY": {"name": "SPDR S&P 500 ETF Trust", "etf": "Y"},
+            "AAPL": {"name": "Apple Inc. - Common Stock", "etf": "N"},
+            "ETHA": {"name": "iShares Ethereum Trust ETF", "etf": "Y"},
+        }
+
+        mask, reasons, unclassified = company_universe_mask(
+            symbols, security_master, keep_unclassified=False
+        )
+
+        self.assertEqual(mask.tolist(), [True, True, False, False])
+        self.assertEqual(reasons["ETF/ETP"], 1)
+        self.assertEqual(reasons["missing from current security master"], 1)
+        self.assertEqual(unclassified, 1)
+
+    def test_company_mask_keeps_historical_unclassified_symbols_by_default(self):
+        mask, reasons, unclassified = company_universe_mask(
+            np.array(["ST-DELISTED"]), security_master={}
+        )
+
+        self.assertEqual(mask.tolist(), [True])
+        self.assertEqual(reasons, {})
+        self.assertEqual(unclassified, 1)
+
+    def test_rank_segment_can_exclude_the_most_liquid_names(self):
+        selected = top_liquid_indices(
+            scores=np.array([5.0, 4.0, 3.0, 2.0]),
+            entry_prices=np.full(4, 100.0),
+            top=4,
+            symbols=np.array(["A", "B", "C", "D"]),
+            exclude_top=2,
+        )
+        self.assertEqual(selected.tolist(), [2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -4,6 +4,7 @@ einops
 tqdm
 pandas
 rich
+requests
 omegaconf
 fsspec
 pillow
