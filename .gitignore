@@ -8,6 +8,8 @@ __pycache__/
 .DS_Store
 outputs
 /ml/artifacts/
+/ml/evaluation_*.json
+/ml/evaluation_*.csv
 
 # except gitignore file
 !.gitignore
