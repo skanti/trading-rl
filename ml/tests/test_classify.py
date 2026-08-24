@@ -13,12 +13,15 @@ from omegaconf import OmegaConf
 from classify import (
     CLASSIFY_FEATURE_DIM,
     CLASSIFY_SCALAR_DIM,
+    DUAL_PRICE_FEATURE_NAMES,
     RelativeDirectionClassifier,
     binary_metrics,
+    build_dual_price_features,
     build_classify_scalars,
     build_relative_features,
     relative_labels,
     relative_log_prices,
+    stock_direction_labels,
 )
 from classify_dataset import (
     RelativeDirectionDataset,
@@ -104,6 +107,20 @@ class RelativeFeatureTest(unittest.TestCase):
             relative_labels(stock, spy).item(), relative_labels(stock / 3.0, spy).item() * 0 + 0.0
         )
 
+    def test_dual_features_keep_stock_and_spy_as_separate_normalized_channels(self):
+        stock = torch.tensor([[100.0, 102.0, 101.0, 104.0, 999.0]])
+        spy = torch.tensor([[400.0, 399.0, 403.0, 402.0, 1.0]])
+        features = build_dual_price_features(stock, spy)
+        rescaled = build_dual_price_features(stock * 17.0, spy * 0.003)
+        self.assertEqual(features.shape, (1, 4, len(DUAL_PRICE_FEATURE_NAMES)))
+        self.assertTrue(torch.allclose(features, rescaled, atol=2e-3))
+        self.assertTrue(torch.equal(features[:, -1], torch.zeros(1, 2)))
+        moved_targets = build_dual_price_features(
+            torch.cat((stock[:, :-1], stock[:, -1:] * 2), dim=1),
+            torch.cat((spy[:, :-1], spy[:, -1:] * 3), dim=1),
+        )
+        self.assertTrue(torch.equal(features, moved_targets))
+
 class RelativeLabelTest(unittest.TestCase):
     def test_worked_example_from_the_specification(self):
         # Monday 1pm both at 100%; Wednesday 1pm stock 105%, SPY 94% -> True.
@@ -128,6 +145,10 @@ class RelativeLabelTest(unittest.TestCase):
     def test_non_positive_prices_are_rejected(self):
         with self.assertRaises(ValueError):
             relative_log_prices(torch.tensor([[1.0, 0.0]]), torch.tensor([[1.0, 1.0]]))
+
+    def test_stock_direction_label_compares_target_with_entry_price_only(self):
+        prices = torch.tensor([[99.0, 100.0, 101.0], [101.0, 100.0, 99.0]])
+        self.assertEqual(stock_direction_labels(prices).tolist(), [1.0, 0.0])
 
 
 class BinaryMetricTest(unittest.TestCase):
@@ -154,20 +175,24 @@ class BinaryMetricTest(unittest.TestCase):
 
 
 class ClassifierConfigTest(unittest.TestCase):
-    def test_main_config_selects_the_relative_classifier(self):
+    def test_main_config_selects_the_overnight_dual_price_classifier(self):
         cfg = OmegaConf.load(Path(__file__).parents[1] / "main.yaml")
         classifier = build_classifier(cfg, torch.device("cpu"))
         self.assertEqual(str(cfg.general.task), "classification")
-        self.assertEqual(int(cfg.data.horizon_days), 3)
+        self.assertEqual(str(cfg.data.feature_mode), "dual_normalized")
+        self.assertEqual(str(cfg.data.target_mode), "stock_direction")
+        self.assertEqual(int(cfg.data.horizon_days), 1)
+        self.assertEqual(int(cfg.data.anchor_minute), 15 * 60 + 55)
+        self.assertEqual(int(cfg.data.target_minute), 9 * 60 + 45)
         self.assertEqual(int(cfg.data.tick_minutes), 1)
         self.assertEqual(int(cfg.data.window_size), 9_600)
         self.assertEqual(classifier.window_size, int(cfg.data.window_size))
-        self.assertEqual(classifier.feature_dim, CLASSIFY_FEATURE_DIM)
+        self.assertEqual(classifier.feature_dim, len(DUAL_PRICE_FEATURE_NAMES))
         self.assertEqual(classifier.scalar_dim, CLASSIFY_SCALAR_DIM)
         parameters = sum(p.numel() for p in classifier.parameters())
         self.assertGreaterEqual(parameters, MIN_PARAMETERS)
         self.assertLessEqual(parameters, MAX_PARAMETERS)
-        self.assertEqual(parameters, 1_279_361)
+        self.assertEqual(parameters, 1_241_793)
 
     def test_classifier_emits_one_logit_per_window(self):
         classifier = RelativeDirectionClassifier(window_size=4, hidden_dim=8, depth=2)
@@ -239,6 +264,15 @@ class ClassifyDatasetTest(unittest.TestCase):
         self.assertEqual(np.flatnonzero(validation.to_numpy())[0], 12)
         self.assertFalse((train & validation).any())
 
+    def test_next_session_opening_label_is_purged_before_validation(self):
+        dates = pd.Series(pd.to_datetime(self.sessions))
+        validation_start = dates.iloc[12]
+        train = classification_split_mask(dates, "train", validation_start, 1)
+        train_positions = np.flatnonzero(train.to_numpy())
+
+        self.assertEqual(train_positions[-1], 10)
+        self.assertTrue(np.all(train_positions + 1 < 12))
+
     def test_anchor_always_lands_inside_regular_hours(self):
         dataset = self.dataset()
         offsets = {dataset.anchor_offset(i) for i in range(len(dataset))}
@@ -258,6 +292,26 @@ class ClassifyDatasetTest(unittest.TestCase):
             utc=True,
         ).tz_convert("US/Eastern")
         self.assertEqual([(stamp.hour, stamp.minute) for stamp in stamps], [(13, 0), (13, 0)])
+
+    def test_fixed_1555_entry_targets_0945_on_the_next_trading_session(self):
+        dataset = self.dataset(
+            tick_minutes=5,
+            horizon_days=1,
+            anchor_minute=15 * 60 + 55,
+            target_minute=9 * 60 + 45,
+        )
+        sample = dataset[0]
+        stamps = pd.to_datetime(
+            [sample["secs"][-2], sample["secs"][-1]],
+            unit="s",
+            origin="2010-01-01",
+            utc=True,
+        ).tz_convert("US/Eastern")
+        self.assertEqual(sample["anchor_time"], "15:55")
+        self.assertEqual(sample["target_time"], "09:45")
+        self.assertEqual([(stamp.hour, stamp.minute) for stamp in stamps], [(15, 55), (9, 45)])
+        self.assertEqual(stamps[1].date(), pd.Timestamp(self.sessions[3]).date())
+        self.assertAlmostEqual(float(sample["anchor_progress"]), 385 / 390, places=6)
 
     def test_evaluation_can_sweep_every_regular_minute(self):
         base = self.dataset()

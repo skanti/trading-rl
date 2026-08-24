@@ -1,15 +1,9 @@
-"""Anchored relative-direction samples for the binary classification task.
+"""Anchored stock/reference samples for binary classification tasks.
 
 One sample is a symbol, a session, and a random time of day inside regular
 hours. The observation is the trailing window ending at that anchor and the
-label is whether the symbol outperforms the reference ``horizon_days`` sessions
-later at the same time of day.
-
-Only the stock/reference *ratio* is ever exposed. Handing the model the two
-price paths separately would let it recognize the reference's path, which is
-identical across every symbol on a given date and therefore a near-perfect
-fingerprint for the date; from there the answer is memorizable rather than
-predictable.
+label tick can use either the same clock on a later session or an explicitly
+configured target clock such as next-session 09:45.
 """
 
 from __future__ import annotations
@@ -105,6 +99,7 @@ class RelativeDirectionDataset(Dataset):
         limit: int | None = None,
         seed: int = 0,
         anchor_minute: int | None = None,
+        target_minute: int | None = None,
     ):
         self.data_dir = str(data_dir)
         self.reference_symbol = str(reference_symbol)
@@ -125,6 +120,14 @@ class RelativeDirectionDataset(Dataset):
             if (minute - EXTENDED_OPEN_MINUTE) % self.tick_minutes:
                 raise ValueError("anchor minute must lie on the configured tick grid")
             self.fixed_anchor_offset = (minute - EXTENDED_OPEN_MINUTE) // self.tick_minutes
+        self.fixed_target_offset: int | None = None
+        if target_minute is not None:
+            minute = int(target_minute)
+            if not RTH_OPEN_MINUTE <= minute <= RTH_CLOSE_MINUTE:
+                raise ValueError("target minute must be inside 09:30..16:00 Eastern")
+            if (minute - EXTENDED_OPEN_MINUTE) % self.tick_minutes:
+                raise ValueError("target minute must lie on the configured tick grid")
+            self.fixed_target_offset = (minute - EXTENDED_OPEN_MINUTE) // self.tick_minutes
         if self.horizon_days < 1:
             raise ValueError("horizon_days must be positive")
         # The window ends at the anchor, which sits at least at 09:30 of the
@@ -253,10 +256,11 @@ class RelativeDirectionDataset(Dataset):
         window = grid[anchor - self.window_size + 1 : anchor + 1]
         if window.size != self.window_size:
             raise AssertionError("window construction produced the wrong length")
+        target_offset = offset if self.fixed_target_offset is None else self.fixed_target_offset
         target = (
             self.context_sod[session + self.horizon_days]
             + shift * 60
-            + offset * self.tick_seconds
+            + target_offset * self.tick_seconds
         )
         return np.concatenate((window, [target]))
 
@@ -269,6 +273,9 @@ class RelativeDirectionDataset(Dataset):
         # 0.0 at 09:30 and 1.0 at 16:00, so the model knows how far into the
         # session its anchor sits without seeing a clock in the window.
         progress = (offset - self.first_offset) / (self.last_offset - self.first_offset)
+        target_offset = offset if self.fixed_target_offset is None else self.fixed_target_offset
+        anchor_minute = EXTENDED_OPEN_MINUTE + offset * self.tick_minutes
+        target_minute = EXTENDED_OPEN_MINUTE + target_offset * self.tick_minutes
         return {
             "_id": str(row.sample_id),
             "date": str(pd.Timestamp(row.date).date()),
@@ -276,10 +283,8 @@ class RelativeDirectionDataset(Dataset):
                 pd.Timestamp(self.calendar_dates[int(row.session) + self.horizon_days]).date()
             ),
             "weekday": np.int64(pd.Timestamp(row.date).dayofweek),
-            "anchor_time": (
-                f"{(EXTENDED_OPEN_MINUTE + offset * self.tick_minutes) // 60:02d}:"
-                f"{(EXTENDED_OPEN_MINUTE + offset * self.tick_minutes) % 60:02d}"
-            ),
+            "anchor_time": f"{anchor_minute // 60:02d}:{anchor_minute % 60:02d}",
+            "target_time": f"{target_minute // 60:02d}:{target_minute % 60:02d}",
             "prices": prices.astype(np.float32),
             "reference_prices": reference.astype(np.float32),
             "secs": secs,
@@ -334,6 +339,8 @@ def make_classify_dataloader(
         targets=targets,
         limit=cfg_split.get("samples_num", None),
         seed=seed,
+        anchor_minute=cfg_data.get("anchor_minute", None),
+        target_minute=cfg_data.get("target_minute", None),
     )
     if cfg_split.split == "train":
         # Defense in depth: the split mask and the dataset's session calendar
@@ -355,7 +362,9 @@ def make_classify_dataloader(
         dataset,
         batch_size=int(cfg_split.batch_size),
         num_workers=int(cfg_split.workers_num),
-        shuffle=bool(cfg_split.get("should_augment", False)),
+        shuffle=bool(
+            cfg_split.get("shuffle", cfg_split.get("should_augment", False))
+        ),
         pin_memory=True,
         drop_last=cfg_split.split != "val",
         persistent_workers=int(cfg_split.workers_num) > 0,

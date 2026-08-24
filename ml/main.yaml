@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-cls-rel-weekday-1d"
+  experiment_name: "train-cls-overnight-1555-0945-stock-spy"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
   # Selects the supervised classifier over the PPO trading policies.
   task: "classification"
@@ -13,20 +13,24 @@ model:
   eta_min: 1e-6
   mlp:
     window_size: 9600
-    # One anchored log(stock/reference) path; neither raw path is exposed.
-    feature_dim: 1
-    # The narrower projection keeps the 9,600-point model near 1.3M parameters.
-    hidden_dim: 128
+    # Independently normalized stock and SPY paths; no relative-price channel.
+    feature_dim: 2
+    # Keeps the two-channel, 9,600-point model near 1.25M parameters.
+    hidden_dim: 64
     depth: 4
     # Anchor progress plus a five-way Monday--Friday one-hot encoding.
     scalar_dim: 6
 data:
   reference_symbol: "ST-SPY"
+  feature_mode: "dual_normalized"
+  target_mode: "stock_direction"
   tick_minutes: 1
   context_days: 10
   # 10 extended sessions x 960 one-minute observations, ending at the anchor.
   window_size: 9600
-  # Trading sessions ahead, evaluated at the same time of day.
+  # Enter at 15:55 and classify the stock price at 09:45 next trading session.
+  anchor_minute: 955
+  target_minute: 585
   horizon_days: 1
   anno: "2010-01-01"
   days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_10d.csv"
@@ -44,14 +48,16 @@ train:
   steps_num: 50000
   workers_num: 16
   split: "train"
-  # A fresh regular-session time is drawn per visit during training.
-  should_augment: true
+  # The time is fixed, but stock/session samples are still shuffled each epoch.
+  should_augment: false
+  shuffle: true
   seed: 0
 val:
   batch_size: 64
   workers_num: 4
   split: "val"
   should_augment: false
+  shuffle: false
   # One full deterministic pass over the pinned validation universe.
   validation_batches: null
 loop:

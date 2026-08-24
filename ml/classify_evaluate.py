@@ -1,4 +1,4 @@
-"""Fixed-minute, two-session backtest for relative-direction checkpoints."""
+"""Backtest binary price-direction checkpoints."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from classify import (
-    CLASSIFY_FEATURE_NAMES,
     CLASSIFY_SCALAR_NAMES,
     RelativeDirectionClassifier,
     binary_metrics,
+    build_classify_features,
     build_classify_scalars,
-    build_relative_features,
-    relative_labels,
+    classify_feature_names,
+    classify_labels,
 )
 from classify_dataset import (
     EXTENDED_OPEN_MINUTE,
@@ -97,10 +97,17 @@ class RegularMinuteSweepDataset(Dataset):
         if history_indices.min() < 0 or history_indices.max() >= minute_grid.size:
             raise AssertionError("minute sweep history extends outside its session grid")
         history_secs = minute_grid[history_indices]
-        target_secs = (
-            self.base.context_sod[session + self.base.horizon_days]
-            + (self.anchor_minutes - EXTENDED_OPEN_MINUTE) * 60
-        )
+        if self.base.fixed_target_offset is None:
+            target_minutes = self.anchor_minutes
+        else:
+            target_minutes = np.full_like(
+                self.anchor_minutes,
+                EXTENDED_OPEN_MINUTE
+                + self.base.fixed_target_offset * self.base.tick_minutes,
+            )
+        target_secs = self.base.context_sod[session + self.base.horizon_days] + (
+            target_minutes - EXTENDED_OPEN_MINUTE
+        ) * 60
         secs = np.concatenate((history_secs, target_secs[:, None]), axis=1)
         sample_id = str(row.sample_id)
         self._cached_sample_index = sample_index
@@ -119,6 +126,12 @@ class RegularMinuteSweepDataset(Dataset):
         sample_index, minute_index = divmod(int(index), len(self.anchor_minutes))
         row = self.base.samples.iloc[sample_index]
         anchor_minute = int(self.anchor_minutes[minute_index])
+        target_minute = (
+            anchor_minute
+            if self.base.fixed_target_offset is None
+            else EXTENDED_OPEN_MINUTE
+            + self.base.fixed_target_offset * self.base.tick_minutes
+        )
         prices, reference = self._minute_matrices(sample_index)
         sample_id = str(row.sample_id)
         progress = (anchor_minute - RTH_OPEN_MINUTE) / (
@@ -136,6 +149,7 @@ class RegularMinuteSweepDataset(Dataset):
             ),
             "weekday": np.int64(pd.Timestamp(row.date).dayofweek),
             "anchor_time": f"{anchor_minute // 60:02d}:{anchor_minute % 60:02d}",
+            "target_time": f"{target_minute // 60:02d}:{target_minute % 60:02d}",
             "prices": prices[minute_index],
             "reference_prices": reference[minute_index],
             "anchor_progress": np.float32(progress),
@@ -163,16 +177,17 @@ def load_classifier(
     """Load a classifier while refusing incompatible checkpoint layouts."""
     with fsspec.open(checkpoint_path, "rb") as checkpoint_file:
         state = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
-    if tuple(state.get("feature_names", ())) != CLASSIFY_FEATURE_NAMES:
-        raise ValueError("checkpoint does not use the relative-price feature layout")
-    if tuple(state.get("scalar_names", ())) != CLASSIFY_SCALAR_NAMES:
-        raise ValueError("checkpoint does not use the intraday-anchor scalar layout")
     checkpoint_config = OmegaConf.create(state.get("config", {}))
     if not checkpoint_config.get("model") or not checkpoint_config.model.get("mlp"):
         raise ValueError("checkpoint does not contain model.mlp configuration")
     model_config = OmegaConf.to_container(checkpoint_config.model.mlp, resolve=True)
     if not isinstance(model_config, dict):
         raise TypeError("checkpoint model.mlp must be a mapping")
+    feature_mode = str(checkpoint_config.data.get("feature_mode", "relative"))
+    if tuple(state.get("feature_names", ())) != classify_feature_names(feature_mode):
+        raise ValueError("checkpoint feature layout does not match its configuration")
+    if tuple(state.get("scalar_names", ())) != CLASSIFY_SCALAR_NAMES:
+        raise ValueError("checkpoint does not use the clock and weekday scalar layout")
     classifier = RelativeDirectionClassifier(**model_config).to(device)
     classifier.load_state_dict(state["model"], strict=True)
     classifier.eval()
@@ -211,6 +226,7 @@ def make_evaluation_dataset(
         targets=targets,
         seed=0,
         anchor_minute=anchor_minute,
+        target_minute=cfg.data.get("target_minute", None),
     )
     dataset: Dataset = base if anchor_minute is not None else RegularMinuteSweepDataset(base)
     return dataset, validation_start, last_date
@@ -240,6 +256,7 @@ def summarize_trades(
     requested_symbols: tuple[str, ...],
     entry_minutes_per_stock_day: int = 1,
     selection_mode: str = "threshold",
+    target_time: str | None = None,
 ) -> dict[str, object]:
     candidate = binary_metrics(candidate_logits, candidate_labels)
     entry_minutes = int(entry_minutes_per_stock_day)
@@ -251,6 +268,7 @@ def summarize_trades(
         "validation_start": str(validation_start.date()),
         "data_last_date": str(last_date.date()),
         "anchor_time_eastern": anchor_time,
+        "target_time_eastern": target_time or anchor_time,
         "horizon_trading_days": horizon_days,
         "selection_mode": selection_mode,
         "max_trades_per_minute": 3 if selection_mode == "top3" else None,
@@ -353,11 +371,18 @@ def evaluate_bets(
         anchor_progress = batch["anchor_progress"].to(device=device, dtype=torch.float32)
         weekday = batch["weekday"].to(device=device, dtype=torch.long)
         scalars = build_classify_scalars(anchor_progress, weekday)
-        features = build_relative_features(
-            prices, reference, float(cfg.data.get("price_feature_scale", 100.0))
+        features = build_classify_features(
+            prices,
+            reference,
+            str(cfg.data.get("feature_mode", "relative")),
+            float(cfg.data.get("price_feature_scale", 100.0)),
         )
         logits = classifier(features, scalars)
-        labels = relative_labels(prices, reference)
+        labels = classify_labels(
+            prices,
+            reference,
+            str(cfg.data.get("target_mode", "relative_direction")),
+        )
         probabilities = logits.sigmoid()
         confidence = torch.maximum(probabilities, 1.0 - probabilities)
         selected = confidence.ge(float(min_confidence))
@@ -387,10 +412,13 @@ def evaluate_bets(
                 "entry_date": batch["date"][index],
                 "exit_date": batch["target_date"][index],
                 "anchor_time": batch["anchor_time"][index],
+                "target_time": batch.get("target_time", batch["anchor_time"])[index],
                 "side": side,
                 "direction": int(direction),
+                "probability_higher": float(probabilities[index]),
                 "probability_outperform": float(probabilities[index]),
                 "confidence": float(confidence[index]),
+                "actual_higher": int(labels[index]),
                 "actual_outperform": int(labels[index]),
                 "signal_correct": bool(directions[index].gt(0).eq(labels[index].bool())),
                 "stock_entry_price": float(prices[index, -2]),
@@ -441,13 +469,18 @@ def evaluate(
     device_name: str | None = None,
     batch_size: int = 390,
     workers: int = 4,
-    position_mode: str = "relative",
+    position_mode: str | None = None,
     transaction_cost_bps: float = 0.0,
     selection_mode: str = "threshold",
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if selection_mode not in ("threshold", "top3"):
         raise ValueError("selection_mode must be 'threshold' or 'top3'")
     cfg = OmegaConf.load(config_path)
+    if anchor_minute is None and cfg.data.get("anchor_minute", None) is not None:
+        anchor_minute = int(cfg.data.anchor_minute)
+    target_mode = str(cfg.data.get("target_mode", "relative_direction"))
+    if position_mode is None:
+        position_mode = "stock" if target_mode == "stock_direction" else "relative"
     device = torch.device(device_name or str(cfg.model.device))
     classifier, state = load_classifier(checkpoint_path, device)
     checkpoint_horizon = int(state.get("horizon_days", cfg.data.horizon_days))
@@ -459,6 +492,11 @@ def evaluate(
         raise ValueError("checkpoint reference symbol does not match the evaluation config")
     if classifier.window_size != int(cfg.data.window_size):
         raise ValueError("checkpoint window size does not match the evaluation config")
+    feature_mode = str(cfg.data.get("feature_mode", "relative"))
+    if tuple(state.get("feature_names", ())) != classify_feature_names(feature_mode):
+        raise ValueError("checkpoint feature layout does not match the evaluation config")
+    if str(state.get("target_mode", "relative_direction")) != target_mode:
+        raise ValueError("checkpoint target mode does not match the evaluation config")
 
     universe = cfg.data.get("val_universe", None)
     ranked_path = universe_path or (
@@ -493,6 +531,12 @@ def evaluate(
         if anchor_minute is None
         else f"{anchor_minute // 60:02d}:{anchor_minute % 60:02d}"
     )
+    configured_target = cfg.data.get("target_minute", None)
+    target_text = (
+        anchor_text
+        if configured_target is None
+        else f"{int(configured_target) // 60:02d}:{int(configured_target) % 60:02d}"
+    )
     summary = summarize_trades(
         frame,
         logits,
@@ -511,6 +555,7 @@ def evaluate(
         if isinstance(dataset, RegularMinuteSweepDataset)
         else 1,
         selection_mode=selection_mode,
+        target_time=target_text,
     )
     return frame, summary
 
@@ -518,7 +563,7 @@ def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Backtest a relative-direction checkpoint at every regular-session minute."
+            "Backtest a binary price-direction checkpoint."
         )
     )
     parser.add_argument("--checkpoint", required=True, help="classifier .ckpt to evaluate")
@@ -536,7 +581,10 @@ def main() -> None:
         "--anchor_time",
         type=parse_anchor_time,
         default=None,
-        help="optional single HH:MM Eastern time; default sweeps every regular minute",
+        help=(
+            "optional entry HH:MM Eastern time; defaults to data.anchor_minute when "
+            "configured, otherwise sweeps every regular minute"
+        ),
     )
     parser.add_argument(
         "--min_confidence",
@@ -558,8 +606,11 @@ def main() -> None:
     parser.add_argument(
         "--position_mode",
         choices=("relative", "stock"),
-        default="relative",
-        help="relative hedges every stock bet with SPY; stock trades the stock alone",
+        default=None,
+        help=(
+            "relative hedges with SPY; stock trades only the stock; defaults to "
+            "stock for stock-direction targets and relative otherwise"
+        ),
     )
     parser.add_argument("--transaction_cost_bps", type=float, default=0.0)
     parser.add_argument("--output_csv", default=None, help="optional trade-level CSV path")

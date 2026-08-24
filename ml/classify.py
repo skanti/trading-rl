@@ -1,9 +1,8 @@
-"""Relative-direction binary classifier: does the stock beat the reference?
+"""Binary price-direction features, labels, model, and metrics.
 
-The observation is one channel — the log ratio of the stock to the reference —
-anchored so the newest value is zero. The label is whether that ratio is higher
-``horizon_days`` sessions later at the same time of day, which is exactly "the
-stock outperformed the reference".
+Supported experiments either expose one stock/reference-relative channel or
+two independently normalized stock and reference channels. In both layouts the
+labelled future tick is excluded from the observation.
 """
 
 from __future__ import annotations
@@ -14,7 +13,10 @@ import torch.nn.functional as F
 import model
 
 
-CLASSIFY_FEATURE_NAMES = ("relative_log_price",)
+RELATIVE_FEATURE_NAMES = ("relative_log_price",)
+DUAL_PRICE_FEATURE_NAMES = ("stock_log_price", "reference_log_price")
+# Backward-compatible names for the original relative experiment and tests.
+CLASSIFY_FEATURE_NAMES = RELATIVE_FEATURE_NAMES
 CLASSIFY_FEATURE_DIM = len(CLASSIFY_FEATURE_NAMES)
 WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday")
 CLASSIFY_SCALAR_NAMES = (
@@ -22,6 +24,15 @@ CLASSIFY_SCALAR_NAMES = (
     *(f"weekday_{name}" for name in WEEKDAY_NAMES),
 )
 CLASSIFY_SCALAR_DIM = len(CLASSIFY_SCALAR_NAMES)
+
+
+def classify_feature_names(feature_mode: str) -> tuple[str, ...]:
+    mode = str(feature_mode)
+    if mode == "relative":
+        return RELATIVE_FEATURE_NAMES
+    if mode == "dual_normalized":
+        return DUAL_PRICE_FEATURE_NAMES
+    raise ValueError("feature_mode must be 'relative' or 'dual_normalized'")
 
 
 def relative_log_prices(prices: torch.Tensor, reference_prices: torch.Tensor) -> torch.Tensor:
@@ -60,6 +71,46 @@ def build_relative_features(
     return anchored.unsqueeze(-1)
 
 
+def build_dual_price_features(
+    prices: torch.Tensor,
+    reference_prices: torch.Tensor,
+    price_feature_scale: float = 100.0,
+) -> torch.Tensor:
+    """Independently normalized stock and reference channels.
+
+    Both paths are log-normalized to their 15:55 entry value. The future target
+    tick is excluded, and scaling either raw price series by a constant leaves
+    the corresponding channel unchanged.
+    """
+    if prices.shape != reference_prices.shape or prices.ndim != 2:
+        raise ValueError("prices and reference_prices must share shape (batch, sequence)")
+    if not torch.isfinite(prices).all() or not torch.isfinite(reference_prices).all():
+        raise ValueError("prices must be finite")
+    if (prices <= 0).any() or (reference_prices <= 0).any():
+        raise ValueError("prices must be positive")
+    stock = torch.log(prices.float())[:, :-1]
+    reference = torch.log(reference_prices.float())[:, :-1]
+    if stock.shape[1] < 2:
+        raise ValueError("the window must hold at least two ticks")
+    scale = float(price_feature_scale)
+    stock = (stock - stock[:, -1:]) * scale
+    reference = (reference - reference[:, -1:]) * scale
+    return torch.stack((stock, reference), dim=-1)
+
+
+def build_classify_features(
+    prices: torch.Tensor,
+    reference_prices: torch.Tensor,
+    feature_mode: str,
+    price_feature_scale: float = 100.0,
+) -> torch.Tensor:
+    if str(feature_mode) == "relative":
+        return build_relative_features(prices, reference_prices, price_feature_scale)
+    if str(feature_mode) == "dual_normalized":
+        return build_dual_price_features(prices, reference_prices, price_feature_scale)
+    raise ValueError("feature_mode must be 'relative' or 'dual_normalized'")
+
+
 def relative_labels(prices: torch.Tensor, reference_prices: torch.Tensor) -> torch.Tensor:
     """1.0 when the stock outperforms the reference over the horizon.
 
@@ -68,6 +119,25 @@ def relative_labels(prices: torch.Tensor, reference_prices: torch.Tensor) -> tor
     """
     relative = relative_log_prices(prices, reference_prices)
     return (relative[:, -1] > relative[:, -2]).float()
+
+
+def stock_direction_labels(prices: torch.Tensor) -> torch.Tensor:
+    """1.0 when the stock target price is above its entry-anchor price."""
+    if prices.ndim != 2 or prices.shape[1] < 2:
+        raise ValueError("prices must have shape (batch, sequence>=2)")
+    if not torch.isfinite(prices).all() or (prices <= 0).any():
+        raise ValueError("prices must be finite and positive")
+    return prices[:, -1].gt(prices[:, -2]).float()
+
+
+def classify_labels(
+    prices: torch.Tensor, reference_prices: torch.Tensor, target_mode: str
+) -> torch.Tensor:
+    if str(target_mode) == "relative_direction":
+        return relative_labels(prices, reference_prices)
+    if str(target_mode) == "stock_direction":
+        return stock_direction_labels(prices)
+    raise ValueError("target_mode must be 'relative_direction' or 'stock_direction'")
 
 
 def build_classify_scalars(
@@ -186,7 +256,7 @@ def binary_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, floa
 
 
 class RelativeDirectionClassifier(model.WindowMLP):
-    """Flat-window MLP emitting one logit per anchored window."""
+    """Flat-window MLP emitting one binary-direction logit per window."""
 
     def __init__(
         self,
@@ -196,8 +266,8 @@ class RelativeDirectionClassifier(model.WindowMLP):
         depth: int = 4,
         scalar_dim: int = CLASSIFY_SCALAR_DIM,
     ):
-        if feature_dim != CLASSIFY_FEATURE_DIM:
-            raise ValueError(f"relative classifier requires feature_dim={CLASSIFY_FEATURE_DIM}")
+        if int(feature_dim) < 1:
+            raise ValueError("feature_dim must be positive")
         super().__init__(window_size, feature_dim, hidden_dim, 1, depth, scalar_dim)
         # A small head starts the classifier near p=0.5 rather than at an
         # arbitrary confident guess.

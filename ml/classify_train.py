@@ -1,4 +1,4 @@
-"""Supervised trainer for the relative-direction binary classifier."""
+"""Supervised trainer for binary price-direction classifiers."""
 
 from __future__ import annotations
 
@@ -16,15 +16,14 @@ from tqdm import tqdm
 
 import utils
 from classify import (
-    CLASSIFY_FEATURE_DIM,
-    CLASSIFY_FEATURE_NAMES,
     CLASSIFY_SCALAR_DIM,
     CLASSIFY_SCALAR_NAMES,
     RelativeDirectionClassifier,
     binary_metrics,
+    build_classify_features,
     build_classify_scalars,
-    build_relative_features,
-    relative_labels,
+    classify_feature_names,
+    classify_labels,
 )
 from classify_dataset import make_classify_dataloader
 
@@ -40,8 +39,9 @@ def build_classifier(cfg: DictConfig, device: torch.device) -> RelativeDirection
     config = OmegaConf.to_container(cfg.model.mlp, resolve=True)
     if not isinstance(config, dict):
         raise TypeError("model.mlp must be a mapping")
-    if int(config.get("feature_dim", -1)) != CLASSIFY_FEATURE_DIM:
-        raise ValueError(f"model.mlp.feature_dim must be {CLASSIFY_FEATURE_DIM}")
+    feature_names = classify_feature_names(str(cfg.data.get("feature_mode", "relative")))
+    if int(config.get("feature_dim", -1)) != len(feature_names):
+        raise ValueError(f"model.mlp.feature_dim must be {len(feature_names)}")
     if int(config.get("scalar_dim", -1)) != CLASSIFY_SCALAR_DIM:
         raise ValueError(f"model.mlp.scalar_dim must be {CLASSIFY_SCALAR_DIM}")
     classifier = RelativeDirectionClassifier(**config).to(device)
@@ -60,10 +60,16 @@ def prepare_batch(batch: dict, device: torch.device, cfg: DictConfig):
     anchor_progress = batch["anchor_progress"].to(device=device, dtype=torch.float32)
     weekday = batch["weekday"].to(device=device, dtype=torch.long)
     scalars = build_classify_scalars(anchor_progress, weekday)
-    features = build_relative_features(
-        prices, reference, float(cfg.data.get("price_feature_scale", 100.0))
+    features = build_classify_features(
+        prices,
+        reference,
+        str(cfg.data.get("feature_mode", "relative")),
+        float(cfg.data.get("price_feature_scale", 100.0)),
     )
-    return features, scalars, relative_labels(prices, reference)
+    labels = classify_labels(
+        prices, reference, str(cfg.data.get("target_mode", "relative_direction"))
+    )
+    return features, scalars, labels
 
 
 @torch.no_grad()
@@ -121,11 +127,13 @@ def main(cfg: DictConfig) -> None:
         eta_min=float(cfg.model.get("eta_min", 1e-6)),
     )
     logger.info(
-        "Relative-direction classifier, params=%.2fM, window_size=%d, horizon_days=%d, "
-        "train_samples=%d, validation_samples=%d",
+        "Direction classifier, params=%.2fM, window_size=%d, horizon_days=%d, "
+        "anchor_minute=%s, target_minute=%s, train_samples=%d, validation_samples=%d",
         sum(parameter.numel() for parameter in classifier.parameters()) / 1e6,
         int(cfg.model.mlp.window_size),
         int(cfg.data.horizon_days),
+        str(cfg.data.get("anchor_minute", "random")),
+        str(cfg.data.get("target_minute", "same as anchor")),
         len(train_loader.dataset),
         len(validation_loader.dataset),
     )
@@ -136,8 +144,13 @@ def main(cfg: DictConfig) -> None:
     if checkpoint_path:
         logger.info("Loading checkpoint, checkpoint_path=%s", checkpoint_path)
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        if tuple(state.get("feature_names", ())) != CLASSIFY_FEATURE_NAMES:
-            raise ValueError("checkpoint is not a relative-direction classifier")
+        feature_names = classify_feature_names(str(cfg.data.get("feature_mode", "relative")))
+        if tuple(state.get("feature_names", ())) != feature_names:
+            raise ValueError("checkpoint feature layout does not match the experiment")
+        if str(state.get("target_mode", "relative_direction")) != str(
+            cfg.data.get("target_mode", "relative_direction")
+        ):
+            raise ValueError("checkpoint target mode does not match the experiment")
         classifier.load_state_dict(state["model"], strict=True)
         optimizer.load_state_dict(state["optimizer"])
         if "lr_scheduler" in state:
@@ -197,10 +210,17 @@ def main(cfg: DictConfig) -> None:
                     "model": classifier.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "lr_scheduler": scheduler.state_dict(),
-                    "feature_names": CLASSIFY_FEATURE_NAMES,
+                    "feature_names": classify_feature_names(
+                        str(cfg.data.get("feature_mode", "relative"))
+                    ),
                     "scalar_names": CLASSIFY_SCALAR_NAMES,
+                    "target_mode": str(
+                        cfg.data.get("target_mode", "relative_direction")
+                    ),
                     "reference_symbol": str(cfg.data.reference_symbol),
                     "horizon_days": int(cfg.data.horizon_days),
+                    "anchor_minute": cfg.data.get("anchor_minute", None),
+                    "target_minute": cfg.data.get("target_minute", None),
                     "config": OmegaConf.to_container(cfg, resolve=True),
                 },
             )
