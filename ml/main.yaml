@@ -1,7 +1,7 @@
 defaults:
   - _self_
 general:
-  experiment_name: "train-cls-overnight-1555-0945-stock-spy"
+  experiment_name: "train-cls-overnight-1555-0945-stock-spy-v2"
   experiment_dir: "${oc.env:EXP_DIR}/trading/${general.experiment_name}"
   # Selects the supervised classifier over the PPO trading policies.
   task: "classification"
@@ -35,8 +35,8 @@ data:
   anno: "2010-01-01"
   days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_10d.csv"
   data_dir: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22"
-  validation_weeks: 4
-  date_val: "2026-07-25"
+  validation_weeks: 12
+  date_val: "2026-06-01"
   price_feature_scale: 100.0
   # Validation is pinned to the 50 most-traded stocks so its win rate is stable
   # across steps.

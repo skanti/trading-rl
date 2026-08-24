@@ -272,6 +272,7 @@ def summarize_trades(
         "horizon_trading_days": horizon_days,
         "selection_mode": selection_mode,
         "max_trades_per_minute": 3 if selection_mode == "top3" else None,
+        "max_trades_per_day": 5 if selection_mode == "top5_daily" else None,
         "confidence_threshold": confidence_threshold,
         "position_mode": position_mode,
         "transaction_cost_bps_per_side": transaction_cost_bps,
@@ -343,6 +344,7 @@ def evaluate_bets(
     transaction_cost_bps: float,
     show_progress: bool = False,
     max_trades_per_minute: int | None = None,
+    max_trades_per_day: int | None = None,
 ) -> tuple[pd.DataFrame, torch.Tensor, torch.Tensor]:
     """Score candidates and return one row for every thresholded unit bet.
 
@@ -358,9 +360,13 @@ def evaluate_bets(
         raise ValueError("transaction_cost_bps must be non-negative")
     if max_trades_per_minute is not None and int(max_trades_per_minute) < 1:
         raise ValueError("max_trades_per_minute must be positive")
+    if max_trades_per_day is not None and int(max_trades_per_day) < 1:
+        raise ValueError("max_trades_per_day must be positive")
+    if max_trades_per_minute is not None and max_trades_per_day is not None:
+        raise ValueError("minute and daily trade limits are mutually exclusive")
 
     rows: list[dict[str, object]] = []
-    minute_candidates: dict[tuple[str, str], list[dict[str, object]]] = {}
+    ranked_candidates: dict[tuple[str, ...], list[dict[str, object]]] = {}
     all_logits: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
     cost_rate = float(transaction_cost_bps) / 10_000.0
@@ -433,11 +439,16 @@ def evaluate_bets(
                 "net_return_on_gross_capital": net_pnl / gross_capital,
                 "trade_won": net_pnl > 0.0,
             }
-            if max_trades_per_minute is None:
+            if max_trades_per_minute is None and max_trades_per_day is None:
                 rows.append(row)
             else:
-                cohort_key = (str(row["entry_date"]), str(row["anchor_time"]))
-                cohort = minute_candidates.setdefault(cohort_key, [])
+                if max_trades_per_day is not None:
+                    cohort_key = (str(row["entry_date"]),)
+                    cohort_limit = int(max_trades_per_day)
+                else:
+                    cohort_key = (str(row["entry_date"]), str(row["anchor_time"]))
+                    cohort_limit = int(max_trades_per_minute)
+                cohort = ranked_candidates.setdefault(cohort_key, [])
                 cohort.append(row)
                 cohort.sort(
                     key=lambda candidate: (
@@ -445,14 +456,14 @@ def evaluate_bets(
                         str(candidate["sample_id"]),
                     )
                 )
-                del cohort[int(max_trades_per_minute) :]
+                del cohort[cohort_limit:]
     if not all_logits:
         raise ValueError("evaluation loader produced no candidate batches")
-    if max_trades_per_minute is not None:
+    if max_trades_per_minute is not None or max_trades_per_day is not None:
         rows = [
             candidate
-            for cohort_key in sorted(minute_candidates)
-            for candidate in minute_candidates[cohort_key]
+            for cohort_key in sorted(ranked_candidates)
+            for candidate in ranked_candidates[cohort_key]
         ]
     frame = pd.DataFrame(rows)
     return frame, torch.cat(all_logits), torch.cat(all_labels)
@@ -473,8 +484,8 @@ def evaluate(
     transaction_cost_bps: float = 0.0,
     selection_mode: str = "threshold",
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    if selection_mode not in ("threshold", "top3"):
-        raise ValueError("selection_mode must be 'threshold' or 'top3'")
+    if selection_mode not in ("threshold", "top3", "top5_daily"):
+        raise ValueError("selection_mode must be 'threshold', 'top3', or 'top5_daily'")
     cfg = OmegaConf.load(config_path)
     if anchor_minute is None and cfg.data.get("anchor_minute", None) is not None:
         anchor_minute = int(cfg.data.anchor_minute)
@@ -525,6 +536,7 @@ def evaluate(
         transaction_cost_bps,
         show_progress=True,
         max_trades_per_minute=3 if selection_mode == "top3" else None,
+        max_trades_per_day=5 if selection_mode == "top5_daily" else None,
     )
     anchor_text = (
         "every minute 09:30..15:59"
@@ -570,11 +582,12 @@ def main() -> None:
     parser.add_argument("--config_path", default="main.yaml")
     parser.add_argument(
         "--selection_mode",
-        choices=("threshold", "top3"),
+        choices=("threshold", "top3", "top5_daily"),
         default="threshold",
         help=(
-            "threshold trades every qualifying signal; top3 keeps only the three "
-            "most-confident qualifying symbols per minute"
+            "threshold trades every qualifying signal; top3 keeps the three most-"
+            "confident qualifying symbols per minute; top5_daily keeps the five "
+            "most-confident qualifying symbols per entry date"
         ),
     )
     parser.add_argument(

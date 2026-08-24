@@ -193,6 +193,42 @@ class ClassifyEvaluateTest(unittest.TestCase):
         self.assertEqual(logits.numel(), 5)
         self.assertEqual(labels.numel(), 5)
 
+    def test_top5_daily_keeps_only_the_most_confident_symbols_across_minutes(self):
+        classifier = FixedClassifier([5.0, -4.0, 3.0, -2.0, 1.0, 0.8, -0.7])
+        prices = torch.full((7, 5), 100.0)
+        prices[:, -1] = torch.tensor([105.0, 95.0, 104.0, 96.0, 103.0, 102.0, 98.0])
+        reference = torch.full((7, 5), 100.0)
+        batch = {
+            "_id": ["A", "B", "C", "D", "E", "F", "G"],
+            "date": ["2026-08-03"] * 7,
+            "target_date": ["2026-08-04"] * 7,
+            "anchor_time": ["13:00"] * 4 + ["15:55"] * 3,
+            "weekday": torch.tensor([0] * 7),
+            "prices": prices,
+            "reference_prices": reference,
+            "anchor_progress": torch.full((7,), 0.5),
+        }
+        cfg = OmegaConf.create({"data": {"price_feature_scale": 100.0}})
+
+        frame, logits, labels = evaluate_bets(
+            classifier,
+            [batch],
+            cfg,
+            torch.device("cpu"),
+            min_confidence=0.60,
+            position_mode="stock",
+            transaction_cost_bps=0.0,
+            max_trades_per_day=5,
+        )
+
+        self.assertEqual(frame.sample_id.tolist(), ["A", "B", "C", "D", "E"])
+        self.assertEqual(frame.direction.tolist(), [1, -1, 1, -1, 1])
+        self.assertTrue(frame.confidence.is_monotonic_decreasing)
+        self.assertTrue(frame.signal_correct.all())
+        self.assertTrue(frame.trade_won.all())
+        self.assertEqual(logits.numel(), 7)
+        self.assertEqual(labels.numel(), 7)
+
 
 if __name__ == "__main__":
     unittest.main()
