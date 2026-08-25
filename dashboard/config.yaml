@@ -1,0 +1,43 @@
+# Dashboard, Firebase and notification settings.
+# Read by ml/baseline/* (publisher, digest, auth provisioning) and by nuxt.config.ts.
+# Alpaca credentials are NOT here -- they come from the environment (see ml/.env).
+
+dashboard:
+  url: "https://trading-dashboard-ccdd5.web.app"
+  title: "Overnight Liquidity"
+
+auth:
+  # Dashboard login. The username is bridged to a Firebase Auth account as
+  # `<username>@<email_domain>`; run `python -m baseline.provision_auth_user` after
+  # changing either value.
+  username: "gambler8"
+  password: "leverage1000x"
+  email_domain: "trading-dashboard-ccdd5.local"
+
+firebase:
+  project_id: "trading-dashboard-ccdd5"
+  collection: "accounts"
+  document: "paper"
+  # Consumed by nuxt.config.ts at build time.
+  web:
+    apiKey: "AIzaSyB8EdB28e7pIPI9_4wJdEEBcOTwpYPFAzQ"
+    authDomain: "trading-dashboard-ccdd5.firebaseapp.com"
+    projectId: "trading-dashboard-ccdd5"
+    storageBucket: "trading-dashboard-ccdd5.firebasestorage.app"
+    messagingSenderId: "774035311073"
+    appId: "1:774035311073:web:b7763e4da9ad0d4b22aaa0"
+  # Admin SDK key. Either a path to the downloaded JSON, or paste the JSON contents
+  # inline as a mapping here. Firebase console -> Project settings -> Service accounts.
+  service_account: "~/.config/trading-dashboard/service-account.json"
+
+smtp:
+  host: "smtp.gmail.com"
+  port: 587
+  user: "armen.avetisyan.to@gmail.com"
+  # Gmail app password, not the account password.
+  password: "tcqh vbsl cupx fuqx"
+
+notifications:
+  recipients:
+    - "armen.avetisyan.to@gmail.com"
+    - "mobilephone.felix@gmail.com"

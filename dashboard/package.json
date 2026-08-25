@@ -1,0 +1,32 @@
+{
+  "name": "trading-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "lint": "eslint .",
+    "typecheck": "nuxt typecheck",
+    "test": "vitest run",
+    "deploy": "./deploy.sh"
+  },
+  "dependencies": {
+    "@iconify-json/lucide": "^1.2.111",
+    "@nuxt/ui": "^4.8.2",
+    "firebase": "^12.14.0",
+    "nuxt": "^4.4.6",
+    "tailwindcss": "^4.3.0",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@nuxt/eslint": "^1.15.2",
+    "eslint": "^10.4.1",
+    "happy-dom": "^20.10.2",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.6",
+    "vue-tsc": "^3.3.3"
+  },
+  "packageManager": "pnpm@11.5.2"
+}

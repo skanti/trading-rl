@@ -1,0 +1,22 @@
+rules_version = '2';
+
+// The dashboard is read-only for browsers: every write arrives through the Python
+// publisher using the Admin SDK, which bypasses these rules entirely. Anonymous
+// callers get nothing, so the account's equity is never publicly readable.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /accounts/{account} {
+      allow read: if request.auth != null;
+      allow write: if false;
+
+      match /sessions/{session} {
+        allow read: if request.auth != null;
+        allow write: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

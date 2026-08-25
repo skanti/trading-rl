@@ -14,3 +14,15 @@ outputs
 # except gitignore file
 !.gitignore
 !.gitattributes
+
+# dashboard build output
+/dashboard/node_modules/
+/dashboard/.output/
+/dashboard/.nuxt/
+/dashboard/.data/
+/dashboard/dist
+
+# Committed on purpose despite the blanket ".*" rule above: config.yaml is the
+# single source of truth, and deploy.sh hard-requires .firebaserc.
+!/dashboard/config.yaml
+!/dashboard/.firebaserc

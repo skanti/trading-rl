@@ -23,7 +23,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time as time_module
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -32,6 +32,7 @@ import requests
 from rich.console import Console
 from rich.table import Table
 
+from baseline import performance
 from baseline.overnight_liquidity import (
     DEFAULT_SECURITY_MASTER_CACHE,
     _security_symbol,
@@ -166,19 +167,8 @@ class DailyArtifacts:
         entry_orders = position.get("entry_orders") or {}
         exit_orders = position.get("exit_orders") or {}
 
-        def filled_notional(orders: Mapping[str, Mapping[str, object]]) -> float:
-            total = 0.0
-            for order in orders.values():
-                try:
-                    total += float(order.get("filled_qty") or 0.0) * float(
-                        order.get("filled_avg_price") or 0.0
-                    )
-                except (TypeError, ValueError):
-                    continue
-            return total
-
-        entry_notional = filled_notional(entry_orders)
-        exit_notional = filled_notional(exit_orders)
+        entry_notional = performance.filled_notional(entry_orders)
+        exit_notional = performance.filled_notional(exit_orders)
         realized_pnl = exit_notional - entry_notional if exit_orders else None
         summary: dict[str, object] = {
             "version": 1,
@@ -432,6 +422,26 @@ class AlpacaClient:
 
     def positions(self) -> list[dict[str, Any]]:
         return list(self._request("GET", self.trading_url, "positions"))
+
+    def portfolio_history(
+        self,
+        period: str = "1A",
+        timeframe: str = "1D",
+    ) -> dict[str, Any]:
+        """Account equity curve. Points are stamped at UTC midnight of the day after
+        the session, so the trading date is the timestamp's Eastern date."""
+        return dict(
+            self._request(
+                "GET",
+                self.trading_url,
+                "account/portfolio/history",
+                params={
+                    "period": period,
+                    "timeframe": timeframe,
+                    "extended_hours": "false",
+                },
+            )
+        )
 
     def position(self, symbol: str) -> dict[str, Any] | None:
         result = self._request(
@@ -1204,6 +1214,107 @@ def exit_position(
         return position
 
 
+# Wall-clock ceilings for the daemon's outbound side effects. Neither is part of
+# trading, so both are abandoned rather than allowed to hold up the loop.
+DIGEST_TIMEOUT_SECONDS = 60.0
+PUBLISH_TIMEOUT_SECONDS = 60.0
+
+
+def _run_guarded(label: str, action: Callable[[], None], timeout_seconds: float) -> None:
+    """Run a non-trading side effect that must neither raise nor stall.
+
+    Catching exceptions is not sufficient on its own. ``smtplib`` is given an explicit
+    timeout, but firebase-admin issues gRPC calls with no default deadline, so an
+    unreachable Firestore could otherwise block this loop indefinitely while a position
+    is open. The work therefore runs on a daemon thread and is abandoned if it overruns;
+    an abandoned thread cannot keep the process alive at shutdown either.
+    """
+    failure: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            action()
+        except BaseException as error:  # noqa: BLE001 - reported, never re-raised here
+            failure.append(error)
+
+    worker = threading.Thread(target=target, name=f"{label}-worker", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+
+    if worker.is_alive():
+        LOGGER.error(
+            "%s exceeded %.0fs and was abandoned; trading is unaffected",
+            label,
+            timeout_seconds,
+        )
+        return
+    if failure:
+        LOGGER.error(
+            "%s failed; trading is unaffected: %s",
+            label,
+            failure[0],
+            exc_info=failure[0],
+        )
+
+
+def _send_exit_digest(
+    client: "AlpacaClient",
+    position: Mapping[str, object],
+    config_path: str | None,
+    enabled: bool,
+) -> None:
+    """Email the daily digest after the overnight basket has been closed.
+
+    A mail server outage, a rejected app password or a missing dashboard config must
+    never propagate into the exit path that has just sold real positions.
+    """
+    if not enabled:
+        return
+    status = str(position.get("status") or "")
+    if status not in {"closed", "exit_queued"}:
+        return
+
+    def send() -> None:
+        from baseline import reporting
+        from baseline.dashboard_config import load_dashboard_config
+
+        config = load_dashboard_config(config_path)
+        digest = reporting.build_digest_live(client, position, config)
+        recipients = reporting.send_digest(digest, config)
+        LOGGER.info("exit digest emailed to %s", ", ".join(recipients))
+
+    _run_guarded("exit digest email", send, DIGEST_TIMEOUT_SECONDS)
+
+
+def _publish_dashboard(
+    client: "AlpacaClient",
+    store: "StateStore",
+    work_dir: Path,
+    config_path: str | None,
+    enabled: bool,
+) -> None:
+    """Push an account snapshot to Firestore for the dashboard.
+
+    Off unless ``--dashboard`` is passed. When enabled it is folded into this daemon
+    rather than run as a second process: this loop is already permanent, so there is
+    nothing extra to supervise. As with the digest email, both failure and stalling are
+    contained -- see :func:`_run_guarded`.
+    """
+    if not enabled:
+        return
+
+    def push() -> None:
+        from baseline import dashboard_publisher
+        from baseline.dashboard_config import load_dashboard_config
+
+        config = load_dashboard_config(config_path)
+        snapshot = dashboard_publisher.build_snapshot(client, store.load(), config)
+        sessions = dashboard_publisher.session_records(work_dir)
+        dashboard_publisher.publish(snapshot, sessions, config)
+
+    _run_guarded("dashboard publish", push, PUBLISH_TIMEOUT_SECONDS)
+
+
 def _print_entry_plan(position: Mapping[str, object], submit: bool) -> None:
     table = Table(title="Overnight basket entry" if submit else "DRY RUN — overnight basket entry")
     table.add_column("Symbol")
@@ -1312,6 +1423,10 @@ def run_daemon(
     minimum_ranking_lead_minutes: int,
     entry_grace_seconds: int,
     artifacts: DailyArtifacts,
+    dashboard_config: str | None = None,
+    email_digest: bool = True,
+    publish_dashboard: bool = False,
+    publish_interval_seconds: float = 300.0,
 ) -> None:
     LOGGER.info(
         "daemon started: rank %s, enter %s, exit %s America/New_York",
@@ -1321,6 +1436,9 @@ def run_daemon(
     )
     last_error_key: tuple[str, str] | None = None
     last_attempts: dict[str, datetime] = {}
+    # Publish immediately on the first pass, then on the configured throttle. Strategy
+    # actions reset this to 0.0 so a rank, entry or exit shows up straight away.
+    publish_due = 0.0
 
     def may_attempt(key: str, current: datetime) -> bool:
         previous = last_attempts.get(key)
@@ -1364,6 +1482,8 @@ def run_daemon(
                 entry_day = date.fromisoformat(str(result["entry_date"]))
                 if entry_day != today:
                     artifacts.write_summary(entry_day, "exit", store, config)
+                _send_exit_digest(client, result, dashboard_config, email_digest)
+                publish_due = 0.0
             state = store.load()
             ranking = state.get("ranking") or {}
             rank_start = _combine(today, ranking_time)
@@ -1380,6 +1500,7 @@ def run_daemon(
                 result = rank_for_day(client, store, config, today, artifacts=artifacts)
                 _print_ranking(result, config.top)
                 artifacts.write_summary(today, "rank", store, config)
+                publish_due = 0.0
             state = store.load()
             ranking = state.get("ranking") or {}
             position = state.get("position") or {}
@@ -1405,11 +1526,22 @@ def run_daemon(
                 result = enter_for_day(client, store, config, today, submit=True, now=now)
                 _print_entry_plan(result, True)
                 artifacts.write_summary(today, "enter", store, config)
+                publish_due = 0.0
             elif new_entry_due and not ranking_early and may_attempt("missing-ranking", now):
                 LOGGER.error(
                     "entry skipped: no ranking completed at least %d minutes before %s",
                     minimum_ranking_lead_minutes,
                     entry_time.strftime("%H:%M"),
+                )
+            if publish_dashboard and time_module.monotonic() >= publish_due:
+                _publish_dashboard(
+                    client, store, artifacts.work_dir, dashboard_config, publish_dashboard
+                )
+                # A zero interval means "on strategy actions only".
+                publish_due = (
+                    float("inf")
+                    if publish_interval_seconds <= 0.0
+                    else time_module.monotonic() + publish_interval_seconds
                 )
             last_error_key = None
         except Exception as error:
@@ -1494,6 +1626,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-live-endpoint",
         action="store_true",
         help="explicitly allow an endpoint other than paper-api.alpaca.markets",
+    )
+    parser.add_argument(
+        "--dashboard-config",
+        default=None,
+        help="dashboard/config.yaml supplying SMTP settings for the exit digest email",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="do not email the digest after a submitted exit",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="publish account snapshots to Firestore for the dashboard (off by default)",
+    )
+    parser.add_argument(
+        "--publish-interval-seconds",
+        type=float,
+        default=300.0,
+        help="dashboard publish cadence; only used with --dashboard, 0 publishes on strategy actions only",
     )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     return parser
@@ -1664,6 +1817,9 @@ def main() -> None:
             entry_day = date.fromisoformat(str(result["entry_date"]))
             if entry_day != trade_date:
                 artifacts.write_summary(entry_day, "exit", store, config)
+            _send_exit_digest(
+                client, result, args.dashboard_config, args.submit and not args.no_email
+            )
         else:
             run_daemon(
                 client,
@@ -1675,6 +1831,10 @@ def main() -> None:
                 args.minimum_ranking_lead_minutes,
                 args.entry_grace_seconds,
                 artifacts,
+                dashboard_config=args.dashboard_config,
+                email_digest=not args.no_email,
+                publish_dashboard=args.dashboard,
+                publish_interval_seconds=args.publish_interval_seconds,
             )
     except Exception as error:
         LOGGER.exception("%s action failed: %s", args.action, error)
