@@ -108,8 +108,8 @@ class DailyArtifacts:
         bars_by_symbol: Mapping[str, Sequence[Mapping[str, object]]],
         *,
         feed: str,
-        start: date,
-        end: date,
+        start: date | datetime,
+        end: date | datetime,
     ) -> dict[str, object]:
         """Write the historical market bars consumed by that day's ranking.
 
@@ -285,6 +285,22 @@ def load_credentials() -> tuple[str, str]:
     return key, secret
 
 
+def load_data_credentials(trading_key: str, trading_secret: str) -> tuple[str, str]:
+    """Load an optional market-data subscription, falling back to trading auth."""
+    key = os.environ.get("ALPACA_DATA_KEY")
+    secret = os.environ.get("ALPACA_DATA_SECRET")
+    if not key and not secret:
+        return trading_key, trading_secret
+    if not key or not secret:
+        raise RuntimeError("set both ALPACA_DATA_KEY and ALPACA_DATA_SECRET, or neither")
+    return key, secret
+
+
+def _completed_session_end(day: date) -> datetime:
+    """Return an explicit timestamp safely beyond a completed session's daily bar."""
+    return datetime.combine(day, time(23, 59, 59), tzinfo=EASTERN)
+
+
 class AlpacaClient:
     """Small REST client with bounded retries and thread-local sessions."""
 
@@ -296,7 +312,11 @@ class AlpacaClient:
         data_url: str = DEFAULT_DATA_URL,
         timeout_seconds: float = 30.0,
         max_retries: int = 4,
+        data_key: str | None = None,
+        data_secret: str | None = None,
     ):
+        if (data_key is None) != (data_secret is None):
+            raise ValueError("data_key and data_secret must be provided together")
         self.trading_url = _normalize_api_base(trading_url)
         self.data_url = _normalize_api_base(data_url)
         self.timeout_seconds = float(timeout_seconds)
@@ -308,14 +328,20 @@ class AlpacaClient:
             "Content-Type": "application/json",
             "User-Agent": "trading-rl-overnight-liquidity/1",
         }
+        self._data_headers = {
+            **self._headers,
+            "APCA-API-KEY-ID": data_key or key,
+            "APCA-API-SECRET-KEY": data_secret or secret,
+        }
         self._local = threading.local()
 
-    def _session(self) -> requests.Session:
-        session = getattr(self._local, "session", None)
+    def _session(self, *, data_credentials: bool = False) -> requests.Session:
+        attribute = "data_session" if data_credentials else "trading_session"
+        session = getattr(self._local, attribute, None)
         if session is None:
             session = requests.Session()
-            session.headers.update(self._headers)
-            self._local.session = session
+            session.headers.update(self._data_headers if data_credentials else self._headers)
+            setattr(self._local, attribute, session)
         return session
 
     def _request(
@@ -327,11 +353,12 @@ class AlpacaClient:
         params: Mapping[str, object] | None = None,
         payload: Mapping[str, object] | None = None,
         allow_not_found: bool = False,
+        data_credentials: bool = False,
     ) -> Any:
         url = f"{base}/{path.lstrip('/')}"
         for attempt in range(self.max_retries + 1):
             try:
-                response = self._session().request(
+                response = self._session(data_credentials=data_credentials).request(
                     method,
                     url,
                     params=params,
@@ -384,6 +411,7 @@ class AlpacaClient:
                 f"{data_root}/v1beta1",
                 "screener/stocks/most-actives",
                 params={"by": by, "top": int(top)},
+                data_credentials=True,
             )
         )
 
@@ -446,8 +474,8 @@ class AlpacaClient:
     def historical_daily_bars(
         self,
         symbols: Sequence[str],
-        start: date,
-        end: date,
+        start: date | datetime,
+        end: date | datetime,
         feed: str,
         adjustment: str = "raw",
     ) -> dict[str, list[dict[str, Any]]]:
@@ -466,7 +494,15 @@ class AlpacaClient:
             }
             if page_token:
                 params["page_token"] = page_token
-            response = dict(self._request("GET", self.data_url, "stocks/bars", params=params))
+            response = dict(
+                self._request(
+                    "GET",
+                    self.data_url,
+                    "stocks/bars",
+                    params=params,
+                    data_credentials=True,
+                )
+            )
             for symbol, bars in dict(response.get("bars") or {}).items():
                 output.setdefault(str(symbol), []).extend(list(bars))
             page_token = response.get("next_page_token")
@@ -649,8 +685,8 @@ def completed_liquidity_ranking(
 def _download_bars(
     client: AlpacaClient,
     symbols: Sequence[str],
-    start: date,
-    end: date,
+    start: date | datetime,
+    end: date | datetime,
     feed: str,
     batch_size: int,
     workers: int,
@@ -745,11 +781,12 @@ def rank_for_day(
             candidate_diagnostics["previous_screen_symbols"],
             candidate_diagnostics["excluded_or_unavailable_candidates"],
         )
+        bars_end = _completed_session_end(completed[-1])
         bars = _download_bars(
             client,
             symbols,
             lookback_start,
-            trade_date,
+            bars_end,
             config.feed,
             config.data_batch_size,
             config.data_workers,
@@ -761,7 +798,7 @@ def rank_for_day(
                 bars,
                 feed=config.feed,
                 start=lookback_start,
-                end=trade_date,
+                end=bars_end,
             )
         ranking = completed_liquidity_ranking(
             bars,
@@ -1040,6 +1077,7 @@ def exit_position(
     config: StrategyConfig,
     submit: bool,
     now: datetime | None = None,
+    wait_for_fill: bool = True,
 ) -> dict[str, Any]:
     with store.locked():
         state = store.load()
@@ -1113,6 +1151,35 @@ def exit_position(
             position.setdefault("exit_orders", {})[symbol] = _order_summary(order)
             state["position"] = position
             store.save(state)
+
+        # A queued order may have filled before the daemon's 09:30
+        # reconciliation, leaving no current position to drive the loop above.
+        # Refresh those completed orders so durable state records the fill.
+        for symbol in set(owned_symbols) - set(current_positions):
+            attempt = max(1, int(attempts.get(symbol, 1)))
+            order = client.order_by_client_id(
+                _client_order_id(entry_date, "sell", symbol, attempt)
+            )
+            if order is not None:
+                position.setdefault("exit_orders", {})[symbol] = _order_summary(order)
+
+        if not wait_for_fill:
+            remaining = [symbol for symbol in owned_symbols if client.position(symbol) is not None]
+            position["remaining_symbols"] = remaining
+            position["status"] = "exit_queued" if remaining else "closed"
+            position["exit_queued_at"] = _iso_now(now)
+            if not remaining:
+                position["exit_completed_at"] = _iso_now(now)
+            state["position"] = position
+            state["updated_at"] = _iso_now(now)
+            store.save(state)
+            LOGGER.info(
+                "pre-open exit queued for entry %s: orders=%d, remaining=%d",
+                entry_date,
+                len(submitted),
+                len(remaining),
+            )
+            return position
 
         final_orders = _wait_for_orders(
             client, submitted, config.fill_timeout_seconds, config.poll_seconds
@@ -1209,6 +1276,22 @@ def _validate_live_clock(client: AlpacaClient, expected_date: date) -> None:
         raise RuntimeError("Alpaca reports the US equity market is closed")
 
 
+def _validate_exit_clock(client: AlpacaClient, expected_date: date) -> bool:
+    """Validate an exit submission and report whether fills can be awaited now."""
+    clock = client.clock()
+    market_now = _parse_timestamp(str(clock["timestamp"])).astimezone(EASTERN)
+    if market_now.date() != expected_date:
+        raise RuntimeError(
+            f"Alpaca clock date {market_now.date()} does not match requested date {expected_date}"
+        )
+    if not time(9, 0) <= market_now.time().replace(tzinfo=None) < time(16, 0):
+        raise RuntimeError("exit submission must occur between 09:00 and 16:00 ET")
+    market_open = bool(clock.get("is_open"))
+    if market_now.time().replace(tzinfo=None) >= time(9, 30) and not market_open:
+        raise RuntimeError("Alpaca reports the US equity market is closed")
+    return market_open
+
+
 def _ranking_is_early_enough(
     ranking: Mapping[str, object], entry_at: datetime, minimum_lead_minutes: int
 ) -> bool:
@@ -1254,16 +1337,28 @@ def run_daemon(
             state = store.load()
             position = state.get("position") or {}
             exit_date_value = position.get("exit_date")
+            queued_before_open = (
+                position.get("status") == "exit_queued"
+                and now < _combine(today, time(9, 30))
+            )
             if (
                 exit_date_value
                 and position.get("status") != "closed"
+                and not queued_before_open
                 and today >= date.fromisoformat(str(exit_date_value))
                 and now >= _combine(today, exit_time)
                 and now < _combine(today, time(16, 0))
                 and may_attempt("exit", now)
             ):
-                _validate_live_clock(client, today)
-                result = exit_position(client, store, config, submit=True, now=now)
+                market_open = _validate_exit_clock(client, today)
+                result = exit_position(
+                    client,
+                    store,
+                    config,
+                    submit=True,
+                    now=now,
+                    wait_for_fill=market_open,
+                )
                 _print_exit(result, True)
                 artifacts.write_summary(today, "exit", store, config)
                 entry_day = date.fromisoformat(str(result["entry_date"]))
@@ -1330,14 +1425,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Rank and trade Alpaca's most-liquid fractionable stocks overnight."
     )
-    parser.add_argument("action", choices=("run", "rank", "enter", "exit", "status"))
+    parser.add_argument(
+        "action", choices=("run", "preview", "rank", "enter", "exit", "status")
+    )
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--entry-time", type=parse_clock, default=parse_clock("15:55"))
     parser.add_argument("--exit-time", type=parse_clock, default=parse_clock("09:35"))
     parser.add_argument(
         "--ranking-time",
         type=parse_clock,
-        default=parse_clock("15:15"),
+        default=parse_clock("15:00"),
         help="ET time to start ranking, well before entry",
     )
     parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=20)
@@ -1373,7 +1470,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cash-buffer-fraction", type=float, default=0.02)
     parser.add_argument("--fill-timeout-seconds", type=float, default=45.0)
-    parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument(
         "--work-dir",
         default=str(DEFAULT_WORK_DIR),
@@ -1434,8 +1531,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     regular_close = time(16, 0)
     if not regular_open <= args.entry_time < regular_close:
         parser.error("entry-time must be within regular US equity hours [09:30, 16:00)")
-    if not regular_open <= args.exit_time < regular_close:
-        parser.error("exit-time must be within regular US equity hours [09:30, 16:00)")
+    if not time(9, 0) <= args.exit_time < regular_close:
+        parser.error("exit-time must be within the exit submission window [09:00, 16:00)")
     lead = datetime.combine(date.min, args.entry_time) - datetime.combine(date.min, args.ranking_time)
     if lead < timedelta(minutes=args.minimum_ranking_lead_minutes):
         parser.error(
@@ -1443,6 +1540,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         )
     if args.action == "run" and not args.submit:
         parser.error("the run action requires --submit; use enter/exit without it to preview orders")
+    if args.action == "preview" and args.submit:
+        parser.error("the preview action never accepts --submit")
     if args.submit and not _is_paper_endpoint(args.trading_url) and not args.allow_live_endpoint:
         parser.error("refusing non-paper order submission without --allow-live-endpoint")
     exchanges = frozenset(value.strip().upper() for value in args.exchanges.split(",") if value.strip())
@@ -1471,7 +1570,16 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     config = _validate_args(parser, args)
-    work_dir = Path(args.work_dir).expanduser()
+    preview_workspace = (
+        tempfile.TemporaryDirectory(prefix="overnight-liquidity-preview.")
+        if args.action == "preview"
+        else None
+    )
+    work_dir = (
+        Path(preview_workspace.name)
+        if preview_workspace is not None
+        else Path(args.work_dir).expanduser()
+    )
     trade_date = date.fromisoformat(args.trade_date) if args.trade_date else datetime.now(EASTERN).date()
     log_format = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     daily_log = DailyLogHandler(
@@ -1484,7 +1592,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(), daily_log],
     )
-    state_path = Path(args.state_path).expanduser() if args.state_path else work_dir / "state.json"
+    state_path = (
+        work_dir / "state.json"
+        if preview_workspace is not None
+        else Path(args.state_path).expanduser()
+        if args.state_path
+        else work_dir / "state.json"
+    )
     store = StateStore(state_path)
     artifacts = DailyArtifacts(work_dir)
     artifacts.directory(trade_date)
@@ -1493,12 +1607,15 @@ def main() -> None:
         artifacts.write_summary(trade_date, "status", store, config)
         return
     key, secret = load_credentials()
+    data_key, data_secret = load_data_credentials(key, secret)
     client = AlpacaClient(
         key,
         secret,
         args.trading_url,
         args.data_url,
         timeout_seconds=args.request_timeout_seconds,
+        data_key=data_key,
+        data_secret=data_secret,
     )
     try:
         if args.action == "rank":
@@ -1507,6 +1624,14 @@ def main() -> None:
                 config.top,
             )
             artifacts.write_summary(trade_date, "rank", store, config)
+        elif args.action == "preview":
+            ranking = rank_for_day(client, store, config, trade_date)
+            _print_ranking(ranking, config.top)
+            result = enter_for_day(client, store, config, trade_date, submit=False)
+            _print_entry_plan(result, False)
+            CONSOLE.print(
+                "Preview complete: no orders submitted and live strategy state was not changed."
+            )
         elif args.action == "enter":
             if args.submit:
                 _validate_live_clock(client, trade_date)
@@ -1524,9 +1649,16 @@ def main() -> None:
             _print_entry_plan(result, args.submit)
             artifacts.write_summary(trade_date, "enter", store, config)
         elif args.action == "exit":
+            market_open = True
             if args.submit:
-                _validate_live_clock(client, trade_date)
-            result = exit_position(client, store, config, args.submit)
+                market_open = _validate_exit_clock(client, trade_date)
+            result = exit_position(
+                client,
+                store,
+                config,
+                args.submit,
+                wait_for_fill=market_open,
+            )
             _print_exit(result, args.submit)
             artifacts.write_summary(trade_date, "exit", store, config)
             entry_day = date.fromisoformat(str(result["entry_date"]))
@@ -1548,6 +1680,9 @@ def main() -> None:
         LOGGER.exception("%s action failed: %s", args.action, error)
         artifacts.write_summary(trade_date, "error", store, config, error=str(error))
         raise
+    finally:
+        if preview_workspace is not None:
+            preview_workspace.cleanup()
 
 
 if __name__ == "__main__":

@@ -2,20 +2,25 @@ import json
 import logging
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
 
 from baseline.live_overnight_liquidity import (
     DEFAULT_EXCHANGES,
+    EASTERN,
     RANKING_PIPELINE_VERSION,
     AlpacaClient,
     DailyArtifacts,
     DailyLogHandler,
     StateStore,
     StrategyConfig,
+    _completed_session_end,
+    _validate_args,
+    _validate_exit_clock,
     available_budget,
+    build_parser,
     completed_liquidity_ranking,
     eligible_assets,
     enter_for_day,
@@ -117,7 +122,59 @@ class FakeActivityClient:
         return {"most_actives": [{"symbol": symbol} for symbol in symbols]}
 
 
+class FakeQueuedBroker(FakeBroker):
+    def submit_order(self, payload):
+        if payload["side"] != "sell":
+            return super().submit_order(payload)
+        self.submissions.append(dict(payload))
+        order = {
+            "id": f"order-{len(self.submissions)}",
+            "client_order_id": payload["client_order_id"],
+            "symbol": payload["symbol"],
+            "side": "sell",
+            "status": "accepted",
+            "qty": payload["qty"],
+            "notional": None,
+            "filled_qty": "0",
+            "filled_avg_price": None,
+            "submitted_at": "2026-08-25T13:00:00Z",
+            "filled_at": None,
+        }
+        self.orders[payload["client_order_id"]] = order
+        return order
+
+
+class FakeClockBroker:
+    def __init__(self, timestamp, is_open):
+        self.timestamp = timestamp
+        self.is_open = is_open
+
+    def clock(self):
+        return {"timestamp": self.timestamp, "is_open": self.is_open}
+
+
 class LiveOvernightLiquidityTest(unittest.TestCase):
+    def test_exit_time_accepts_0900(self):
+        parser = build_parser()
+        args = parser.parse_args(["exit", "--exit-time", "09:00"])
+
+        parsed = _validate_args(parser, args)
+
+        self.assertIsInstance(parsed, StrategyConfig)
+        self.assertEqual(args.ranking_time.strftime("%H:%M"), "15:00")
+        self.assertEqual(parsed.poll_seconds, 1.0)
+
+        preview_args = parser.parse_args(["preview"])
+        preview_config = _validate_args(parser, preview_args)
+        self.assertIsInstance(preview_config, StrategyConfig)
+
+    def test_preopen_exit_clock_allows_queued_orders(self):
+        preopen = FakeClockBroker("2026-08-25T09:00:00-04:00", False)
+        regular = FakeClockBroker("2026-08-25T09:30:00-04:00", True)
+
+        self.assertFalse(_validate_exit_clock(preopen, date(2026, 8, 25)))
+        self.assertTrue(_validate_exit_clock(regular, date(2026, 8, 25)))
+
     def test_daily_artifacts_write_market_data_logs_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -272,6 +329,37 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(calls[0][1], "https://data.alpaca.markets/v1beta1")
         self.assertEqual(calls[0][2], "screener/stocks/most-actives")
         self.assertEqual(calls[0][3]["params"], {"by": "trades", "top": 100})
+        self.assertTrue(calls[0][3]["data_credentials"])
+
+    def test_data_requests_use_separate_credentials_and_completed_timestamp(self):
+        client = AlpacaClient(
+            "trading-key",
+            "trading-secret",
+            data_key="data-key",
+            data_secret="data-secret",
+        )
+        trading_session = client._session()
+        data_session = client._session(data_credentials=True)
+
+        self.assertIsNot(trading_session, data_session)
+        self.assertEqual(trading_session.headers["APCA-API-KEY-ID"], "trading-key")
+        self.assertEqual(data_session.headers["APCA-API-KEY-ID"], "data-key")
+
+        calls = []
+
+        def request(method, base, path, **kwargs):
+            calls.append((method, base, path, kwargs))
+            return {"bars": {}, "next_page_token": None}
+
+        client._request = request
+        completed_end = _completed_session_end(date(2026, 8, 24))
+        client.historical_daily_bars(
+            ["AAPL"], date(2026, 2, 25), completed_end, "sip"
+        )
+
+        self.assertEqual(completed_end.isoformat(), "2026-08-24T23:59:59-04:00")
+        self.assertEqual(calls[0][3]["params"]["end"], completed_end.isoformat())
+        self.assertTrue(calls[0][3]["data_credentials"])
 
     def test_budget_uses_cash_instead_of_margin_buying_power(self):
         budget = available_budget(
@@ -335,6 +423,53 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(set(broker.current_positions), {"HELD"})
         self.assertEqual({order["symbol"] for order in broker.submissions}, {"A", "B"})
         self.assertTrue(all(order["side"] == "sell" for order in broker.submissions))
+
+    def test_preopen_exit_stays_queued_and_is_reconciled_after_open(self):
+        broker = FakeQueuedBroker()
+        broker.current_positions["A"] = {"symbol": "A", "qty": "0.75"}
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.json")
+            state = store.load()
+            state["position"] = {
+                "entry_date": "2026-08-24",
+                "exit_date": "2026-08-25",
+                "status": "open",
+                "symbols": ["A"],
+                "filled_symbols": ["A"],
+                "entry_orders": {},
+                "exit_orders": {},
+            }
+            store.save(state)
+
+            queued = exit_position(
+                broker,
+                store,
+                config(top=1),
+                submit=True,
+                now=datetime(2026, 8, 25, 9, 0, tzinfo=EASTERN),
+                wait_for_fill=False,
+            )
+            queued_order = broker.orders["olq-20260824-x-A"]
+            self.assertEqual(queued["status"], "exit_queued")
+            self.assertEqual(queued_order["status"], "accepted")
+            self.assertIn("A", broker.current_positions)
+            self.assertEqual(broker.submissions[0]["time_in_force"], "day")
+
+            queued_order["status"] = "filled"
+            queued_order["filled_qty"] = "0.75"
+            broker.current_positions.pop("A")
+            closed = exit_position(
+                broker,
+                store,
+                config(top=1),
+                submit=True,
+                now=datetime(2026, 8, 25, 9, 30, tzinfo=EASTERN),
+                wait_for_fill=True,
+            )
+
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["exit_orders"]["A"]["status"], "filled")
+        self.assertEqual(len(broker.submissions), 1)
 
     def test_exit_retries_a_canceled_order_with_a_new_id(self):
         broker = FakeBroker()

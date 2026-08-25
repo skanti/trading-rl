@@ -117,7 +117,7 @@ python -m baseline.overnight_liquidity \
 ## Alpaca paper execution
 
 `live_overnight_liquidity.py` applies the same causal liquidity idea to an
-Alpaca account. By default it starts ranking at 15:15 ET, opens an equal-notional top-10
+Alpaca account. By default it starts ranking at 15:00 ET, opens an equal-notional top-10
 basket at 15:55, and closes that basket at 09:35 on the next trading session.
 The fast candidate screen unions Alpaca's current top 100 SIP symbols by share
 volume, current top 100 by trade count, and the previous day's screened
@@ -147,19 +147,46 @@ file. For the paper endpoint:
 export ALPACA_URL="https://paper-api.alpaca.markets/v2"
 export ALPACA_KEY="..."
 export ALPACA_SECRET="..."
+export ALPACA_DATA_KEY="..."       # optional separate market-data subscription
+export ALPACA_DATA_SECRET="..."
 
 python -m baseline.live_overnight_liquidity run \
   --top 10 \
-  --ranking-time 15:15 \
+  --ranking-time 15:00 \
   --entry-time 15:55 \
   --exit-time 09:35 \
   --capital-fraction 0.90 \
   --submit
 ```
 
+When both data variables are set, SIP screener and historical-bar requests use
+that subscription while account, position, calendar, and order requests keep
+using the trading credentials. If neither data variable is set, market-data
+requests fall back to the trading credentials. Daily-bar requests end at an
+explicit timestamp on the last completed session and never include the
+unfinished ranking day.
+
 `run` is persistent and must stay running across the overnight holding period.
 It requires `--submit`; one-shot `enter` and `exit` are dry runs unless that
 flag is present. Useful one-shot operations are:
+
+Use `preview` to rank immediately and print today's proposed entry basket in
+one command. It uses isolated temporary state, never accepts `--submit`, and
+cannot replace or suppress the live daemon's scheduled ranking:
+
+```bash
+python -m baseline.live_overnight_liquidity preview \
+  --top 10 \
+  --entry-time 15:59 \
+  --exit-time 09:00 \
+  --capital-fraction 0.95
+```
+
+Exit submission times from 09:00 through 09:29 queue fractional `day` market
+orders for the regular-session open. The daemon records `exit_queued` without
+canceling those orders on the normal fill timeout, then reconciles their fills
+at 09:30 and retries only when necessary. Entry submissions still require an
+open regular session.
 
 ```bash
 python -m baseline.live_overnight_liquidity rank
