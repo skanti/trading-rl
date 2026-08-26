@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from typing import Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,15 @@ from week_dataset import forward_fill_positions
 
 REFERENCE_SYMBOL = "ST-SPY"
 EXTENDED_OPEN_MINUTE = 4 * 60
+
+# Reg T governs anything held past the close, so an overnight strategy cannot reach the
+# 4x day-trading buying power Alpaca reports as `multiplier`.
+MAX_OVERNIGHT_LEVERAGE = 2.0
+# Base Reg T maintenance is 25%; brokers raise it on concentrated, volatile books, and
+# Alpaca's own requirement on this basket sits near 32%. Used only for reporting.
+MAINTENANCE_MARGIN = 0.30
+# Alpaca accrues margin interest on a 360-day year, per calendar day.
+MARGIN_INTEREST_DIVISOR = 360.0
 DEFAULT_DAYS_PATH = "/data/ppv1/updates/full_2026-08-22_10d.csv"
 DEFAULT_DATA_DIR = "/data/ppv1/updates/full_2026-08-22"
 DEFAULT_SECURITY_MASTER_CACHE = "/tmp/trading/baseline_cache/nasdaq_security_master.json"
@@ -57,6 +67,42 @@ def _security_symbol(sample_id: str) -> str:
     if symbol.startswith("ST-"):
         symbol = symbol[3:]
     return symbol.replace("-", ".").upper()
+
+
+# "Alphabet Inc. - Class C Capital Stock" and "Alphabet Inc. - Class A Common Stock"
+# are one company listed twice. Ranking treats them as separate names, so a basket can
+# end up holding the same issuer at double weight while reporting the nominal size.
+_SHARE_CLASS_SUFFIX = re.compile(r"\s*[-\u2013]\s*Class\s+.*$", re.IGNORECASE)
+# The leading ``\s+`` matters: without it a company whose name begins with a descriptor
+# word ("American Airlines Group Inc. - Common Stock") would be erased to nothing.
+_SECURITY_TYPE_SUFFIX = re.compile(
+    r"\s*[-\u2013]?\s+(?:Common|Capital|Ordinary|Preferred)\s+(?:Stock|Shares)\b.*$",
+    re.IGNORECASE,
+)
+
+
+def issuer_key(symbol: str, security_master: Mapping[str, Mapping[str, object]] | None) -> str:
+    """Collapse every listed share class of one company onto a single key.
+
+    Falls back to the symbol itself when the security master has no name, so an unknown
+    ticker is never silently merged with an unrelated one.
+    """
+    if not security_master:
+        return symbol
+    record = security_master.get(_security_symbol(symbol))
+    name = str(record.get("name", "")) if record else ""
+    if not name:
+        return symbol
+    trimmed = _SECURITY_TYPE_SUFFIX.sub("", _SHARE_CLASS_SUFFIX.sub("", name))
+    trimmed = trimmed.strip().rstrip(" -\u2013,")
+    return trimmed.casefold() or symbol
+
+
+def build_issuer_map(
+    symbols: Iterable[str], security_master: Mapping[str, Mapping[str, object]] | None
+) -> dict[str, str]:
+    """Map each sample id to its issuer key."""
+    return {str(symbol): issuer_key(str(symbol), security_master) for symbol in symbols}
 
 
 def is_company_security(record: dict[str, object]) -> tuple[bool, str]:
@@ -220,8 +266,14 @@ def top_liquid_indices(
     top: int,
     symbols: np.ndarray,
     exclude_top: int = 0,
+    issuers: Mapping[str, str] | None = None,
 ) -> np.ndarray:
-    """Select the highest causal scores with a price available at entry."""
+    """Select the highest causal scores with a price available at entry.
+
+    When ``issuers`` is supplied, only the best-ranked share class of any company is
+    kept and the basket is backfilled from further down the ranking, so ``top`` counts
+    distinct companies rather than distinct tickers.
+    """
     score = np.asarray(scores, dtype=np.float64)
     prices = np.asarray(entry_prices, dtype=np.float64)
     names = np.asarray(symbols)
@@ -234,12 +286,34 @@ def top_liquid_indices(
     eligible = np.flatnonzero(np.isfinite(score) & np.isfinite(prices) & (prices > 0.0))
     if eligible.size < int(top):
         raise ValueError(f"only {eligible.size} causally eligible symbols are available for top={top}")
-    if eligible.size > int(top):
-        local = np.argpartition(score[eligible], -int(top))[-int(top) :]
-        eligible = eligible[local]
-    # A lexical secondary key makes exact score ties reproducible.
+    if issuers is None:
+        if eligible.size > int(top):
+            local = np.argpartition(score[eligible], -int(top))[-int(top) :]
+            eligible = eligible[local]
+        # A lexical secondary key makes exact score ties reproducible.
+        order = np.lexsort((names[eligible], -score[eligible]))
+        return eligible[order][int(exclude_top) :]
+
+    # Deduplicating needs the whole ranking, not a top-N partition: a skipped duplicate
+    # is replaced from below, so the cut cannot be taken before the walk.
     order = np.lexsort((names[eligible], -score[eligible]))
-    return eligible[order][int(exclude_top) :]
+    ranked = eligible[order]
+    chosen: list[int] = []
+    seen: set[str] = set()
+    for index in ranked:
+        name = str(names[index])
+        key = issuers.get(name, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen.append(int(index))
+        if len(chosen) == int(top):
+            break
+    if len(chosen) < int(top):
+        raise ValueError(
+            f"only {len(chosen)} distinct issuers are causally eligible for top={top}"
+        )
+    return np.asarray(chosen, dtype=np.int64)[int(exclude_top) :]
 
 
 def activity_union_candidate_mask(
@@ -269,6 +343,35 @@ def activity_union_candidate_mask(
 
 def _parse_clock(value: str) -> int:
     return parse_anchor_time(value)
+
+
+def _parse_percentage(value: str) -> float:
+    """Parse an interest rate written as a percentage into a fraction.
+
+    Accepts "5.25%" or a bare "5.25", both meaning 5.25% -> 0.0525.
+
+    A bare value below half a percent is rejected rather than accepted. Margin rates
+    are never that low, so such a value is almost certainly the old fractional form
+    (0.0525), and silently reading it as 0.0525% would understate the borrow cost a
+    hundredfold without any visible sign.
+    """
+    text = value.strip().rstrip("%").strip()
+    try:
+        percent = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a percentage; write it like 5.25% or 5.25"
+        ) from None
+    if percent < 0.0:
+        raise argparse.ArgumentTypeError("the rate must be non-negative")
+    if 0.0 < percent < 0.5:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} looks like a fraction, not a percentage. This flag takes "
+            f"percent, so write {percent * 100.0:g}% if you meant that rate"
+        )
+    if percent > 100.0:
+        raise argparse.ArgumentTypeError(f"{value!r} exceeds 100%")
+    return percent / 100.0
 
 
 def _calendar(days: pd.DataFrame) -> pd.DataFrame:
@@ -782,6 +885,44 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
             f"minimum {summary['minimum_daily_activity_union_size']}, "
             f"maximum {summary['maximum_daily_activity_union_size']}; no carry-forward",
         )
+    if float(summary.get("leverage", 1.0)) > 1.0:
+        unlevered = summary["unlevered_metrics"]
+        details.add_row(
+            "Leverage",
+            f"{summary['leverage']:.2f}x at {summary['margin_interest_rate']:.2%} annual "
+            f"(rate/360 per calendar day, mean hold "
+            f"{summary['mean_holding_calendar_days']:.2f}d); "
+            f"borrow drag {summary['annual_borrow_drag']:.2%}/yr",
+        )
+        details.add_row(
+            "Unlevered comparison",
+            f"return {unlevered['annualized_return']:.2%}, "
+            f"Sharpe {unlevered['sharpe_zero_cash_rate']:.2f}, "
+            f"max drawdown {unlevered['max_drawdown']:.2%}",
+        )
+        details.add_row(
+            "Margin headroom",
+            f"worst session leaves {summary['worst_session_margin_ratio']:.0%} equity "
+            f"against a {summary['maintenance_margin']:.0%} floor; "
+            f"that session breaches at {summary['margin_breach_leverage']:.2f}x",
+        )
+    # Tolerate summaries built before these keys existed rather than raising in display.
+    duplicate_days = int(summary.get("sessions_with_two_classes_of_one_issuer", 0))
+    unnamed = int(summary.get("symbols_without_an_issuer_name", 0))
+    if "deduped_share_classes" not in summary:
+        detail = None
+    elif summary["deduped_share_classes"]:
+        detail = "one share class per company"
+        if duplicate_days:
+            detail = f"FAILED: {duplicate_days} session(s) still hold two classes of one issuer"
+        if unnamed:
+            detail += f"; {unnamed} traded symbol(s) had no name in the security master"
+    else:
+        detail = "disabled"
+        if duplicate_days:
+            detail += f"; {duplicate_days} session(s) hold two classes of one issuer"
+    if detail is not None:
+        details.add_row("Share classes", detail)
     details.add_row("Unique symbols", f"{summary['unique_symbols_traded']:,}")
     details.add_row(
         "Daily membership changes",
@@ -948,6 +1089,11 @@ def run_backtest(
     ranking_minute: int = 15 * 60 + 15,
     entry_minute: int = 15 * 60 + 55,
     exit_minute: int = 9 * 60 + 45,
+    issuers: Mapping[str, str] | None = None,
+    dedupe_share_classes: bool = True,
+    leverage: float = 1.0,
+    margin_interest_rate: float = 0.0,
+    maintenance_margin: float = MAINTENANCE_MARGIN,
     reference_symbol: str = REFERENCE_SYMBOL,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if transaction_cost_bps < 0.0:
@@ -1012,6 +1158,7 @@ def run_backtest(
             top,
             stock_symbols,
             exclude_top,
+            issuers=issuers if dedupe_share_classes else None,
         )
         selected = stock_indices[selected_local]
         exits = morning_prices[date_index + 1, selected]
@@ -1060,7 +1207,30 @@ def run_backtest(
         spy_exit_prices.append(float(spy_exit))
 
     trades = pd.concat(pieces, ignore_index=True)
-    daily = trades.groupby("entry_date", sort=True).net_return.mean()
+    unlevered_daily = trades.groupby("entry_date", sort=True).net_return.mean()
+
+    # Leverage is not a free scalar. Scaling returns alone leaves the Sharpe ratio
+    # unchanged, so it would say nothing. What makes it a real trade-off is the borrow
+    # cost and the compounding of a deeper drawdown. Per-trade returns in `trades` stay
+    # unlevered; only the portfolio series is levered.
+    #
+    # Alpaca accrues margin interest on the overnight debit balance as
+    # rate / 360 per CALENDAR day, so a Friday entry held to Monday is charged three
+    # days, not one. Deriving the accrual from each trade's actual entry-to-exit span
+    # captures weekends and holidays instead of assuming a flat trading-day divisor.
+    exit_by_entry = trades.groupby("entry_date", sort=True).exit_date.first()
+    holding_days = pd.Series(
+        (pd.to_datetime(exit_by_entry.values) - pd.to_datetime(exit_by_entry.index)).days,
+        index=exit_by_entry.index,
+        dtype=np.float64,
+    ).clip(lower=1.0)
+    borrow_per_session = (
+        max(0.0, leverage - 1.0)
+        * float(margin_interest_rate)
+        * holding_days
+        / MARGIN_INTEREST_DIVISOR
+    )
+    daily = float(leverage) * unlevered_daily - borrow_per_session
     spy_daily = pd.Series(spy_returns, index=daily.index, dtype=np.float64)
     difference = daily - spy_daily
     spy_buy_hold_equity = np.asarray(spy_exit_prices, dtype=np.float64) / float(
@@ -1086,6 +1256,29 @@ def run_backtest(
         len(current & previous) / len(current | previous)
         for previous, current in zip(memberships, memberships[1:])
     ]
+    # A levered book is force-liquidated when equity / position value falls through the
+    # maintenance requirement. Report the worst session against that floor rather than
+    # silently producing an equity curve the broker would never have let you hold.
+    worst_session = float(unlevered_daily.min())
+    if leverage > 1.0 and worst_session < 0.0:
+        drop = abs(worst_session)
+        margin_ratio = (1.0 - leverage * drop) / (leverage * (1.0 - drop))
+        breach_leverage = 1.0 / (float(maintenance_margin) * (1.0 - drop) + drop)
+    else:
+        margin_ratio = 1.0
+        breach_leverage = float("inf")
+
+    # The dedupe rule reads company names out of the security master, so it can fail
+    # quietly if a name format changes or a symbol is missing. Report both, rather than
+    # trusting that it worked: a silent no-op is the failure mode that matters.
+    traded_symbols = sorted(trades.sample_id.unique())
+    resolved = {symbol: (issuers or {}).get(symbol, symbol) for symbol in traded_symbols}
+    unresolved = [symbol for symbol, key in resolved.items() if key == symbol]
+    same_issuer_days = 0
+    for _, group in trades.groupby("entry_date", sort=False):
+        keys = [resolved[symbol] for symbol in group.sample_id]
+        same_issuer_days += len(keys) != len(set(keys))
+
     liquidity_descriptions = {
         "dollar_ema": "completed regular-session dollar volume",
         "activity_union_ema": "activity-screened completed-session dollar volume",
@@ -1110,6 +1303,17 @@ def run_backtest(
         "minimum_completed_trading_days": int(minimum_trading_days),
         "activity_candidates_per_metric": int(activity_candidates_per_metric),
         "transaction_cost_bps_per_side": float(transaction_cost_bps),
+        "deduped_share_classes": bool(dedupe_share_classes and issuers is not None),
+        "sessions_with_two_classes_of_one_issuer": int(same_issuer_days),
+        "symbols_without_an_issuer_name": len(unresolved),
+        "leverage": float(leverage),
+        "margin_interest_rate": float(margin_interest_rate),
+        "annual_borrow_drag": float(borrow_per_session.sum()) / (len(unlevered_daily) / 252.0),
+        "mean_holding_calendar_days": float(holding_days.mean()),
+        "maintenance_margin": float(maintenance_margin),
+        "worst_session_margin_ratio": float(margin_ratio),
+        "margin_breach_leverage": float(breach_leverage),
+        "unlevered_metrics": strategy_metrics(unlevered_daily),
         "max_entry_staleness_minutes": int(max_entry_staleness_minutes),
         "max_exit_staleness_minutes": int(max_exit_staleness_minutes),
         "stale_exit_marks_over_10_minutes": int(trades.exit_staleness_minutes.gt(10.0).sum()),
@@ -1232,9 +1436,45 @@ def main() -> None:
     parser.add_argument("--refresh-security-master", action="store_true")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument(
+        "--no-dedupe-share-classes",
+        dest="dedupe_share_classes",
+        action="store_false",
+        help="allow two share classes of the same company in one basket (e.g. GOOG and GOOGL)",
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=1.0,
+        help="gross exposure as a multiple of equity; overnight holds are capped at 2.0 by Reg T",
+    )
+    parser.add_argument(
+        "--margin-interest-rate",
+        type=_parse_percentage,
+        default=None,
+        metavar="PERCENT",
+        help="annual interest charged on the borrowed portion, as a percentage: Alpaca "
+        "charges 6.75%% non-elite / 5.25%% elite, accrued as rate/360 per calendar day. "
+        "Required above 1x",
+    )
     parser.add_argument("--output-csv", default=None)
     parser.add_argument("--summary-json", default=None)
     args = parser.parse_args()
+
+    if args.leverage < 1.0:
+        parser.error("--leverage must be at least 1.0")
+    if args.leverage > MAX_OVERNIGHT_LEVERAGE:
+        # Alpaca's 4x multiplier is day-trading buying power. This strategy holds
+        # overnight by construction, so Reg T's 2x requirement governs and there is no
+        # legitimate run above it -- an override would only produce an untradeable curve.
+        parser.error(
+            f"--leverage cannot exceed {MAX_OVERNIGHT_LEVERAGE:.1f} for an overnight hold; "
+            "Alpaca's 4x multiplier is day-trading buying power and does not survive the close"
+        )
+    if args.leverage > 1.0 and args.margin_interest_rate is None:
+        # Without a borrow rate the result is a pure scalar multiple and the Sharpe
+        # ratio is unchanged, which would be misleading rather than merely incomplete.
+        parser.error("--margin-interest-rate is required when --leverage exceeds 1.0")
 
     if (
         args.months < 1
@@ -1406,6 +1646,10 @@ def main() -> None:
             min_history_days=args.min_history_days,
             minimum_trading_days=args.minimum_trading_days,
             transaction_cost_bps=args.transaction_cost_bps,
+            issuers=build_issuer_map(symbols, security_master),
+            dedupe_share_classes=args.dedupe_share_classes,
+            leverage=args.leverage,
+            margin_interest_rate=args.margin_interest_rate or 0.0,
             max_entry_staleness_minutes=args.max_entry_staleness_minutes,
             max_exit_staleness_minutes=args.max_exit_staleness_minutes,
             liquidity_scheme=scheme,

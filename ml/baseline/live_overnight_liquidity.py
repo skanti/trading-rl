@@ -35,6 +35,7 @@ from rich.table import Table
 from baseline import performance
 from baseline.overnight_liquidity import (
     DEFAULT_SECURITY_MASTER_CACHE,
+    issuer_key,
     _security_symbol,
     causal_ema_log_liquidity,
     is_company_security,
@@ -842,8 +843,17 @@ def rank_for_day(
             "alpaca_eligible_asset_count": len(alpaca_eligible),
             "eligible_asset_count": len(symbols),
             "ranked_asset_count": len(ranking),
+            # The issuer is resolved here, while the security master is already loaded,
+            # and persisted with the ranking so the entry decision stays auditable and
+            # survives a restart without a second lookup.
             "candidates": [
-                {"rank": index + 1, "symbol": symbol, "score": score, "observations": observations}
+                {
+                    "rank": index + 1,
+                    "symbol": symbol,
+                    "score": score,
+                    "observations": observations,
+                    "issuer": issuer_key(symbol, security_master),
+                }
                 for index, (symbol, score, observations) in enumerate(ranking[:reserve_count])
             ],
         }
@@ -959,19 +969,47 @@ def _wait_for_orders(
 
 
 def _select_unconflicted_candidates(
-    ranking: Mapping[str, object], held_symbols: set[str], open_order_symbols: set[str], top: int
+    ranking: Mapping[str, object],
+    held_symbols: set[str],
+    open_order_symbols: set[str],
+    top: int,
+    dedupe_share_classes: bool = True,
 ) -> list[str]:
-    selected = []
+    """Take the top ranked candidates, skipping conflicts and duplicate share classes.
+
+    Alphabet lists as both GOOGL and GOOG, and the liquidity ranking scores them
+    separately, so a basket can hold one company at double weight while reporting the
+    nominal size. Candidates are walked in rank order, so the first class encountered is
+    the more liquid one and the basket backfills from further down the reserve.
+
+    A ranking written before issuers were recorded has no ``issuer`` field; such a
+    candidate falls back to its own symbol, which disables deduping rather than failing.
+    """
+    selected: list[str] = []
+    seen_issuers: set[str] = set()
+    skipped_duplicates: list[str] = []
     for candidate in ranking["candidates"]:
         symbol = str(candidate["symbol"])
         if symbol in held_symbols or symbol in open_order_symbols:
             continue
+        if dedupe_share_classes:
+            issuer = str(candidate.get("issuer") or symbol)
+            if issuer in seen_issuers:
+                skipped_duplicates.append(symbol)
+                continue
+            seen_issuers.add(issuer)
         selected.append(symbol)
         if len(selected) == top:
             break
     if len(selected) != top:
         raise RuntimeError(
             f"only {len(selected)} ranked candidates remain after excluding existing positions/orders"
+        )
+    if skipped_duplicates:
+        LOGGER.info(
+            "skipped %d duplicate share class(es) so the basket holds distinct issuers: %s",
+            len(skipped_duplicates),
+            ", ".join(skipped_duplicates),
         )
     return selected
 

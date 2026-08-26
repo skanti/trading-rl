@@ -17,6 +17,7 @@ from baseline.live_overnight_liquidity import (
     StateStore,
     StrategyConfig,
     _completed_session_end,
+    _select_unconflicted_candidates,
     _validate_args,
     _validate_exit_clock,
     available_budget,
@@ -537,3 +538,64 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _ranking(*pairs):
+    """Build a ranking payload from (symbol, issuer) pairs in rank order."""
+    return {
+        "candidates": [
+            {"rank": index + 1, "symbol": symbol, "issuer": issuer, "score": 100.0 - index}
+            for index, (symbol, issuer) in enumerate(pairs)
+        ]
+    }
+
+
+class ShareClassDedupeTest(unittest.TestCase):
+    """One company must not occupy two slots in the basket."""
+
+    def test_the_better_ranked_share_class_wins_and_the_basket_backfills(self):
+        ranking = _ranking(
+            ("GOOGL", "alphabet inc."),
+            ("NVDA", "nvidia corporation"),
+            ("GOOG", "alphabet inc."),
+            ("AAPL", "apple inc."),
+        )
+        selected = _select_unconflicted_candidates(ranking, set(), set(), 3)
+        self.assertEqual(selected, ["GOOGL", "NVDA", "AAPL"])
+
+    def test_the_surviving_class_is_whichever_ranks_higher_not_a_fixed_ticker(self):
+        # If GOOG ever out-ranks GOOGL, GOOG is the one that should be held.
+        ranking = _ranking(
+            ("GOOG", "alphabet inc."),
+            ("GOOGL", "alphabet inc."),
+            ("NVDA", "nvidia corporation"),
+        )
+        self.assertEqual(_select_unconflicted_candidates(ranking, set(), set(), 2), ["GOOG", "NVDA"])
+
+    def test_deduping_can_be_switched_off(self):
+        ranking = _ranking(("GOOGL", "alphabet inc."), ("GOOG", "alphabet inc."))
+        selected = _select_unconflicted_candidates(
+            ranking, set(), set(), 2, dedupe_share_classes=False
+        )
+        self.assertEqual(selected, ["GOOGL", "GOOG"])
+
+    def test_a_ranking_without_issuers_still_selects(self):
+        # State written before issuers were recorded must not break entry.
+        legacy = {"candidates": [{"rank": 1, "symbol": "GOOGL"}, {"rank": 2, "symbol": "GOOG"}]}
+        self.assertEqual(_select_unconflicted_candidates(legacy, set(), set(), 2), ["GOOGL", "GOOG"])
+
+    def test_conflicts_and_duplicates_are_skipped_together(self):
+        ranking = _ranking(
+            ("GOOGL", "alphabet inc."),
+            ("GOOG", "alphabet inc."),
+            ("NVDA", "nvidia corporation"),
+            ("AAPL", "apple inc."),
+        )
+        selected = _select_unconflicted_candidates(ranking, {"GOOGL"}, set(), 2)
+        # GOOGL is held, so GOOG becomes the best available Alphabet class.
+        self.assertEqual(selected, ["GOOG", "NVDA"])
+
+    def test_too_few_distinct_issuers_raises(self):
+        ranking = _ranking(("GOOGL", "alphabet inc."), ("GOOG", "alphabet inc."))
+        with self.assertRaises(RuntimeError):
+            _select_unconflicted_candidates(ranking, set(), set(), 2)
