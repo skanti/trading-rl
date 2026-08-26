@@ -6,22 +6,16 @@ positions, and a session-by-session trade log — behind a login.
 
 ## How the data gets here
 
-The browser never holds an Alpaca credential. The trading daemon does the fetching and
-the writing, so there is no second process to supervise.
-
-**Firestore publishing is currently off.** The daemon emails the digest and nothing
-else; add `--dashboard` to start publishing.
+The browser never holds an Alpaca credential. A small daemon in this directory reads
+Alpaca plus the trading process's JSON artifacts and publishes them to Firestore. The
+trading process has no Firebase imports, flags, callbacks, or failure modes.
 
 ```
-Alpaca paper API
-      │
-      ▼
-ml/baseline/live_overnight_liquidity.py  (run --submit)
-      │
-      ├──smtplib────────▶ digest email, after the morning exit          [on]
-      │
-      └──firebase-admin──▶ Firestore ──authed read──▶ this app          [--dashboard]
-             on every rank / entry / exit, plus a 5-minute throttle
+Alpaca paper API ───────────────┐
+                               ▼
+trading state.json ──read──▶ scripts/dashboard_daemon.py
+                               │
+                               └──▶ Firestore ──authed read──▶ Nuxt app
 ```
 
 `accounts/paper` holds the snapshot; `accounts/paper/sessions/{YYYY-MM-DD}` holds one
@@ -30,23 +24,25 @@ writes at all — the publisher writes through the Admin SDK, which bypasses rul
 
 ## Configuration
 
-[`config.yaml`](./config.yaml) holds the Firebase project and web config, the dashboard
-login and SMTP settings. It is read by `ml/baseline/*` and by `nuxt.config.ts`.
+[`config.yaml`](./config.yaml) holds the Firebase project and web config plus the
+dashboard login. Only code under `dashboard/` reads it.
 
-**Alpaca credentials are not in it.** The publisher, the digest and the trading daemon
-all read `ALPACA_KEY` / `ALPACA_SECRET` from the environment, as they always have:
+**Alpaca credentials are not in it.** Export `ALPACA_KEY` / `ALPACA_SECRET` before
+starting the dashboard daemon:
 
 ```bash
-cd ../ml && set -a && source .env && set +a
+set -a && source ../ml/.env && set +a
 ```
 
-Only browser-safe values reach the bundle — never the SMTP or dashboard password.
-`deploy.sh` greps the generated output for them and refuses to deploy if one appears.
+Only browser-safe values reach the bundle. `deploy.sh` checks that configured secrets
+did not enter the generated static files.
 
 ## Local development
 
 ```bash
 pnpm install
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 pnpm dev        # http://localhost:5001
 ```
 
@@ -57,6 +53,7 @@ treats you as signed in, so a fresh checkout is usable immediately.
 pnpm test       # vitest
 pnpm typecheck  # vue-tsc
 pnpm lint       # eslint
+.venv/bin/python -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 ## First-time Firebase setup
@@ -68,11 +65,11 @@ The project id is already set to `trading-dashboard-ccdd5` in `.firebaserc` and
 2. Firebase console → **Firestore Database** → create in Native mode.
 3. Firebase console → **Authentication → Sign-in method** → enable **Email/Password**.
 4. Firebase console → **Project settings → Service accounts → Generate new private key**,
-   saved to the path in `config.yaml` (`~/.config/trading-dashboard/service-account.json`).
-   You can also paste the key JSON inline under `firebase.service_account` instead.
+   saved to the ignored path in `config.yaml`
+   (`dashboard/.secrets/service-account.json`). Never commit this file.
 5. Create the login user from `config.yaml`:
    ```bash
-   ../ml/.venv/bin/python scripts/provision_auth_user.py
+   .venv/bin/python scripts/provision_auth_user.py
    ```
 
 ## Deploying
@@ -83,44 +80,28 @@ The project id is already set to `trading-dashboard-ccdd5` in `.firebaserc` and
 ./deploy.sh --hosting-only   # leave firestore.rules alone
 ```
 
-After the first deploy, update `dashboard.url` in `config.yaml` so the digest email links
-to the real site.
+After the first deploy, update `dashboard.url` in `config.yaml` to the real site.
 
 ## Publishing snapshots
 
-**No extra process is required.** When enabled, the trading daemon publishes to
-Firestore itself: immediately after every rank, entry and exit, and every 5 minutes in
-between.
+The dashboard daemon is intentionally separate from trading. Run it under the same
+process supervisor as the trading daemon; it publishes immediately, then every five
+minutes by default.
 
 ```bash
-cd ../ml && set -a && source .env && set +a
+set -a && source ../ml/.env && set +a
 
-# Current setup: digest email only, no Firestore writes.
-.venv/bin/python -m baseline.live_overnight_liquidity run --submit
-
-# Once the dashboard is live:
-.venv/bin/python -m baseline.live_overnight_liquidity run --submit --dashboard
+.venv/bin/python scripts/dashboard_daemon.py --dry-run  # print one payload
+.venv/bin/python scripts/dashboard_daemon.py --once     # publish once
+.venv/bin/python scripts/dashboard_daemon.py            # keep publishing
 ```
 
-| Flag | Effect |
-| --- | --- |
-| *(none)* | **Default** — digest email only; the publisher is never loaded |
-| `--dashboard` | Publish snapshots to Firestore |
-| `--publish-interval-seconds 300` | Cadence between strategy actions (default, needs `--dashboard`) |
-| `--publish-interval-seconds 0` | Publish **only** on rank/entry/exit |
-| `--no-email` | Do not send the exit digest |
+Always use `dashboard/.venv` for this process. The ML environment intentionally has a
+separate dependency set and is not supported for the Firebase daemon.
 
-Publishing and emailing are both wrapped end to end: a Firestore or SMTP failure is
-logged and swallowed, never propagated into an entry or an exit.
-
-`dashboard_publisher` also runs standalone, for a manual backfill or to check the
-payload without waiting for the daemon:
-
-```bash
-.venv/bin/python -m baseline.dashboard_publisher --dry-run   # print, write nothing
-.venv/bin/python -m baseline.dashboard_publisher             # one snapshot
-.venv/bin/python -m baseline.dashboard_publisher --watch --interval-seconds 300
-```
+Use `--interval-seconds 60` to change the cadence, `--work-dir` when strategy artifacts
+are somewhere other than `/data/ppv1/live`, and `--state-path` to select a separate
+state file. A failed publish is logged and retried on the next interval.
 
 It refuses any endpoint other than `paper-api.alpaca.markets` unless started with
 `--allow-live-endpoint`, so an unlucky `ALPACA_URL` cannot point it at real money.
@@ -135,4 +116,7 @@ It refuses any endpoint other than `paper-api.alpaca.markets` unless started wit
 | `app/repositories/` | Firestore adapter and the offline demo adapter |
 | `app/types/dashboard.ts` | Snapshot shapes; mirror of the publisher's output |
 | `app/utils/` | Formatting and chart geometry (both unit tested) |
+| `scripts/dashboard_daemon.py` | Independent Alpaca-to-Firestore polling daemon |
+| `scripts/dashboard_metrics.py` | Pure snapshot performance calculations |
+| `scripts/dashboard_config.py` | Dashboard-only configuration loader |
 | `firestore.rules` | Authenticated read, no browser writes |

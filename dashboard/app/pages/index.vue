@@ -45,7 +45,7 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
       variant="subtle"
       icon="i-lucide-database"
       title="Nothing published yet"
-      description="Run `python -m baseline.dashboard_publisher` to publish the first account snapshot."
+      description="Run `python scripts/dashboard_daemon.py --once` to publish the first account snapshot."
     />
 
     <template v-else>

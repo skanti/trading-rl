@@ -2,9 +2,9 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
 
-// config.yaml is the single source of truth for the whole project -- the Python
-// publisher, the digest email and this app all read it, so there is no .env to keep
-// in sync. Only the values the browser genuinely needs are copied into runtimeConfig;
+// config.yaml is the dashboard's single source of truth. The standalone Python daemon,
+// auth provisioning script and this app read it. Only the values the browser genuinely
+// needs are copied into runtimeConfig;
 // the dashboard password is deliberately not among them, since Firebase Auth is what
 // actually checks it.
 const config = parse(

@@ -5,24 +5,20 @@ address. The two are bridged by ``auth.email_domain``, so the credentials in the
 file and the credentials Firebase will accept can never drift -- rerun this after
 changing either the username or the password.
 
-    ../ml/.venv/bin/python scripts/provision_auth_user.py
+    .venv/bin/python scripts/provision_auth_user.py
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Sequence
 
-# The config contract lives with the other Python readers of config.yaml, so this script
-# borrows it rather than growing a second copy that could drift from them.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ml"))
+from omegaconf import OmegaConf
 
-from omegaconf import OmegaConf  # noqa: E402
-
-from baseline.dashboard_config import (  # noqa: E402
+from dashboard_config import (
     auth_email,
     load_dashboard_config,
     service_account,

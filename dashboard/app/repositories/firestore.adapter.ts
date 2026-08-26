@@ -17,7 +17,7 @@ export interface FirestoreLocation {
 }
 
 /**
- * Reads what `baseline.dashboard_publisher` writes. Nothing here writes: the rules in
+ * Reads what `scripts/dashboard_daemon.py` writes. Nothing here writes: the rules in
  * firestore.rules reject browser writes outright.
  */
 export function createFirestoreRepository(

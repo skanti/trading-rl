@@ -1,6 +1,5 @@
-# Dashboard, Firebase and notification settings.
-# Read by ml/baseline/* (publisher, digest, auth provisioning) and by nuxt.config.ts.
-# Alpaca credentials are NOT here -- they come from the environment (see ml/.env).
+# Dashboard and Firebase settings, read only by this directory.
+# Alpaca credentials come from the dashboard daemon's environment.
 
 dashboard:
   url: "https://trading-dashboard-ccdd5.web.app"
@@ -28,7 +27,7 @@ firebase:
     appId: "1:774035311073:web:b7763e4da9ad0d4b22aaa0"
   # Admin SDK key. Either a path to the downloaded JSON, or paste the JSON contents
   # inline as a mapping here. Firebase console -> Project settings -> Service accounts.
-  service_account: "~/.config/trading-dashboard/service-account.json"
+  service_account: "/home/aavetisyan/dev/trading-rl/dashboard/.secrets/service-account.json"
 
 smtp:
   host: "smtp.gmail.com"

@@ -7,20 +7,16 @@
 - Database: Firebase Firestore, read-only from the browser.
 
 ## Data flow
-- The browser never talks to Alpaca. The trading daemon (`live_overnight_liquidity run`) calls
-  `dashboard_publisher.build_snapshot`/`publish` on every strategy action and on a throttle,
-  writing one snapshot document plus a `sessions` subcollection; this app only reads.
-- Publishing is **opt-in** (`--dashboard`) and currently off; the daemon emails the digest only.
-  Run the app against the demo adapter, or publish once by hand with
-  `python -m baseline.dashboard_publisher`, while it stays off.
-- Both outbound side effects (Firestore publish, digest email) are wrapped in bare `except` on
-  the daemon side. Trading correctness outranks telemetry — never let either raise.
-- `dashboard/config.yaml` holds Firebase, SMTP and dashboard-login settings. `nuxt.config.ts`
-  parses it at build time and copies only browser-safe values into `runtimeConfig.public`; the
-  SMTP and dashboard passwords are never bundled (`deploy.sh` fails the build if they appear).
+- The browser never talks to Alpaca. `scripts/dashboard_daemon.py` is a standalone polling
+  process that reads Alpaca and the trading daemon's JSON artifacts, then writes one snapshot
+  document plus a `sessions` subcollection. Nothing in `ml/baseline` imports dashboard code.
+- The dashboard daemon retries its own failures. Trading must never supervise, import, or call it.
+- `dashboard/config.yaml` holds Firebase and dashboard-login settings. `nuxt.config.ts` parses it
+  at build time and copies only browser-safe values into `runtimeConfig.public`; configured
+  secrets are never bundled (`deploy.sh` fails the build if they appear).
 - Alpaca credentials live in the environment (`ml/.env`), never in `config.yaml`.
 - Snapshot field shapes live in `app/types/dashboard.ts` and must track `build_snapshot`
-  in `ml/baseline/dashboard_publisher.py`, which is their only writer.
+  in `scripts/dashboard_daemon.py`, which is their only writer.
 
 ## Design
 - Rely on Nuxt-UI components for standard UI elements before writing custom Tailwind classes.
@@ -34,4 +30,5 @@
 ## Testing Strategy
 - **Vitest** over pure logic and adapters (`test/`), matching the reference project. Firestore is
   faked with `vi.mock('firebase/firestore', ...)` — no emulator.
+- Python daemon logic is covered by `python -m unittest discover -s scripts -p 'test_*.py'`.
 - `./deploy.sh` gates every deploy on `pnpm test && pnpm typecheck && pnpm lint`.

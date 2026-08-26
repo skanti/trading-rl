@@ -1,8 +1,7 @@
-"""Account performance arithmetic shared by the dashboard publisher and the digest email.
+"""Pure account-performance arithmetic for the dashboard snapshot.
 
 Every function here is pure: callers pass already-fetched Alpaca payloads and get
-plain dataclasses back. That keeps the numbers that reach a chart identical to the
-numbers that reach an inbox, and lets the whole module be unit tested without a network.
+plain dataclasses back, keeping the daemon's network and persistence code small.
 
 One subtlety drives the parsing code. Alpaca returns ``timeframe=1D`` portfolio history
 points stamped at UTC midnight of the day *after* the session, so a naive UTC read is
@@ -356,8 +355,7 @@ def statistics(series: Sequence[EquityPoint]) -> Statistics:
 def filled_notional(orders: Mapping[str, Mapping[str, Any]]) -> float:
     """Sum ``filled_qty * filled_avg_price`` across a map of order summaries.
 
-    Shared with ``DailyArtifacts.write_summary`` so the realized profit written to
-    ``summary.json`` and the number emailed out can never disagree.
+    This is kept pure so snapshot and session calculations remain deterministic.
     """
     total = 0.0
     for order in orders.values():

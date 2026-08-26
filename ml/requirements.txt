@@ -8,5 +8,3 @@ requests
 omegaconf
 fsspec
 pillow
-firebase-admin
-PyYAML

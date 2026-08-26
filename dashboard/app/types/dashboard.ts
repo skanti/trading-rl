@@ -1,6 +1,6 @@
 /**
- * Shapes written by `baseline.dashboard_publisher`. Keep these in step with
- * `build_snapshot` in ml/baseline/dashboard_publisher.py -- that function is the only
+ * Shapes written by `scripts/dashboard_daemon.py`. Keep these in step with its
+ * `build_snapshot` function -- that daemon is the only
  * writer, so it defines the contract.
  */
 

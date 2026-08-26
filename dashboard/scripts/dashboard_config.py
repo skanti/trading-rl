@@ -1,14 +1,12 @@
-"""Loader for ``dashboard/config.yaml``, the project's single source of truth.
+"""Load the dashboard's local YAML configuration.
 
-It holds the settings that do not belong on a command line: the Firebase project and
-service account, SMTP credentials, the dashboard login and URL.
+It holds the Firebase project, service account, dashboard login and public URL.
 
-Alpaca credentials are deliberately not here. The trading daemon, the publisher and the
-digest all read ``ALPACA_KEY``/``ALPACA_SECRET`` from the environment, as they always
-have -- see ``ml/.env``.
+Alpaca credentials are deliberately not here. The dashboard daemon reads
+``ALPACA_KEY``/``ALPACA_SECRET`` from its environment.
 
-It is loaded with OmegaConf, matching the house style used by ``ml/evaluate.py`` and
-``ml/pair_train.py``.
+This module lives with the dashboard so Firebase credentials and configuration never
+become a dependency of the trading package.
 """
 
 from __future__ import annotations
@@ -19,19 +17,14 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-# ml/baseline/dashboard_config.py -> ml/baseline -> ml -> repository root
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG_PATH = REPO_ROOT / "dashboard" / "config.yaml"
+# dashboard/scripts/dashboard_config.py -> dashboard/scripts -> dashboard
+DASHBOARD_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_PATH = DASHBOARD_ROOT / "config.yaml"
 REQUIRED_KEYS = (
     "dashboard.url",
     "firebase.project_id",
     "firebase.collection",
     "firebase.document",
-    "smtp.host",
-    "smtp.port",
-    "smtp.user",
-    "smtp.password",
-    "notifications.recipients"
 )
 
 
@@ -64,26 +57,7 @@ def load_dashboard_config(explicit: str | os.PathLike[str] | None = None) -> Dic
             f"{path} is missing required key(s): {', '.join(missing)}"
         )
 
-    recipients = OmegaConf.select(config, "notifications.recipients")
-    if not list(recipients):
-        raise DashboardConfigError(f"{path} lists no notifications.recipients")
-
     return config
-
-
-def try_load_dashboard_config(
-    explicit: str | os.PathLike[str] | None = None
-) -> DictConfig | None:
-    """Load the configuration, returning ``None`` instead of raising.
-
-    Used where the configuration is an enhancement rather than a requirement -- most
-    importantly when supplying argparse defaults to the live trading daemon, which must
-    still start with its built-in defaults if the file is absent or malformed.
-    """
-    try:
-        return load_dashboard_config(explicit)
-    except Exception:  # noqa: BLE001 - a bad config must not block trading
-        return None
 
 
 def service_account(config: DictConfig) -> Path | dict[str, Any] | None:
