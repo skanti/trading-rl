@@ -72,7 +72,7 @@ The project id is already set to `trading-dashboard-ccdd5` in `.firebaserc` and
    You can also paste the key JSON inline under `firebase.service_account` instead.
 5. Create the login user from `config.yaml`:
    ```bash
-   cd ../ml && .venv/bin/python -m baseline.provision_auth_user
+   ../ml/.venv/bin/python scripts/provision_auth_user.py
    ```
 
 ## Deploying

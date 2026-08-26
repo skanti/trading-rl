@@ -5,26 +5,39 @@ address. The two are bridged by ``auth.email_domain``, so the credentials in the
 file and the credentials Firebase will accept can never drift -- rerun this after
 changing either the username or the password.
 
-    python -m baseline.provision_auth_user
+    ../ml/.venv/bin/python scripts/provision_auth_user.py
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 import sys
 from typing import Sequence
 
-from omegaconf import OmegaConf
+# The config contract lives with the other Python readers of config.yaml, so this script
+# borrows it rather than growing a second copy that could drift from them.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ml"))
 
-from baseline.dashboard_config import auth_email, load_dashboard_config, service_account
+from omegaconf import OmegaConf  # noqa: E402
+
+from baseline.dashboard_config import (  # noqa: E402
+    auth_email,
+    load_dashboard_config,
+    service_account,
+)
 
 LOGGER = logging.getLogger("dashboard-auth")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Provision the dashboard's Firebase Auth user.")
-    parser.add_argument("--config", default=None, help="path to dashboard/config.yaml")
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parents[1] / "config.yaml"),
+        help="path to dashboard/config.yaml",
+    )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")

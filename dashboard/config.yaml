@@ -8,7 +8,7 @@ dashboard:
 
 auth:
   # Dashboard login. The username is bridged to a Firebase Auth account as
-  # `<username>@<email_domain>`; run `python -m baseline.provision_auth_user` after
+  # `<username>@<email_domain>`; run `dashboard/scripts/provision_auth_user.py` after
   # changing either value.
   username: "gambler8"
   password: "leverage1000x"

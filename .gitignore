@@ -16,6 +16,8 @@ outputs
 !.gitattributes
 
 # dashboard build output
+/dashboard/firebase-debug.log
+/dashboard/firebase-debug.*.log
 /dashboard/node_modules/
 /dashboard/.output/
 /dashboard/.nuxt/
