@@ -1609,7 +1609,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=20)
     parser.add_argument("--entry-grace-seconds", type=int, default=75)
-    parser.add_argument("--ema-span", type=int, default=20)
+    parser.add_argument("--ema-span", type=int, default=10)
     parser.add_argument("--min-history-days", type=int, default=20)
     parser.add_argument(
         "--minimum-trading-days",

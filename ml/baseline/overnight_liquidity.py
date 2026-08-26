@@ -1371,7 +1371,12 @@ def main() -> None:
     parser.add_argument("--months", type=int, default=12, help="trailing calendar months")
     parser.add_argument("--start-date", default=None, help="optional YYYY-MM-DD override for --months")
     parser.add_argument("--end-date", default=None, help="final exit date, default: latest data date")
-    parser.add_argument("--ema-span", type=int, default=20, help="liquidity EMA span; 1 uses only the prior day")
+    parser.add_argument(
+        "--ema-span",
+        type=int,
+        default=10,
+        help="liquidity EMA span; 1 uses only the prior day",
+    )
     parser.add_argument("--min-history-days", type=int, default=20)
     parser.add_argument(
         "--minimum-trading-days",
