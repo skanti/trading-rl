@@ -80,8 +80,12 @@ export interface StrategyState {
   symbols: string[]
   filled_symbols: string[]
   remaining_symbols: string[]
+  share_mode?: 'whole' | 'fractional' | null
   budget: number
   per_symbol_notional: number
+  estimated_deployed_notional?: number
+  target_quantities?: Record<string, number>
+  skipped_symbols?: string[]
   entry_completed_at: string | null
   exit_completed_at: string | null
   ranking_trade_date: string | null

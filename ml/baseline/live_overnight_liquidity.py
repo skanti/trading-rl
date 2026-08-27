@@ -1,10 +1,10 @@
 """Live/paper Alpaca execution for the causal overnight-liquidity basket.
 
-The process ranks exchange-listed, fractionable US equities from a bounded
-window of *completed* daily bars, buys an equal-notional basket late in the
-regular session, and closes only those strategy-owned positions on the next
-trading morning.  State and deterministic client order IDs make the workflow
-restartable and idempotent.
+The process ranks exchange-listed, fractionable US company stocks from a bounded
+window of *completed* daily bars, buys an equal-target basket late in the regular
+session, and closes only those strategy-owned positions on the next trading
+morning. State and deterministic client order IDs make the workflow restartable
+and idempotent.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from rich.table import Table
 
 from baseline.overnight_liquidity import (
     DEFAULT_SECURITY_MASTER_CACHE,
+    basket_quantities,
     issuer_key,
     _security_symbol,
     causal_ema_log_liquidity,
@@ -195,10 +196,14 @@ class DailyArtifacts:
                 "liquidity_lookback_calendar_days": config.lookback_calendar_days,
                 "activity_candidates": config.activity_candidates,
                 "feed": config.feed,
+                "ranking_feed": config.feed,
+                "quote_feed": config.quote_feed,
                 "exchanges": sorted(config.exchanges),
                 "capital": config.capital,
                 "capital_fraction": config.capital_fraction,
                 "cash_buffer_fraction": config.cash_buffer_fraction,
+                "share_mode": config.share_mode,
+                "quote_max_age_seconds": config.quote_max_age_seconds,
             },
             "ranking": state.get("ranking") or {},
             "position": position,
@@ -511,6 +516,24 @@ class AlpacaClient:
                 break
         return output
 
+    def latest_quotes(self, symbols: Sequence[str], feed: str) -> dict[str, dict[str, Any]]:
+        """Return the latest NBBO quote used to estimate whole-share buy quantities."""
+        if not symbols:
+            return {}
+        response = dict(
+            self._request(
+                "GET",
+                self.data_url,
+                "stocks/quotes/latest",
+                params={"symbols": ",".join(symbols), "feed": feed},
+                data_credentials=True,
+            )
+        )
+        return {
+            str(symbol): dict(value)
+            for symbol, value in dict(response.get("quotes") or {}).items()
+        }
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -521,6 +544,7 @@ class StrategyConfig:
     lookback_calendar_days: int
     activity_candidates: int
     feed: str
+    quote_feed: str
     exchanges: frozenset[str]
     data_batch_size: int
     data_workers: int
@@ -529,6 +553,8 @@ class StrategyConfig:
     cash_buffer_fraction: float
     fill_timeout_seconds: float
     poll_seconds: float
+    share_mode: str
+    quote_max_age_seconds: float
 
 
 class StateStore:
@@ -915,6 +941,67 @@ def available_budget(account: Mapping[str, object], config: StrategyConfig) -> f
     return math.floor(budget * 100.0) / 100.0
 
 
+def whole_share_order_plan(
+    symbols: Sequence[str],
+    quotes: Mapping[str, Mapping[str, object]],
+    budget: float,
+    reference: datetime,
+    max_age_seconds: float,
+) -> dict[str, object]:
+    """Floor equal-notional targets using fresh asks, matching the simulator.
+
+    Unused allocation is deliberately left as cash. A missing or stale quote aborts
+    the complete plan so a live entry never guesses a quantity from old market data.
+    """
+    if not symbols:
+        raise ValueError("whole-share sizing requires at least one symbol")
+    prices: list[float] = []
+    quote_times: dict[str, str] = {}
+    normalized_reference = reference.astimezone(ZoneInfo("UTC"))
+    for symbol in symbols:
+        quote_row = quotes.get(symbol)
+        if quote_row is None:
+            raise RuntimeError(f"latest quote missing for {symbol}")
+        ask = _float(quote_row.get("ap"), f"quote[{symbol}].ap")
+        if ask <= 0.0:
+            raise RuntimeError(f"latest ask is not positive for {symbol}")
+        raw_timestamp = quote_row.get("t")
+        if not raw_timestamp:
+            raise RuntimeError(f"latest quote timestamp missing for {symbol}")
+        quoted_at = _parse_timestamp(str(raw_timestamp))
+        if quoted_at.tzinfo is None:
+            raise RuntimeError(f"latest quote timestamp has no timezone for {symbol}")
+        age_seconds = (normalized_reference - quoted_at).total_seconds()
+        if age_seconds < -5.0:
+            raise RuntimeError(f"latest quote timestamp is in the future for {symbol}")
+        if age_seconds > max_age_seconds:
+            raise RuntimeError(
+                f"latest quote for {symbol} is {age_seconds:.1f}s old; "
+                f"maximum is {max_age_seconds:.1f}s"
+            )
+        prices.append(ask)
+        quote_times[symbol] = quoted_at.isoformat()
+
+    quantities = basket_quantities(np.asarray(prices), budget, "whole")
+    targets = {
+        symbol: int(quantity)
+        for symbol, quantity in zip(symbols, quantities, strict=True)
+    }
+    skipped = [symbol for symbol in symbols if targets[symbol] == 0]
+    estimated_deployed = sum(
+        targets[symbol] * price for symbol, price in zip(symbols, prices, strict=True)
+    )
+    if not any(targets.values()):
+        raise RuntimeError("no selected stock is affordable as a whole share")
+    return {
+        "sizing_prices": dict(zip(symbols, prices, strict=True)),
+        "sizing_quote_times": quote_times,
+        "target_quantities": targets,
+        "skipped_symbols": skipped,
+        "estimated_deployed_notional": math.floor(estimated_deployed * 100.0) / 100.0,
+    }
+
+
 def _order_summary(order: Mapping[str, object]) -> dict[str, object]:
     return {
         key: order.get(key)
@@ -1033,13 +1120,17 @@ def enter_for_day(
     with store.locked():
         state = store.load()
         ranking = state.get("ranking") or {}
+        previous = state.get("position") or {}
+        resuming = (
+            previous.get("entry_date") == trade_date.isoformat()
+            and previous.get("status") != "closed"
+        )
         if (
             ranking.get("trade_date") != trade_date.isoformat()
             or ranking.get("ranking_pipeline_version") != RANKING_PIPELINE_VERSION
         ):
             raise RuntimeError(f"no current ranking for {trade_date}; run the rank action first")
-        previous = state.get("position") or {}
-        if previous.get("entry_date") == trade_date.isoformat() and previous.get("status") != "closed":
+        if resuming:
             if not submit and previous.get("status") == "planned":
                 return dict(previous)
             LOGGER.info("entry workflow for %s already exists; resuming it", trade_date)
@@ -1047,6 +1138,14 @@ def enter_for_day(
             budget = float(previous["budget"])
             per_symbol = float(previous["per_symbol_notional"])
             position = dict(previous)
+            share_mode = str(position.get("share_mode") or "fractional")
+            if share_mode != config.share_mode:
+                LOGGER.warning(
+                    "resuming %s entry with persisted share mode %s instead of configured %s",
+                    trade_date,
+                    share_mode,
+                    config.share_mode,
+                )
         else:
             if previous and previous.get("status") not in (None, "closed"):
                 raise RuntimeError(
@@ -1060,13 +1159,26 @@ def enter_for_day(
             account = client.account()
             budget = available_budget(account, config)
             per_symbol = math.floor((budget / config.top) * 100.0) / 100.0
+            share_mode = config.share_mode
+            sizing: dict[str, object] = {}
+            if share_mode == "whole":
+                sizing = whole_share_order_plan(
+                    selected,
+                    client.latest_quotes(selected, config.quote_feed),
+                    budget,
+                    now or datetime.now(tz=EASTERN),
+                    config.quote_max_age_seconds,
+                )
             position = {
                 "entry_date": trade_date.isoformat(),
                 "exit_date": _next_session(client, trade_date).isoformat(),
                 "status": "planned" if not submit else "entering",
+                "share_mode": share_mode,
+                "quote_feed": config.quote_feed if share_mode == "whole" else None,
                 "symbols": selected,
                 "budget": budget,
                 "per_symbol_notional": per_symbol,
+                **sizing,
                 "entry_account_snapshot": {
                     key: account.get(key)
                     for key in (
@@ -1094,15 +1206,32 @@ def enter_for_day(
         if not submit:
             return position
 
+        if share_mode == "whole":
+            raw_targets = position.get("target_quantities")
+            if not isinstance(raw_targets, Mapping):
+                raise RuntimeError("whole-share entry state has no target quantities")
+            target_quantities = {
+                symbol: int(raw_targets.get(symbol, 0)) for symbol in selected
+            }
+            order_symbols = [symbol for symbol in selected if target_quantities[symbol] > 0]
+        else:
+            target_quantities = {}
+            order_symbols = selected
+
         submitted: dict[str, dict[str, Any]] = {}
-        for symbol in selected:
+        for symbol in order_symbols:
             client_id = _client_order_id(trade_date, "buy", symbol)
             order = client.order_by_client_id(client_id)
             if order is None:
+                size = (
+                    {"qty": str(target_quantities[symbol])}
+                    if share_mode == "whole"
+                    else {"notional": f"{per_symbol:.2f}"}
+                )
                 order = client.submit_order(
                     {
                         "symbol": symbol,
-                        "notional": f"{per_symbol:.2f}",
+                        **size,
                         "side": "buy",
                         "type": "market",
                         "time_in_force": "day",
@@ -1134,12 +1263,16 @@ def enter_for_day(
             trade_date,
             position["status"],
             len(filled_symbols),
-            len(selected),
+            len(order_symbols),
         )
         if not filled_symbols:
             raise RuntimeError("none of the basket entry orders filled")
-        if len(filled_symbols) != len(selected):
-            LOGGER.warning("only %d/%d basket entries filled", len(filled_symbols), len(selected))
+        if len(filled_symbols) != len(order_symbols):
+            LOGGER.warning(
+                "only %d/%d submitted basket entries filled",
+                len(filled_symbols),
+                len(order_symbols),
+            )
         return position
 
 
@@ -1299,22 +1432,79 @@ def exit_position(
         return position
 
 
-def _print_entry_plan(position: Mapping[str, object], submit: bool) -> None:
+def _print_entry_plan(
+    position: Mapping[str, object],
+    submit: bool,
+    console: Console = CONSOLE,
+) -> None:
     table = Table(title="Overnight basket entry" if submit else "DRY RUN — overnight basket entry")
     table.add_column("Symbol")
-    table.add_column("Notional", justify="right")
+    share_mode = str(position.get("share_mode") or "fractional")
+    table.add_column("Quantity" if share_mode == "whole" else "Notional", justify="right")
+    if share_mode == "whole":
+        table.add_column("Est. value", justify="right")
     table.add_column("Order status")
     orders = position.get("entry_orders") or {}
-    for symbol in position["symbols"]:
+    quantities = position.get("target_quantities") or {}
+    sizing_prices = position.get("sizing_prices") or {}
+    symbols = list(position["symbols"])
+    per_symbol = float(position["per_symbol_notional"])
+    order_count = 0
+    calculated_deployed = 0.0
+    for symbol in symbols:
         order = orders.get(symbol, {})
+        quantity = int(quantities.get(symbol, 0)) if share_mode == "whole" else None
+        if share_mode == "whole":
+            price = float(sizing_prices.get(symbol, 0.0))
+            estimated_value = quantity * price
+            calculated_deployed += estimated_value
+            if quantity > 0:
+                order_count += 1
+            row = (
+                str(symbol),
+                str(quantity),
+                f"${estimated_value:,.2f}",
+                str(
+                    order.get(
+                        "status",
+                        "skipped — below one share" if quantity == 0 else "not submitted",
+                    )
+                ),
+            )
+        else:
+            order_count += 1
+            calculated_deployed += per_symbol
+            row = (
+                str(symbol),
+                f"${per_symbol:,.2f}",
+                str(order.get("status", "not submitted")),
+            )
+        table.add_row(*row)
+
+    estimated_deployed = float(
+        position.get("estimated_deployed_notional", calculated_deployed)
+    )
+    skipped_count = len(symbols) - order_count
+    table.add_section()
+    if share_mode == "whole":
         table.add_row(
-            str(symbol),
-            f"${float(position['per_symbol_notional']):,.2f}",
-            str(order.get("status", "not submitted")),
+            "TOTAL",
+            "—",
+            f"${estimated_deployed:,.2f}",
+            f"{order_count} orders / {len(symbols)} selected; {skipped_count} skipped",
         )
-    CONSOLE.print(table)
-    CONSOLE.print(
-        f"Budget ${float(position['budget']):,.2f}; exit session {position['exit_date']}; "
+    else:
+        table.add_row(
+            "TOTAL",
+            f"${estimated_deployed:,.2f}",
+            f"{order_count} orders / {len(symbols)} selected",
+        )
+    console.print(table)
+    budget = float(position["budget"])
+    deployment_percentage = (estimated_deployed / budget * 100.0) if budget > 0.0 else 0.0
+    console.print(
+        f"Budget ${budget:,.2f}; estimated basket ${estimated_deployed:,.2f} "
+        f"({deployment_percentage:.1f}% of budget); exit session {position['exit_date']}; "
         f"state={position['status']}"
     )
 
@@ -1517,7 +1707,7 @@ def run_daemon(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rank and trade Alpaca's most-liquid fractionable stocks overnight."
+        description="Rank and trade Alpaca's most-liquid fractionable company stocks overnight."
     )
     parser.add_argument(
         "action", choices=("run", "preview", "rank", "enter", "exit", "status")
@@ -1553,16 +1743,42 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         help="top SIP symbols requested from each of Alpaca's volume and trade-count screens",
     )
-    parser.add_argument("--feed", choices=("iex", "sip"), default="sip")
+    parser.add_argument(
+        "--feed",
+        choices=("iex", "sip"),
+        default="sip",
+        help="feed used for activity screening and historical liquidity ranking (default: sip)",
+    )
+    parser.add_argument(
+        "--quote-feed",
+        choices=("iex", "sip"),
+        default="iex",
+        help="feed used for latest asks in whole-share sizing (default: iex)",
+    )
     parser.add_argument("--exchanges", default=",".join(sorted(DEFAULT_EXCHANGES)))
     parser.add_argument("--data-batch-size", type=int, default=100)
     parser.add_argument("--data-workers", type=int, default=4)
     capital = parser.add_mutually_exclusive_group()
     capital.add_argument("--capital", type=float, default=None, help="maximum dollars deployed")
     capital.add_argument(
-        "--capital-fraction", type=float, default=0.90, help="fraction of cash deployed"
+        "--capital-fraction",
+        type=float,
+        default=1.0,
+        help="fraction of cash requested for deployment (default: 1.0)",
     )
     parser.add_argument("--cash-buffer-fraction", type=float, default=0.02)
+    parser.add_argument(
+        "--share-mode",
+        choices=("whole", "fractional"),
+        default="whole",
+        help="whole floors equal-notional targets to integer shares; fractional sends notionals",
+    )
+    parser.add_argument(
+        "--quote-max-age-seconds",
+        type=float,
+        default=120.0,
+        help="maximum latest-ask age accepted for whole-share sizing (default: 120)",
+    )
     parser.add_argument("--fill-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -1582,7 +1798,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--submit",
         action="store_true",
-        help="actually send paper orders; enter/exit are dry runs without this flag",
+        help="actually send orders; enter/exit are dry runs without this flag",
     )
     parser.add_argument(
         "--allow-live-endpoint",
@@ -1615,8 +1831,14 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("capital-fraction must be in (0, 1]")
     if not 0.0 <= args.cash_buffer_fraction < 1.0:
         parser.error("cash-buffer-fraction must be in [0, 1)")
-    if args.fill_timeout_seconds <= 0.0 or args.poll_seconds <= 0.0:
-        parser.error("fill-timeout-seconds and poll-seconds must be positive")
+    if (
+        args.fill_timeout_seconds <= 0.0
+        or args.poll_seconds <= 0.0
+        or args.quote_max_age_seconds <= 0.0
+    ):
+        parser.error(
+            "fill-timeout-seconds, poll-seconds, and quote-max-age-seconds must be positive"
+        )
     if args.minimum_ranking_lead_minutes < 0 or args.entry_grace_seconds < 0:
         parser.error("minimum-ranking-lead-minutes and entry-grace-seconds must be non-negative")
     if args.request_timeout_seconds <= 0.0:
@@ -1649,6 +1871,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         lookback_calendar_days=args.liquidity_lookback_days,
         activity_candidates=args.activity_candidates,
         feed=args.feed,
+        quote_feed=args.quote_feed,
         exchanges=exchanges,
         data_batch_size=args.data_batch_size,
         data_workers=args.data_workers,
@@ -1657,6 +1880,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         cash_buffer_fraction=args.cash_buffer_fraction,
         fill_timeout_seconds=args.fill_timeout_seconds,
         poll_seconds=args.poll_seconds,
+        share_mode=args.share_mode,
+        quote_max_age_seconds=args.quote_max_age_seconds,
     )
 
 

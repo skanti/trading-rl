@@ -58,6 +58,12 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
             <dd class="numeric mt-0.5 text-slate-200">
               {{ strategy?.budget ? formatCurrency(strategy.budget) : '—' }}
             </dd>
+            <dd
+              v-if="strategy?.estimated_deployed_notional"
+              class="numeric mt-0.5 text-xs text-slate-500"
+            >
+              Est. deployed {{ formatCurrency(strategy.estimated_deployed_notional) }}
+            </dd>
           </div>
           <div>
             <dt class="text-xs uppercase tracking-wide text-slate-500">
@@ -65,6 +71,12 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
             </dt>
             <dd class="numeric mt-0.5 text-slate-200">
               {{ strategy?.per_symbol_notional ? formatCurrency(strategy.per_symbol_notional) : '—' }}
+            </dd>
+            <dd
+              v-if="strategy?.share_mode"
+              class="mt-0.5 text-xs capitalize text-slate-500"
+            >
+              {{ strategy.share_mode }} shares
             </dd>
           </div>
         </dl>

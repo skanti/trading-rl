@@ -5,6 +5,8 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
+from rich.console import Console
+
 from baseline.live_overnight_liquidity import (
     DEFAULT_EXCHANGES,
     EASTERN,
@@ -15,6 +17,7 @@ from baseline.live_overnight_liquidity import (
     StateStore,
     StrategyConfig,
     _completed_session_end,
+    _print_entry_plan,
     _select_unconflicted_candidates,
     _validate_args,
     _validate_exit_clock,
@@ -25,10 +28,11 @@ from baseline.live_overnight_liquidity import (
     enter_for_day,
     exit_position,
     fast_activity_candidates,
+    whole_share_order_plan,
 )
 
 
-def config(top=2, fill_timeout_seconds=1.0):
+def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
     return StrategyConfig(
         top=top,
         ema_span=2,
@@ -37,6 +41,7 @@ def config(top=2, fill_timeout_seconds=1.0):
         lookback_calendar_days=90,
         activity_candidates=100,
         feed="iex",
+        quote_feed="iex",
         exchanges=DEFAULT_EXCHANGES,
         data_batch_size=100,
         data_workers=1,
@@ -45,6 +50,8 @@ def config(top=2, fill_timeout_seconds=1.0):
         cash_buffer_fraction=0.02,
         fill_timeout_seconds=fill_timeout_seconds,
         poll_seconds=0.001,
+        share_mode=share_mode,
+        quote_max_age_seconds=120.0,
     )
 
 
@@ -59,6 +66,8 @@ class FakeBroker:
         }
         self.orders = {}
         self.submissions = []
+        self.latest_quote_rows = {}
+        self.latest_quote_calls = []
 
     def positions(self):
         return list(self.current_positions.values())
@@ -80,6 +89,10 @@ class FakeBroker:
     def calendar(self, start, end):
         return [{"date": "2026-08-25"}]
 
+    def latest_quotes(self, symbols, feed):
+        self.latest_quote_calls.append((list(symbols), feed))
+        return {symbol: self.latest_quote_rows[symbol] for symbol in symbols}
+
     def order_by_client_id(self, client_order_id):
         return self.orders.get(client_order_id)
 
@@ -87,7 +100,7 @@ class FakeBroker:
         self.submissions.append(dict(payload))
         symbol = payload["symbol"]
         if payload["side"] == "buy":
-            quantity = "0.95"
+            quantity = str(payload.get("qty") or "0.95")
             self.current_positions[symbol] = {"symbol": symbol, "qty": quantity}
         else:
             quantity = payload["qty"]
@@ -163,6 +176,53 @@ class FakeClockBroker:
 
 
 class LiveOvernightLiquidityTest(unittest.TestCase):
+    def test_whole_share_preview_prints_per_symbol_and_total_sizing(self):
+        console = Console(record=True, width=140, color_system=None)
+        _print_entry_plan(
+            {
+                "share_mode": "whole",
+                "symbols": ["A", "B", "C"],
+                "budget": 1_200.0,
+                "per_symbol_notional": 400.0,
+                "sizing_prices": {"A": 120.0, "B": 300.0, "C": 700.0},
+                "target_quantities": {"A": 3, "B": 1, "C": 0},
+                "estimated_deployed_notional": 660.0,
+                "entry_orders": {},
+                "exit_date": "2026-08-25",
+                "status": "planned",
+            },
+            submit=False,
+            console=console,
+        )
+
+        output = console.export_text()
+        self.assertIn("Est. value", output)
+        self.assertIn("$360.00", output)
+        self.assertIn("$660.00", output)
+        self.assertIn("2 orders / 3 selected; 1 skipped", output)
+        self.assertIn("55.0% of budget", output)
+
+    def test_fractional_preview_prints_total_sizing(self):
+        console = Console(record=True, width=120, color_system=None)
+        _print_entry_plan(
+            {
+                "share_mode": "fractional",
+                "symbols": ["A", "B"],
+                "budget": 1_000.0,
+                "per_symbol_notional": 500.0,
+                "entry_orders": {},
+                "exit_date": "2026-08-25",
+                "status": "planned",
+            },
+            submit=False,
+            console=console,
+        )
+
+        output = console.export_text()
+        self.assertIn("$1,000.00", output)
+        self.assertIn("2 orders / 2 selected", output)
+        self.assertIn("100.0% of budget", output)
+
     def test_exit_time_accepts_0900(self):
         parser = build_parser()
         args = parser.parse_args(["exit", "--exit-time", "09:00"])
@@ -171,6 +231,15 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertIsInstance(parsed, StrategyConfig)
         self.assertEqual(args.ranking_time.strftime("%H:%M"), "15:00")
+        self.assertEqual(args.share_mode, "whole")
+        self.assertEqual(args.feed, "sip")
+        self.assertEqual(args.quote_feed, "iex")
+        self.assertEqual(args.capital_fraction, 1.0)
+        self.assertEqual(args.quote_max_age_seconds, 120.0)
+        self.assertEqual(parsed.capital_fraction, 1.0)
+        self.assertEqual(parsed.feed, "sip")
+        self.assertEqual(parsed.quote_feed, "iex")
+        self.assertEqual(parsed.quote_max_age_seconds, 120.0)
         self.assertEqual(parsed.poll_seconds, 1.0)
 
         preview_args = parser.parse_args(["preview"])
@@ -340,6 +409,23 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(calls[0][3]["params"], {"by": "trades", "top": 100})
         self.assertTrue(calls[0][3]["data_credentials"])
 
+    def test_latest_quotes_uses_market_data_credentials_and_requested_feed(self):
+        client = AlpacaClient("key", "secret")
+        calls = []
+
+        def request(method, base, path, **kwargs):
+            calls.append((method, base, path, kwargs))
+            return {"quotes": {"AAPL": {"ap": 230.0, "t": "2026-08-24T19:59:00Z"}}}
+
+        client._request = request
+        quotes = client.latest_quotes(["AAPL"], "sip")
+
+        self.assertEqual(quotes["AAPL"]["ap"], 230.0)
+        self.assertEqual(calls[0][1], "https://data.alpaca.markets/v2")
+        self.assertEqual(calls[0][2], "stocks/quotes/latest")
+        self.assertEqual(calls[0][3]["params"], {"symbols": "AAPL", "feed": "sip"})
+        self.assertTrue(calls[0][3]["data_credentials"])
+
     def test_data_requests_use_separate_credentials_and_completed_timestamp(self):
         client = AlpacaClient(
             "trading-key",
@@ -389,6 +475,82 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             config(top=10),
         )
         self.assertEqual(budget, 600.0)
+
+    def test_whole_share_plan_matches_simulator_rounding_and_leaves_idle_cash(self):
+        quoted_at = "2026-08-24T19:59:00Z"
+        plan = whole_share_order_plan(
+            ["A", "B", "C"],
+            {
+                "A": {"ap": 120.0, "t": quoted_at},
+                "B": {"ap": 300.0, "t": quoted_at},
+                "C": {"ap": 700.0, "t": quoted_at},
+            },
+            1_200.0,
+            datetime(2026, 8, 24, 15, 59, tzinfo=EASTERN),
+            60.0,
+        )
+
+        self.assertEqual(plan["target_quantities"], {"A": 3, "B": 1, "C": 0})
+        self.assertEqual(plan["skipped_symbols"], ["C"])
+        self.assertEqual(plan["estimated_deployed_notional"], 660.0)
+
+    def test_whole_share_plan_rejects_stale_quotes(self):
+        with self.assertRaisesRegex(RuntimeError, "maximum is 60.0s"):
+            whole_share_order_plan(
+                ["A"],
+                {"A": {"ap": 100.0, "t": "2026-08-24T19:57:00Z"}},
+                1_000.0,
+                datetime(2026, 8, 24, 15, 59, tzinfo=EASTERN),
+                60.0,
+            )
+
+    def test_whole_share_entry_submits_integer_qty_and_is_restart_idempotent(self):
+        broker = FakeBroker()
+        broker.latest_quote_rows = {
+            "A": {"ap": 120.0, "t": "2026-08-24T19:59:00Z"},
+            "B": {"ap": 600.0, "t": "2026-08-24T19:59:00Z"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.json")
+            state = store.load()
+            state["ranking"] = {
+                "trade_date": "2026-08-24",
+                "ranking_pipeline_version": RANKING_PIPELINE_VERSION,
+                "candidates": [
+                    {"rank": 1, "symbol": "A"},
+                    {"rank": 2, "symbol": "B"},
+                ],
+            }
+            store.save(state)
+
+            first = enter_for_day(
+                broker,
+                store,
+                config(share_mode="whole"),
+                date(2026, 8, 24),
+                submit=True,
+                now=datetime(2026, 8, 24, 15, 59, tzinfo=EASTERN),
+            )
+            second = enter_for_day(
+                broker,
+                store,
+                config(share_mode="fractional"),
+                date(2026, 8, 24),
+                submit=True,
+                now=datetime(2026, 8, 24, 15, 59, 1, tzinfo=EASTERN),
+            )
+
+        self.assertEqual(first["share_mode"], "whole")
+        self.assertEqual(first["quote_feed"], "iex")
+        self.assertEqual(first["target_quantities"], {"A": 3, "B": 0})
+        self.assertEqual(first["skipped_symbols"], ["B"])
+        self.assertEqual(first["estimated_deployed_notional"], 360.0)
+        self.assertEqual(first["filled_symbols"], ["A"])
+        self.assertEqual(broker.latest_quote_calls, [(["A", "B"], "iex")])
+        self.assertEqual(second["status"], "open")
+        self.assertEqual(len(broker.submissions), 1)
+        self.assertEqual(broker.submissions[0]["qty"], "3")
+        self.assertNotIn("notional", broker.submissions[0])
 
     def test_entry_skips_conflicting_position_and_is_idempotent(self):
         broker = FakeBroker()

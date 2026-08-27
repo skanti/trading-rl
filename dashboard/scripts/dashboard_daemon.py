@@ -39,7 +39,10 @@ LOGGER = logging.getLogger("dashboard-daemon")
 SNAPSHOT_VERSION = 2
 SESSIONS_SUBCOLLECTION = "sessions"
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
-DEFAULT_WORK_DIR = Path("/data/ppv1/live")
+DEFAULT_WORK_DIRS = {
+    "paper": Path("/data/ppv1/paper"),
+    "live": Path("/data/ppv1/live"),
+}
 _DAY_DIRECTORY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Only these account fields reach the browser. Everything else Alpaca returns is either
@@ -81,6 +84,18 @@ _POSITION_FIELDS = (
 def _is_paper_url(url: str) -> bool:
     """Whether a trading endpoint points at the paper environment."""
     return urlparse(str(url)).hostname == "paper-api.alpaca.markets"
+
+
+def _trading_mode(url: str) -> str:
+    """Detect a supported Alpaca environment without a separate mode flag."""
+    parsed = urlparse(str(url))
+    if parsed.scheme != "https":
+        raise ValueError("Alpaca trading URL must use https")
+    if parsed.hostname == "paper-api.alpaca.markets":
+        return "paper"
+    if parsed.hostname == "api.alpaca.markets":
+        return "live"
+    raise ValueError(f"unsupported Alpaca trading endpoint: {url}")
 
 
 def _normalize_api_base(url: str) -> str:
@@ -207,8 +222,17 @@ def _strategy_view(state: Mapping[str, Any]) -> dict[str, Any]:
         "symbols": list(position.get("symbols") or []),
         "filled_symbols": list(position.get("filled_symbols") or []),
         "remaining_symbols": list(position.get("remaining_symbols") or []),
+        "share_mode": position.get("share_mode"),
         "budget": performance._float(position.get("budget")),
         "per_symbol_notional": performance._float(position.get("per_symbol_notional")),
+        "estimated_deployed_notional": performance._float(
+            position.get("estimated_deployed_notional")
+        ),
+        "target_quantities": {
+            str(symbol): int(quantity)
+            for symbol, quantity in dict(position.get("target_quantities") or {}).items()
+        },
+        "skipped_symbols": list(position.get("skipped_symbols") or []),
         "entry_completed_at": position.get("entry_completed_at"),
         "exit_completed_at": position.get("exit_completed_at"),
         "ranking_trade_date": ranking.get("trade_date"),
@@ -429,6 +453,7 @@ def build_snapshot(
         "meta": {
             "trading_url": getattr(client, "trading_url", None),
             "paper": _is_paper_url(getattr(client, "trading_url", "")),
+            "mode": _trading_mode(getattr(client, "trading_url", "")),
             "history_period": period,
             "inception_date": series_start.isoformat() if series_start else None
         }
@@ -535,7 +560,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--work-dir",
         default=None,
-        help="daemon work directory holding per-day artifacts (default: from the trading script)"
+        help="daemon work directory holding per-day artifacts (default: /data/ppv1/<mode>)"
     )
     parser.add_argument("--state-path", default=None, help="strategy state.json (default: <work-dir>/state.json)")
     parser.add_argument("--dry-run", action="store_true", help="print one snapshot and exit")
@@ -557,11 +582,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Alpaca endpoint (default: $ALPACA_URL, else the paper endpoint)"
     )
-    parser.add_argument(
-        "--allow-live-endpoint",
-        action="store_true",
-        help="permit a trading_url other than paper-api.alpaca.markets"
-    )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     return parser
 
@@ -577,15 +597,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_dashboard_config(args.config)
 
     trading_url = args.trading_url or os.environ.get("ALPACA_URL") or PAPER_TRADING_URL
-    if not _is_paper_url(trading_url) and not args.allow_live_endpoint:
-        # ml/.env carries live keys on the line above the paper ones; refuse to read a
-        # live account by accident, matching the trading script's own rail.
-        parser.error(
-            f"refusing to publish from non-paper endpoint {trading_url} "
-            "without --allow-live-endpoint"
-        )
+    try:
+        trading_mode = _trading_mode(trading_url)
+    except ValueError as error:
+        parser.error(str(error))
+    LOGGER.info("detected Alpaca %s mode from %s", trading_mode, trading_url)
 
-    work_dir = Path(args.work_dir).expanduser() if args.work_dir else DEFAULT_WORK_DIR
+    work_dir = (
+        Path(args.work_dir).expanduser()
+        if args.work_dir
+        else DEFAULT_WORK_DIRS[trading_mode]
+    )
+    LOGGER.info("using %s strategy artifacts from %s", trading_mode, work_dir)
     state_path = Path(args.state_path).expanduser() if args.state_path else work_dir / "state.json"
     digest_state_path = (
         Path(args.digest_state_path).expanduser()

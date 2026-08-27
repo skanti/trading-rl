@@ -162,9 +162,10 @@ As in the simulator, a company must have at least 100 completed daily bars
 strictly before the entry date. Configure this with `--minimum-trading-days`;
 the 20-session EMA span remains separately configurable with `--ema-span`.
 
-The default `sip` feed provides whole-market liquidity measurements and
-requires an Alpaca SIP data subscription. Use `--feed iex` when running on a
-free data plan. Candidates are restricted to active, tradable, fractionable
+The default ranking `--feed sip` provides whole-market liquidity measurements.
+Whole-share sizing separately defaults to real-time `--quote-feed iex`, so it does
+not require recent SIP quote access. Use `--quote-feed sip` only with an Alpaca
+real-time SIP subscription. Candidates are restricted to active, tradable, fractionable
 company stocks on the major exchanges. The same Nasdaq security-master filter
 used by the simulator strictly removes ETFs (including SPY and QQQ), funds,
 units, preferreds, debt, SPAC shells, and unclassified current assets before
@@ -186,11 +187,15 @@ python -m baseline.live_overnight_liquidity run \
   --ranking-time 15:00 \
   --entry-time 15:55 \
   --exit-time 09:35 \
-  --capital-fraction 0.90 \
+  --feed sip \
+  --quote-feed iex \
+  --capital-fraction 1.00 \
+  --share-mode whole \
   --submit
 ```
 
-Basket sizing remains cash-only even on a margin-enabled account. The requested
+`--capital-fraction` defaults to `1.0`. Basket sizing remains cash-only even on a
+margin-enabled account. The requested
 capital is capped by positive cash after `--cash-buffer-fraction` and by Alpaca's
 regular stock `buying_power`. It deliberately does not use
 `non_marginable_buying_power`, because that settlement-sensitive field can exclude
@@ -198,8 +203,19 @@ same-day stock-sale proceeds even though they are immediately reusable for equit
 The pre-entry account fields used for sizing are saved in strategy state and daily
 summaries for auditability.
 
-When both data variables are set, SIP screener and historical-bar requests use
-that subscription while account, position, calendar, and order requests keep
+Live execution defaults to `--share-mode whole`. Immediately before entry it requests
+the latest ask for every selected stock from `--quote-feed iex`, rejects missing quotes
+or quotes older than the default `--quote-max-age-seconds 120`, and floors each
+equal-notional allocation to an integer quantity using the same rule as the simulator.
+Unused dollars and any allocation too small to buy one share remain cash; they are not
+redistributed to cheaper names. The quote prices, timestamps, target quantities, skipped
+symbols, and estimated deployed notional are persisted in strategy state. Use
+`--share-mode fractional` to retain the earlier notional-order behavior. Both modes use
+the same fractionable-company universe and the same liquidity ranking; share mode affects
+only sizing and the submitted order payload.
+
+When both data variables are set, all market-data requests use those credentials while
+account, position, calendar, and order requests keep
 using the trading credentials. If neither data variable is set, market-data
 requests fall back to the trading credentials. Daily-bar requests end at an
 explicit timestamp on the last completed session and never include the
@@ -221,7 +237,7 @@ python -m baseline.live_overnight_liquidity preview \
   --capital-fraction 0.95
 ```
 
-Exit submission times from 09:00 through 09:29 queue fractional `day` market
+Exit submission times from 09:00 through 09:29 queue `day` market
 orders for the regular-session open. The daemon records `exit_queued` without
 canceling those orders on the normal fill timeout, then reconciles their fills
 at 09:30 and retries only when necessary. Once the market is open, a still-working

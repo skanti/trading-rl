@@ -110,13 +110,14 @@ set -a && source ../ml/.env && set +a
 Always use `dashboard/.venv` for this process. The ML environment intentionally has a
 separate dependency set and is not supported for the Firebase daemon.
 
-Use `--interval-seconds 60` to override the two-minute cadence, `--work-dir` when strategy artifacts
-are somewhere other than `/data/ppv1/live`, and `--state-path` to select a separate
-state file. Use `--no-email` to disable digests. A failed publish is logged and retried
-on the next interval.
+Use `--interval-seconds 60` to override the two-minute cadence and `--state-path` to
+select a separate state file. Use `--no-email` to disable digests. A failed publish is
+logged and retried on the next interval.
 
-It refuses any endpoint other than `paper-api.alpaca.markets` unless started with
-`--allow-live-endpoint`, so an unlucky `ALPACA_URL` cannot point it at real money.
+The daemon detects its mode directly from `--trading-url` or `ALPACA_URL`: the paper
+endpoint reads `/data/ppv1/paper`, while the live endpoint reads `/data/ppv1/live`.
+Use `--work-dir` to override that mapping. No extra live-mode flag is required. Only
+the recognized HTTPS Alpaca paper and live hosts are accepted.
 
 ## Project layout
 

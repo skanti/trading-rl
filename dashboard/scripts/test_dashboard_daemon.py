@@ -18,6 +18,7 @@ from dashboard_daemon import (
     AlpacaClient,
     _firestore_client,
     _is_paper_url,
+    _trading_mode,
     build_parser,
     build_snapshot,
     first_trade_date,
@@ -218,7 +219,13 @@ class SnapshotTest(unittest.TestCase):
         state = {
             "position": {
                 "status": "closed",
+                "share_mode": "whole",
                 "symbols": ["NVDA"],
+                "budget": 1000.0,
+                "per_symbol_notional": 1000.0,
+                "estimated_deployed_notional": 900.0,
+                "target_quantities": {"NVDA": 9},
+                "skipped_symbols": [],
                 "entry_orders": {"NVDA": order(10, 100.0)},
                 "exit_orders": {"NVDA": order(10, 110.0)},
             },
@@ -260,6 +267,9 @@ class SnapshotTest(unittest.TestCase):
         self.assertIsInstance(snapshot["account"]["equity"], float)
         self.assertIsInstance(snapshot["positions"][0]["qty"], float)
         self.assertEqual(snapshot["basket_totals"]["pnl"], 100.0)
+        self.assertEqual(snapshot["strategy"]["share_mode"], "whole")
+        self.assertEqual(snapshot["strategy"]["target_quantities"], {"NVDA": 9})
+        self.assertEqual(snapshot["strategy"]["estimated_deployed_notional"], 900.0)
         self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-08-25")
         self.assertEqual(snapshot["equity_curve"][-1]["profit_loss"], 100.0)
 
@@ -371,6 +381,21 @@ class SafetyTest(unittest.TestCase):
     def test_paper_endpoint_check_uses_the_hostname(self):
         self.assertTrue(_is_paper_url("https://paper-api.alpaca.markets/v2"))
         self.assertFalse(_is_paper_url("https://paper-api.alpaca.markets.evil.example/v2"))
+
+    def test_trading_mode_is_detected_from_known_https_endpoint(self):
+        self.assertEqual(_trading_mode("https://paper-api.alpaca.markets/v2"), "paper")
+        self.assertEqual(_trading_mode("https://api.alpaca.markets/v2"), "live")
+        with self.assertRaisesRegex(ValueError, "unsupported Alpaca trading endpoint"):
+            _trading_mode("https://paper-api.alpaca.markets.evil.example/v2")
+        with self.assertRaisesRegex(ValueError, "must use https"):
+            _trading_mode("http://api.alpaca.markets/v2")
+
+    def test_live_endpoint_needs_no_extra_parser_flag(self):
+        args = build_parser().parse_args(
+            ["--trading-url", "https://api.alpaca.markets/v2"]
+        )
+        self.assertEqual(_trading_mode(args.trading_url), "live")
+        self.assertFalse(hasattr(args, "allow_live_endpoint"))
 
     def test_daemon_is_the_default_and_once_is_explicit(self):
         parser = build_parser()
