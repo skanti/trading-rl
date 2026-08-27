@@ -117,7 +117,11 @@ logged and retried on the next interval.
 The daemon detects its mode directly from `--trading-url` or `ALPACA_URL`: the paper
 endpoint reads `/data/ppv1/paper`, while the live endpoint reads `/data/ppv1/live`.
 Use `--work-dir` to override that mapping. No extra live-mode flag is required. Only
-the recognized HTTPS Alpaca paper and live hosts are accepted.
+the recognized HTTPS Alpaca paper and live hosts are accepted. Both modes publish to
+the stable `accounts/current` document and record the detected mode in snapshot metadata.
+When the mode changes, the publisher clears the old mode's derived session documents
+before writing the new history. The frontend therefore remains account-agnostic and
+does not need rebuilding when the publisher switches between paper and live.
 
 ## Project layout
 

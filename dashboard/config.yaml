@@ -24,7 +24,8 @@ auth:
 firebase:
   project_id: "trading-dashboard-ccdd5"
   collection: "accounts"
-  document: "paper"
+  # Stable active-account document. The publisher records paper/live in snapshot metadata.
+  document: "current"
   # Consumed by nuxt.config.ts at build time.
   web:
     apiKey: "AIzaSyB8EdB28e7pIPI9_4wJdEEBcOTwpYPFAzQ"

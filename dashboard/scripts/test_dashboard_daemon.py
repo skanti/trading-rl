@@ -397,6 +397,41 @@ class SafetyTest(unittest.TestCase):
         self.assertEqual(_trading_mode(args.trading_url), "live")
         self.assertFalse(hasattr(args, "allow_live_endpoint"))
 
+    def test_publish_rejects_unknown_firestore_mode_before_connecting(self):
+        config = OmegaConf.create(
+            {"firebase": {"collection": "accounts", "document": "current"}}
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported trading mode"):
+            dashboard_daemon.publish({}, [], config, trading_mode="unknown")
+
+    def test_publish_uses_stable_firestore_document_for_live_mode(self):
+        config = OmegaConf.create(
+            {"firebase": {"collection": "accounts", "document": "current"}}
+        )
+        client = mock.Mock()
+        reference = client.collection.return_value.document.return_value
+        reference.get.return_value.to_dict.return_value = {}
+        with mock.patch.object(dashboard_daemon, "_firestore_client", return_value=client):
+            dashboard_daemon.publish({}, [], config, trading_mode="live")
+
+        client.collection.assert_called_once_with("accounts")
+        client.collection.return_value.document.assert_called_once_with("current")
+
+    def test_publish_clears_sessions_when_account_mode_changes(self):
+        config = OmegaConf.create(
+            {"firebase": {"collection": "accounts", "document": "current"}}
+        )
+        client = mock.Mock()
+        reference = client.collection.return_value.document.return_value
+        reference.get.return_value.to_dict.return_value = {"meta": {"mode": "paper"}}
+        stale_session = mock.Mock()
+        reference.collection.return_value.list_documents.return_value = [stale_session]
+
+        with mock.patch.object(dashboard_daemon, "_firestore_client", return_value=client):
+            dashboard_daemon.publish({}, [], config, trading_mode="live")
+
+        client.batch.return_value.delete.assert_called_once_with(stale_session)
+
     def test_daemon_is_the_default_and_once_is_explicit(self):
         parser = build_parser()
         self.assertFalse(parser.parse_args([]).once)

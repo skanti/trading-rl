@@ -76,7 +76,7 @@ export default defineNuxtConfig({
       dashboardTitle: config.dashboard?.title ?? 'Trading dashboard',
       authEmailDomain: config.auth?.email_domain ?? '',
       firestoreCollection: config.firebase?.collection ?? 'accounts',
-      firestoreDocument: config.firebase?.document ?? 'paper',
+      firestoreDocument: config.firebase?.document ?? 'current',
       scheduleTimeZone: config.schedule?.time_zone ?? 'America/New_York',
       scheduleRankingTime: config.schedule?.ranking_time ?? '15:00',
       scheduleEntryTime: config.schedule?.entry_time ?? '15:59',

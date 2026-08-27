@@ -15,6 +15,6 @@ export function useRepository(): SnapshotRepository {
 
   return createFirestoreRepository($firebase.firestore, {
     collection: String(config.firestoreCollection || 'accounts'),
-    document: String(config.firestoreDocument || 'paper')
+    document: String(config.firestoreDocument || 'current')
   })
 }

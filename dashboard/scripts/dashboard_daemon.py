@@ -493,17 +493,42 @@ def _firestore_client(config: DictConfig):
 def publish(
     snapshot: Mapping[str, Any],
     sessions: Sequence[Mapping[str, Any]],
-    config: DictConfig
+    config: DictConfig,
+    *,
+    trading_mode: str | None = None,
 ) -> None:
     """Write the snapshot document and the session subcollection."""
     collection = str(OmegaConf.select(config, "firebase.collection"))
     document_name = str(OmegaConf.select(config, "firebase.document"))
+    if trading_mode is not None and trading_mode not in {"paper", "live"}:
+        raise ValueError(f"unsupported trading mode: {trading_mode}")
 
     client = _firestore_client(config)
     reference = client.collection(collection).document(document_name)
+    sessions_reference = reference.collection(SESSIONS_SUBCOLLECTION)
+
+    # The browser reads one stable document regardless of account mode. If the
+    # publisher switches between paper and live, remove the prior mode's derived
+    # sessions before writing the new snapshot so histories can never mix.
+    previous = reference.get().to_dict() or {}
+    previous_mode = str((previous.get("meta") or {}).get("mode") or "")
+    mode_changed = bool(
+        trading_mode
+        and previous_mode in {"paper", "live"}
+        and previous_mode != trading_mode
+    )
+    removed = 0
+    if mode_changed:
+        existing_sessions = list(sessions_reference.list_documents())
+        for offset in range(0, len(existing_sessions), 400):
+            cleanup = client.batch()
+            for session_reference in existing_sessions[offset : offset + 400]:
+                cleanup.delete(session_reference)
+                removed += 1
+            cleanup.commit()
+
     reference.set(dict(snapshot))
 
-    sessions_reference = reference.collection(SESSIONS_SUBCOLLECTION)
     batch = client.batch()
     written = 0
     published_days: set[str] = set()
@@ -524,7 +549,6 @@ def publish(
     # directories for auditing. Older dashboard versions published both as separate
     # sessions. Remove only stale documents inside the refreshed window, preserving
     # history older than ``--sessions-limit``.
-    removed = 0
     if published_days:
         oldest_published = min(published_days)
         stale = []
@@ -544,7 +568,9 @@ def publish(
             cleanup.commit()
 
     LOGGER.info(
-        "published %s/%s with %d session record(s); removed %d stale record(s)",
+        "published %s snapshot to %s/%s with %d session record(s); "
+        "removed %d stale record(s)",
+        trading_mode or "account",
         collection,
         document_name,
         written,
@@ -644,7 +670,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(json.dumps({"snapshot": snapshot, "sessions": sessions}, indent=2, default=str))
             return
-        publish(snapshot, sessions, config)
+        publish(snapshot, sessions, config, trading_mode=trading_mode)
         if not args.no_email:
             key = dashboard_digest.digest_key(state, str(snapshot["trading_day"]))
             if key and key not in dashboard_digest.delivered_keys(digest_state_path):
