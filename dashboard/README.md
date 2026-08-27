@@ -93,7 +93,7 @@ After the first deploy, update `dashboard.url` in `config.yaml` to the real site
 ## Publishing snapshots
 
 The dashboard daemon is intentionally separate from trading. Run it under the same
-process supervisor as the trading daemon; it publishes immediately, then every five
+process supervisor as the trading daemon; it publishes immediately, then every two
 minutes by default. After it observes a basket reach `closed` on its configured exit
 day, it also sends one digest email using `smtp` and `notifications.recipients` from
 `config.yaml`. A durable marker prevents duplicate messages across daemon restarts;
@@ -110,7 +110,7 @@ set -a && source ../ml/.env && set +a
 Always use `dashboard/.venv` for this process. The ML environment intentionally has a
 separate dependency set and is not supported for the Firebase daemon.
 
-Use `--interval-seconds 60` to change the cadence, `--work-dir` when strategy artifacts
+Use `--interval-seconds 60` to override the two-minute cadence, `--work-dir` when strategy artifacts
 are somewhere other than `/data/ppv1/live`, and `--state-path` to select a separate
 state file. Use `--no-email` to disable digests. A failed publish is logged and retried
 on the next interval.

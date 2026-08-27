@@ -14,6 +14,8 @@ export function useSnapshot() {
   const loaded = useState<boolean>('dashboard:loaded', () => false)
 
   async function refresh(): Promise<void> {
+    // Prevent the two-minute poll and a manual refresh from issuing overlapping reads.
+    if (pending.value) return
     pending.value = true
     error.value = null
     try {

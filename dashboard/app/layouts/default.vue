@@ -14,13 +14,21 @@ const links = [
 
 // Recomputed on a ticker so "3 minutes ago" does not freeze on a long-open tab.
 const now = ref(new Date())
-let timer: ReturnType<typeof setInterval> | undefined
+let clockTimer: ReturnType<typeof setInterval> | undefined
+let refreshTimer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
-  timer = setInterval(() => {
+  clockTimer = setInterval(() => {
     now.value = new Date()
   }, 30_000)
+  refreshTimer = setInterval(() => {
+    // Avoid background Firestore reads while the installed app or tab is hidden.
+    if (document.visibilityState === 'visible') void refresh()
+  }, 120_000)
 })
-onBeforeUnmount(() => clearInterval(timer))
+onBeforeUnmount(() => {
+  clearInterval(clockTimer)
+  clearInterval(refreshTimer)
+})
 
 const updated = computed(() => formatRelative(snapshot.value?.updated_at, now.value))
 

@@ -77,7 +77,7 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
     />
 
     <template v-else>
-      <div class="flex flex-wrap items-end justify-between gap-3">
+      <div class="space-y-2">
         <div>
           <p class="text-xs uppercase tracking-wide text-slate-500">
             Account equity
@@ -86,16 +86,10 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
             {{ formatCurrency(account.equity) }}
           </p>
         </div>
-        <div class="flex items-center gap-2">
-          <StatusBadge :status="snapshot.strategy?.status" />
-          <UBadge
-            :color="snapshot.market?.is_open ? 'primary' : 'neutral'"
-            variant="subtle"
-            size="sm"
-          >
-            {{ snapshot.market?.is_open ? 'Market open' : 'Market closed' }}
-          </UBadge>
-        </div>
+        <StrategyPipeline
+          :strategy="snapshot.strategy"
+          :market="snapshot.market"
+        />
       </div>
 
       <div class="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-4">

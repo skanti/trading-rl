@@ -5,6 +5,14 @@ dashboard:
   url: "https://trading-dashboard-ccdd5.web.app"
   title: "Overnight Liquidity"
 
+# Naive weekday timetable shown in the dashboard pipeline. Keep these aligned with the
+# flags used to launch the trading daemon; Alpaca's clock supplies actual market opens.
+schedule:
+  time_zone: "America/New_York"
+  ranking_time: "15:00"
+  entry_time: "15:59"
+  exit_time: "09:00"
+
 auth:
   # Dashboard login. The username is bridged to a Firebase Auth account as
   # `<username>@<email_domain>`; run `dashboard/scripts/provision_auth_user.py` after

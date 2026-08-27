@@ -540,7 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-path", default=None, help="strategy state.json (default: <work-dir>/state.json)")
     parser.add_argument("--dry-run", action="store_true", help="print one snapshot and exit")
     parser.add_argument("--once", action="store_true", help="publish one snapshot and exit")
-    parser.add_argument("--interval-seconds", type=float, default=300.0)
+    parser.add_argument("--interval-seconds", type=float, default=120.0)
     parser.add_argument("--sessions-limit", type=int, default=120)
     parser.add_argument(
         "--digest-state-path",
