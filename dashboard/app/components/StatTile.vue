@@ -13,8 +13,8 @@ withDefaults(defineProps<{
 </script>
 
 <template>
-  <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-    <div class="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-400">
+  <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-3 sm:p-4">
+    <div class="flex items-center gap-1.5 text-[0.6875rem] font-medium uppercase tracking-wide text-slate-400 sm:gap-2 sm:text-xs">
       <UIcon
         v-if="icon"
         :name="icon"
@@ -23,14 +23,14 @@ withDefaults(defineProps<{
       {{ label }}
     </div>
     <p
-      class="numeric mt-2 text-2xl font-semibold"
+      class="numeric mt-1.5 text-xl font-semibold sm:mt-2 sm:text-2xl"
       :class="tone"
     >
       {{ value }}
     </p>
     <p
       v-if="hint"
-      class="numeric mt-1 text-xs text-slate-500"
+      class="numeric mt-0.5 text-xs text-slate-500 sm:mt-1"
     >
       {{ hint }}
     </p>

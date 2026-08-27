@@ -16,7 +16,7 @@ const rows = computed(() =>
         Performance
       </h2>
       <p class="text-xs text-slate-500">
-        Account equity, measured from the close before each period opened
+        Open positions are live; longer periods use closed sessions
       </p>
     </div>
 
@@ -72,7 +72,8 @@ const rows = computed(() =>
             >
               {{ formatSignedPercent(row.pnl_pct) }}
             </td>
-            <!-- Every bucket ends on the same live equity, so show it once. -->
+            <!-- The first row carries current account equity; the remaining rows omit
+                 their realized-curve endpoint to keep the table compact. -->
             <td class="numeric hidden whitespace-nowrap px-4 py-2.5 text-right text-slate-300 sm:table-cell">
               {{ index === 0 ? formatCurrency(row.end_equity) : '' }}
             </td>

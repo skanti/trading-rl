@@ -33,7 +33,7 @@ async function handleSignOut() {
 <template>
   <div class="min-h-screen min-w-0 overflow-x-clip bg-slate-950 text-slate-100">
     <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/85 backdrop-blur">
-      <div class="mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-3 py-3 sm:px-4 md:flex md:gap-x-6">
+      <div class="mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-2 py-3 sm:px-4 md:flex md:gap-x-6">
         <NuxtLink
           to="/"
           class="flex min-w-0 items-center gap-2"
@@ -99,7 +99,7 @@ async function handleSignOut() {
       </div>
     </header>
 
-    <main class="mx-auto min-w-0 w-full max-w-6xl px-3 py-5 sm:px-4 sm:py-6">
+    <main class="mx-auto min-w-0 w-full max-w-6xl px-2 py-5 sm:px-4 sm:py-6">
       <slot />
     </main>
   </div>

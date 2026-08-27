@@ -7,9 +7,37 @@ await ensureLoaded()
 
 const account = computed(() => snapshot.value?.account ?? {})
 const stats = computed(() => snapshot.value?.statistics)
-const today = computed(() => snapshot.value?.performance?.today)
 const inception = computed(() => snapshot.value?.performance?.inception)
 const curve = computed(() => snapshot.value?.equity_curve ?? [])
+const openPerformance = computed(() => {
+  const positions = snapshot.value?.positions ?? []
+  const pnl = positions.reduce((sum, position) => sum + (position.unrealized_pl ?? 0), 0)
+  const cost = positions.reduce((sum, position) => sum + (position.cost_basis ?? 0), 0)
+  return { pnl, pnlPct: cost > 0 ? pnl / cost : 0, cost, positions: positions.length }
+})
+const displayedPerformance = computed(() => {
+  const published = snapshot.value?.performance
+  if (!published) return null
+
+  return {
+    ...published,
+    today: {
+      ...published.today,
+      label: 'Open positions',
+      start_day: snapshot.value?.strategy?.entry_date ?? published.today.start_day,
+      start_equity: openPerformance.value.cost,
+      end_equity: account.value.equity ?? openPerformance.value.cost + openPerformance.value.pnl,
+      pnl: openPerformance.value.pnl,
+      pnl_pct: openPerformance.value.pnlPct,
+      sessions: openPerformance.value.positions ? 1 : 0
+    }
+  }
+})
+const winLossLabel = computed(() => {
+  const wins = stats.value?.winning_sessions ?? 0
+  const losses = stats.value?.losing_sessions ?? 0
+  return `${wins} ${wins === 1 ? 'win' : 'wins'} / ${losses} ${losses === 1 ? 'loss' : 'losses'}`
+})
 
 const recentSessions = computed(() => sessions.value.slice(0, 8))
 </script>
@@ -29,7 +57,7 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
       v-if="pending && !snapshot"
       class="space-y-5"
     >
-      <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div class="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-4">
         <USkeleton
           v-for="index in 4"
           :key="index"
@@ -70,13 +98,13 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
         </div>
       </div>
 
-      <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div class="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-4">
         <StatTile
-          label="Realized today"
-          icon="i-lucide-calendar"
-          :value="formatSignedCurrency(today?.pnl)"
-          :tone="toneClass(today?.pnl)"
-          :hint="formatSignedPercent(today?.pnl_pct)"
+          label="Open P&amp;L"
+          icon="i-lucide-activity"
+          :value="formatSignedCurrency(openPerformance.pnl)"
+          :tone="toneClass(openPerformance.pnl)"
+          :hint="formatSignedPercent(openPerformance.pnlPct)"
         />
         <StatTile
           label="Realized since inception"
@@ -96,7 +124,7 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
           label="Win rate"
           icon="i-lucide-target"
           :value="formatPercent(stats?.win_rate, 1)"
-          :hint="`${stats?.winning_sessions ?? 0}W / ${stats?.losing_sessions ?? 0}L`"
+          :hint="winLossLabel"
         />
       </div>
 
@@ -104,10 +132,13 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
         :points="curve"
         :baseline="inception?.start_equity"
         :sessions="stats?.sessions"
+        :open-pnl="openPerformance.pnl"
+        :open-day="snapshot.trading_day"
+        :open-positions="openPerformance.positions"
       />
 
       <div class="grid gap-5 lg:grid-cols-2">
-        <PerformanceTable :performance="snapshot.performance" />
+        <PerformanceTable :performance="displayedPerformance" />
 
         <div class="rounded-xl border border-slate-800 bg-slate-900/50">
           <div class="border-b border-slate-800 px-4 py-3">
