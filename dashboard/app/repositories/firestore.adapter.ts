@@ -7,7 +7,7 @@ import {
   limit as limitTo,
   orderBy,
   query
-} from 'firebase/firestore'
+} from 'firebase/firestore/lite'
 import type { SnapshotRepository } from './types'
 import type { SessionRecord, Snapshot } from '~/types/dashboard'
 

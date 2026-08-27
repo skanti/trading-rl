@@ -59,6 +59,12 @@ export default defineNuxtConfig({
     preference: 'dark'
   },
 
+  ui: {
+    // The dashboard is small enough that native system fonts are preferable to
+    // downloading dozens of Inter and JetBrains Mono variants.
+    fonts: false
+  },
+
   runtimeConfig: {
     public: {
       dashboardTitle: config.dashboard?.title ?? 'Trading dashboard',

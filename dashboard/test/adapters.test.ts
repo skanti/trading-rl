@@ -8,7 +8,7 @@ const store = {
   sessions: [] as unknown[]
 }
 
-vi.mock('firebase/firestore', () => ({
+vi.mock('firebase/firestore/lite', () => ({
   doc: (_firestore: unknown, collection: string, id: string) => ({ path: `${collection}/${id}` }),
   collection: (parent: { path: string }, name: string) => ({ path: `${parent.path}/${name}` }),
   getDoc: async () => ({
