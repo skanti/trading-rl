@@ -873,6 +873,25 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         _metric_text(summary),
     )
     details.add_row("Cost", f"{summary['transaction_cost_bps_per_side']:.2f} bps per side")
+    if summary.get("budget") is not None:
+        details.add_row(
+            "Position sizing",
+            f"{summary['share_mode']} shares from ${float(summary['budget']):,.0f} initial equity; "
+            f"ending ${float(summary['ending_equity']):,.2f}; "
+            f"mean deployed ${float(summary['average_capital_deployed']):,.2f} "
+            f"({float(summary['average_capital_utilization']):.2%}), "
+            f"mean basket {float(summary['average_executed_basket_size']):.2f}/"
+            f"{int(summary['basket_size'])}",
+        )
+        if summary["share_mode"] == "whole":
+            details.add_row(
+                "Whole-share effects",
+                f"minimum utilization {float(summary['minimum_capital_utilization']):.2%}; "
+                f"minimum basket {int(summary['minimum_executed_basket_size'])}/"
+                f"{int(summary['basket_size'])}; skipped selections "
+                f"{int(summary['skipped_selections']):,}; mean weight spread "
+                f"{float(summary['average_position_weight_spread']):.2%}",
+            )
     details.add_row(
         "KPI sampling",
         f"daily at {str(summary['exit_time_eastern']).split()[0]}; "
@@ -1063,6 +1082,34 @@ def print_symbol_trade_counts(
     output.print(table)
 
 
+def basket_quantities(
+    entry_prices: np.ndarray,
+    budget: float,
+    share_mode: str = "fractional",
+) -> np.ndarray:
+    """Size one equal-notional basket in fractional or whole shares.
+
+    Whole-share sizing deliberately rounds each name down independently. This never
+    exceeds the budget and never redistributes a costly name's unused allocation into
+    cheaper names, which would change the strategy's intended equal weighting. A stock
+    priced above its per-name target therefore receives zero shares and its allocation
+    remains cash.
+    """
+    prices = np.asarray(entry_prices, dtype=np.float64)
+    if prices.ndim != 1 or not prices.size:
+        raise ValueError("entry_prices must be a non-empty one-dimensional array")
+    if not np.isfinite(prices).all() or (prices <= 0.0).any():
+        raise ValueError("entry_prices must be finite and positive")
+    if not np.isfinite(budget) or float(budget) <= 0.0:
+        raise ValueError("budget must be finite and positive")
+    if share_mode not in {"fractional", "whole"}:
+        raise ValueError("share_mode must be 'fractional' or 'whole'")
+
+    target_notional = float(budget) / prices.size
+    quantities = target_notional / prices
+    return np.floor(quantities) if share_mode == "whole" else quantities
+
+
 def run_backtest(
     dates: pd.DatetimeIndex,
     symbols: np.ndarray,
@@ -1095,11 +1142,20 @@ def run_backtest(
     margin_interest_rate: float = 0.0,
     maintenance_margin: float = MAINTENANCE_MARGIN,
     reference_symbol: str = REFERENCE_SYMBOL,
+    share_mode: str = "fractional",
+    budget: float | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if transaction_cost_bps < 0.0:
         raise ValueError("transaction_cost_bps must be non-negative")
     if int(minimum_trading_days) < 1:
         raise ValueError("minimum_trading_days must be positive")
+    if share_mode not in {"fractional", "whole"}:
+        raise ValueError("share_mode must be 'fractional' or 'whole'")
+    if budget is not None and (not np.isfinite(budget) or float(budget) <= 0.0):
+        raise ValueError("budget must be finite and positive")
+    if share_mode == "whole" and budget is None:
+        raise ValueError("whole-share sizing requires a budget")
+    simulation_budget = float(budget) if budget is not None else 1.0
     scores = liquidity_scores(
         dollar_volume,
         alpaca_share_volume,
@@ -1137,6 +1193,7 @@ def run_backtest(
     pieces: list[pd.DataFrame] = []
     spy_returns: list[float] = []
     spy_exit_prices: list[float] = []
+    current_equity = simulation_budget
     for date_index in entries:
         executable_entries = np.where(
             entry_staleness[date_index, stock_mask] <= int(max_entry_staleness_minutes),
@@ -1161,6 +1218,22 @@ def run_backtest(
             issuers=issuers if dedupe_share_classes else None,
         )
         selected = stock_indices[selected_local]
+        selected_ranks = np.arange(int(exclude_top) + 1, int(top) + 1)
+        selected_entries = entry_prices[date_index, selected]
+        session_budget = current_equity
+        quantities = basket_quantities(selected_entries, session_budget, share_mode)
+        executed = quantities > 0.0
+        skipped = int((~executed).sum())
+        if not executed.any():
+            raise ValueError(
+                f"equity ${session_budget:,.2f} cannot buy one share from the selected "
+                f"basket on {dates[date_index].date()}"
+            )
+        selected = selected[executed]
+        selected_local = selected_local[executed]
+        selected_ranks = selected_ranks[executed]
+        selected_entries = selected_entries[executed]
+        quantities = quantities[executed]
         exits = morning_prices[date_index + 1, selected]
         exit_staleness = morning_staleness[date_index + 1, selected]
         missing_exit = (
@@ -1174,23 +1247,45 @@ def run_backtest(
                 f"selected symbols lack a fresh next-session exit on {dates[date_index].date()}: "
                 + ", ".join(missing.tolist())
             )
-        gross = exits / entry_prices[date_index, selected] - 1.0
+        gross = exits / selected_entries - 1.0
+        entry_notional = quantities * selected_entries
+        exit_notional = quantities * exits
+        net_return = gross - cost
+        gross_pnl = exit_notional - entry_notional
+        transaction_cost_dollars = entry_notional * cost
+        net_pnl = entry_notional * net_return
+        session_net_pnl = float(net_pnl.sum())
+        session_return = session_net_pnl / session_budget
+        current_equity = session_budget + session_net_pnl
         pieces.append(
             pd.DataFrame(
                 {
                     "entry_date": str(dates[date_index].date()),
                     "exit_date": str(dates[date_index + 1].date()),
                     "liquidity_scheme": liquidity_scheme,
-                    "rank": np.arange(int(exclude_top) + 1, int(top) + 1),
+                    "rank": selected_ranks,
                     "sample_id": symbols[selected],
                     "liquidity_score": scores[date_index, selected],
-                    "entry_price": entry_prices[date_index, selected],
+                    "share_mode": share_mode,
+                    "budget": session_budget,
+                    "target_notional": session_budget / (int(top) - int(exclude_top)),
+                    "portfolio_start_equity": session_budget,
+                    "portfolio_end_equity": current_equity,
+                    "portfolio_return": session_return,
+                    "quantity": quantities,
+                    "entry_price": selected_entries,
                     "exit_price": exits,
+                    "entry_notional": entry_notional,
+                    "exit_notional": exit_notional,
                     "entry_staleness_minutes": entry_staleness[date_index, selected],
                     "exit_staleness_minutes": exit_staleness,
                     "gross_return": gross,
+                    "gross_pnl": gross_pnl,
                     "transaction_cost": cost,
-                    "net_return": gross - cost,
+                    "transaction_cost_dollars": transaction_cost_dollars,
+                    "net_return": net_return,
+                    "net_pnl": net_pnl,
+                    "skipped_selections": skipped,
                 }
             )
         )
@@ -1207,7 +1302,10 @@ def run_backtest(
         spy_exit_prices.append(float(spy_exit))
 
     trades = pd.concat(pieces, ignore_index=True)
-    unlevered_daily = trades.groupby("entry_date", sort=True).net_return.mean()
+    deployed_by_entry = trades.groupby("entry_date", sort=True).entry_notional.sum()
+    equity_by_entry = trades.groupby("entry_date", sort=True).portfolio_start_equity.first()
+    utilization_by_entry = deployed_by_entry / equity_by_entry
+    unlevered_daily = trades.groupby("entry_date", sort=True).portfolio_return.first()
 
     # Leverage is not a free scalar. Scaling returns alone leaves the Sharpe ratio
     # unchanged, so it would say nothing. What makes it a real trade-off is the borrow
@@ -1228,6 +1326,7 @@ def run_backtest(
         max(0.0, leverage - 1.0)
         * float(margin_interest_rate)
         * holding_days
+        * utilization_by_entry
         / MARGIN_INTEREST_DIVISOR
     )
     daily = float(leverage) * unlevered_daily - borrow_per_session
@@ -1279,6 +1378,11 @@ def run_backtest(
         keys = [resolved[symbol] for symbol in group.sample_id]
         same_issuer_days += len(keys) != len(set(keys))
 
+    executed_basket_sizes = trades.groupby("entry_date", sort=True).size()
+    position_weights = trades.entry_notional / trades.groupby("entry_date").entry_notional.transform("sum")
+    weight_spreads = position_weights.groupby(trades.entry_date).agg(lambda values: values.max() - values.min())
+    skipped_by_entry = trades.groupby("entry_date", sort=True).skipped_selections.first()
+
     liquidity_descriptions = {
         "dollar_ema": "completed regular-session dollar volume",
         "activity_union_ema": "activity-screened completed-session dollar volume",
@@ -1297,6 +1401,17 @@ def run_backtest(
         "top": int(top),
         "exclude_top": int(exclude_top),
         "basket_size": int(top) - int(exclude_top),
+        "share_mode": share_mode,
+        "budget": float(budget) if budget is not None else None,
+        "ending_equity": float(simulation_budget * np.prod(1.0 + daily.to_numpy())),
+        "net_profit": float(simulation_budget * (np.prod(1.0 + daily.to_numpy()) - 1.0)),
+        "average_capital_deployed": float(deployed_by_entry.mean()),
+        "average_capital_utilization": float(utilization_by_entry.mean()),
+        "minimum_capital_utilization": float(utilization_by_entry.min()),
+        "average_executed_basket_size": float(executed_basket_sizes.mean()),
+        "minimum_executed_basket_size": int(executed_basket_sizes.min()),
+        "skipped_selections": int(skipped_by_entry.sum()),
+        "average_position_weight_spread": float(weight_spreads.mean()),
         "liquidity_metric": liquidity_descriptions[liquidity_scheme],
         "ema_span_sessions": int(ema_span),
         "minimum_liquidity_history_sessions": int(min_history_days),
@@ -1411,6 +1526,18 @@ def main() -> None:
     parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:55"))
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:45"))
     parser.add_argument("--transaction-cost-bps", type=float, default=0.0, help="cost per side")
+    parser.add_argument(
+        "--share-mode",
+        choices=("fractional", "whole"),
+        default="fractional",
+        help="fractional preserves exact equal notionals; whole rounds each allocation down",
+    )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        help="initial portfolio equity, compounded between baskets; required by --share-mode whole",
+    )
     parser.add_argument("--max-entry-staleness-minutes", type=int, default=10)
     parser.add_argument(
         "--max-exit-staleness-minutes",
@@ -1480,6 +1607,10 @@ def main() -> None:
         # Without a borrow rate the result is a pure scalar multiple and the Sharpe
         # ratio is unchanged, which would be misleading rather than merely incomplete.
         parser.error("--margin-interest-rate is required when --leverage exceeds 1.0")
+    if args.budget is not None and args.budget <= 0.0:
+        parser.error("--budget must be positive")
+    if args.share_mode == "whole" and args.budget is None:
+        parser.error("--budget is required when --share-mode whole")
 
     if (
         args.months < 1
@@ -1665,6 +1796,8 @@ def main() -> None:
             ranking_minute=args.ranking_time,
             entry_minute=args.entry_time,
             exit_minute=args.exit_time,
+            share_mode=args.share_mode,
+            budget=args.budget,
         )
         scheme_summary["cache_path"] = str(cache_path)
         scheme_summary["asset_filter"] = args.asset_filter

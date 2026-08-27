@@ -103,6 +103,37 @@ python -m baseline.overnight_liquidity \
 
 Change only `--top 50` to run the top-50 basket. The liquidity cache is shared.
 
+### Fractional versus whole-share sizing
+
+The default `--share-mode fractional` preserves the original exact equal-notional
+simulation. Give it initial portfolio equity when comparing it with integer shares;
+each exit's P&L is rolled into the next basket:
+
+```bash
+python -m baseline.overnight_liquidity \
+  --top 12 \
+  --months 12 \
+  --budget 10000 \
+  --share-mode fractional
+```
+
+Use `--share-mode whole` to floor every selected stock's target allocation to a whole
+number of shares:
+
+```bash
+python -m baseline.overnight_liquidity \
+  --top 12 \
+  --months 12 \
+  --budget 10000 \
+  --share-mode whole
+```
+
+Rounding is conservative: unused dollars remain cash rather than being reassigned to
+cheaper names. A stock whose entry price exceeds its equal-notional target receives zero
+shares for that session. The report includes deployed capital, utilization, executed
+basket size, skipped selections, and the spread between the largest and smallest
+position weights.
+
 To trade only liquidity ranks 51--100, excluding the 50 most-liquid stocks:
 
 ```bash

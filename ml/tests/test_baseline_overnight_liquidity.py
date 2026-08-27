@@ -9,6 +9,7 @@ from rich.console import Console
 from baseline.overnight_liquidity import (
     _symbol_daily_arrays,
     activity_union_candidate_mask,
+    basket_quantities,
     causal_ema_log_liquidity,
     causal_completed_trading_days,
     company_universe_mask,
@@ -17,12 +18,76 @@ from baseline.overnight_liquidity import (
     print_scheme_comparison,
     print_symbol_trade_counts,
     print_summary_table,
+    run_backtest,
     strategy_metrics,
     top_liquid_indices,
 )
 
 
 class OvernightLiquidityBaselineTest(unittest.TestCase):
+    def test_whole_share_sizing_rounds_down_without_exceeding_budget(self):
+        prices = np.array([120.0, 300.0, 700.0])
+
+        fractional = basket_quantities(prices, 1_200.0, "fractional")
+        whole = basket_quantities(prices, 1_200.0, "whole")
+
+        np.testing.assert_allclose(fractional, [10 / 3, 4 / 3, 4 / 7])
+        np.testing.assert_array_equal(whole, [3.0, 1.0, 0.0])
+        self.assertLessEqual(float(np.dot(whole, prices)), 1_200.0)
+        self.assertTrue(np.equal(whole, np.floor(whole)).all())
+
+    def test_whole_share_backtest_weights_returns_by_integer_notional_and_idle_cash(self):
+        dates = pd.date_range("2026-08-24", periods=4, freq="B")
+        symbols = np.array(["ST-SPY", "ST-A", "ST-B"])
+        dollar_volume = np.array(
+            [
+                [1_000.0, 3_000.0, 2_000.0],
+                [1_000.0, 3_100.0, 2_100.0],
+                [1_000.0, 3_200.0, 2_200.0],
+                [1_000.0, 3_300.0, 2_300.0],
+            ]
+        )
+        activity = np.ones_like(dollar_volume)
+        entry_prices = np.array([[100.0, 100.0, 300.0]] * 4)
+        morning_prices = entry_prices.copy()
+        morning_prices[3] = [100.0, 110.0, 270.0]
+        staleness = np.zeros_like(entry_prices)
+
+        common = dict(
+            dates=dates,
+            symbols=symbols,
+            dollar_volume=dollar_volume,
+            alpaca_share_volume=activity,
+            alpaca_trade_count=activity,
+            entry_prices=entry_prices,
+            morning_prices=morning_prices,
+            entry_staleness=staleness,
+            morning_staleness=staleness,
+            start_date=dates[2],
+            end_date=dates[3],
+            top=2,
+            exclude_top=0,
+            ema_span=1,
+            min_history_days=1,
+            minimum_trading_days=1,
+            transaction_cost_bps=0.0,
+            max_entry_staleness_minutes=0,
+            max_exit_staleness_minutes=0,
+            budget=1_000.0,
+        )
+
+        fractional_trades, fractional_summary = run_backtest(
+            **common, share_mode="fractional"
+        )
+        whole_trades, whole_summary = run_backtest(**common, share_mode="whole")
+
+        self.assertAlmostEqual(fractional_summary["strategy_metrics"]["mean_return"], 0.0)
+        self.assertAlmostEqual(whole_summary["strategy_metrics"]["mean_return"], 0.02)
+        np.testing.assert_array_equal(whole_trades.quantity, [5.0, 1.0])
+        self.assertAlmostEqual(float(whole_trades.entry_notional.sum()), 800.0)
+        self.assertAlmostEqual(whole_summary["average_capital_utilization"], 0.8)
+        self.assertAlmostEqual(fractional_summary["average_capital_utilization"], 1.0)
+
     def test_completed_trading_day_count_is_strictly_lagged(self):
         volume = np.array(
             [
