@@ -151,15 +151,16 @@ class AlpacaClient:
     def positions(self) -> list[dict[str, Any]]:
         return list(self._get("positions"))
 
-    def portfolio_history(self, period: str = "1A", timeframe: str = "1D") -> dict[str, Any]:
-        return dict(
-            self._get(
-                "account/portfolio/history",
-                period=period,
-                timeframe=timeframe,
-                extended_hours="false",
-            )
-        )
+    def portfolio_history(
+        self,
+        period: str = "1A",
+        timeframe: str = "1D",
+        intraday_reporting: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, object] = {"period": period, "timeframe": timeframe}
+        if intraday_reporting:
+            params["intraday_reporting"] = intraday_reporting
+        return dict(self._get("account/portfolio/history", **params))
 
     def orders(self, *, after: str) -> list[dict[str, Any]]:
         return list(
@@ -355,6 +356,18 @@ def build_snapshot(
 
     account = client.account()
     positions = client.positions()
+    try:
+        clock = client.clock()
+        market = {
+            "is_open": bool(clock.get("is_open")),
+            "next_open": clock.get("next_open"),
+            "next_close": clock.get("next_close"),
+            "timestamp": clock.get("timestamp")
+        }
+    except Exception:  # noqa: BLE001 - the clock is decoration, not data
+        LOGGER.warning("could not read the market clock; publishing without it")
+        market = {}
+
     period = performance.history_period(inception or account.get("created_at"), reference)
     history = client.portfolio_history(period=period, timeframe="1D")
 
@@ -369,6 +382,23 @@ def build_snapshot(
             series_start = None
 
     series = performance.equity_series(history, since=series_start)
+    try:
+        intraday_history = client.portfolio_history(
+            period="7D",
+            timeframe="1H",
+            intraday_reporting="market_hours",
+        )
+        series = performance.append_provisional_close(
+            series,
+            intraday_history,
+            now=reference,
+            market_is_open=bool(market.get("is_open", True)),
+            base_value=performance.inception_equity(history, series),
+            since=series_start,
+        )
+    except Exception:  # noqa: BLE001 - official daily history remains authoritative
+        LOGGER.warning("could not load intraday history; publishing finalized closes only")
+
     buckets = performance.performance_table(series, account, history, now=reference)
     stats = performance.statistics(series)
 
@@ -388,18 +418,6 @@ def build_snapshot(
         except Exception:  # noqa: BLE001 - fill detail is optional dashboard decoration
             LOGGER.warning("could not reconcile partial exit fills from order history")
 
-    try:
-        clock = client.clock()
-        market = {
-            "is_open": bool(clock.get("is_open")),
-            "next_open": clock.get("next_open"),
-            "next_close": clock.get("next_close"),
-            "timestamp": clock.get("timestamp")
-        }
-    except Exception:  # noqa: BLE001 - the clock is decoration, not data
-        LOGGER.warning("could not read the market clock; publishing without it")
-        market = {}
-
     return {
         "version": SNAPSHOT_VERSION,
         "updated_at": reference.isoformat(),
@@ -412,7 +430,8 @@ def build_snapshot(
                 "day": point.day.isoformat(),
                 "equity": point.equity,
                 "profit_loss": point.profit_loss,
-                "profit_loss_pct": point.profit_loss_pct
+                "profit_loss_pct": point.profit_loss_pct,
+                **({"provisional": True} if point.provisional else {})
             }
             for point in series
         ],

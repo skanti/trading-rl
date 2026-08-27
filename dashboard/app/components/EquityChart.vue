@@ -136,11 +136,9 @@ function shortDay(day: string | null | undefined): string {
             ({{ formatSignedPercent(active?.changePct ?? (anchor ? (latest - anchor) / anchor : 0)) }})
           </p>
           <p class="numeric text-xs text-slate-500">
-            <!-- Without a hover this is the last close, which can differ from live
-                 account equity; say so rather than showing two unexplained figures. -->
             {{ active
-              ? dayLabel(active.point.day)
-              : `Last close · ${dayLabel(points[points.length - 1]?.day)}` }}
+              ? `${active.point.provisional ? 'Provisional close · ' : ''}${dayLabel(active.point.day)}`
+              : `${points[points.length - 1]?.provisional ? 'Provisional close' : 'Last close'} · ${dayLabel(points[points.length - 1]?.day)}` }}
           </p>
         </div>
       </div>

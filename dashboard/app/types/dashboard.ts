@@ -24,6 +24,7 @@ export interface EquityPoint {
   equity: number
   profit_loss: number
   profit_loss_pct: number
+  provisional?: boolean
 }
 
 export interface AccountSummary {

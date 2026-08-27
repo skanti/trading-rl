@@ -39,6 +39,13 @@ def history(rows: list[tuple[date, float]]) -> dict[str, object]:
     }
 
 
+def intraday_history(rows: list[tuple[datetime, float]]) -> dict[str, object]:
+    return {
+        "timestamp": [moment.timestamp() for moment, _ in rows],
+        "equity": [equity for _, equity in rows],
+    }
+
+
 def order(qty: float, price: float) -> dict[str, str]:
     return {"filled_qty": str(qty), "filled_avg_price": str(price)}
 
@@ -62,7 +69,7 @@ class FakeAlpacaClient:
     def positions(self):
         return [{"symbol": "NVDA", "qty": "10", "market_value": "1100"}]
 
-    def portfolio_history(self, period="1A", timeframe="1D"):
+    def portfolio_history(self, period="1A", timeframe="1D", intraday_reporting=None):
         return dict(self._history)
 
     def clock(self):
@@ -100,6 +107,61 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(set(table), set(metrics.BUCKET_ORDER))
         self.assertEqual(table["today"].pnl, 5.0)
         self.assertEqual(metrics.statistics(series).max_drawdown, 30.0)
+
+    def test_delayed_daily_close_is_backfilled_from_completed_intraday_session(self):
+        series = metrics.equity_series(history([(date(2026, 8, 25), 99987.75)]))
+        intraday = intraday_history(
+            [
+                (datetime(2026, 8, 26, 14, 30, tzinfo=metrics.EASTERN), 99960.0),
+                (datetime(2026, 8, 26, 15, 30, tzinfo=metrics.EASTERN), 99954.52),
+            ]
+        )
+
+        result = metrics.append_provisional_close(
+            series,
+            intraday,
+            now=datetime(2026, 8, 27, 1, 30, tzinfo=metrics.EASTERN),
+            market_is_open=False,
+            base_value=100000.0,
+        )
+
+        self.assertEqual([point.day for point in result], [date(2026, 8, 25), date(2026, 8, 26)])
+        self.assertAlmostEqual(result[-1].equity, 99954.52)
+        self.assertAlmostEqual(result[-1].profit_loss, -45.48)
+        self.assertTrue(result[-1].provisional)
+
+    def test_provisional_close_never_uses_an_open_session(self):
+        series = metrics.equity_series(history([(date(2026, 8, 25), 99987.75)]))
+        intraday = intraday_history(
+            [(datetime(2026, 8, 26, 10, 30, tzinfo=metrics.EASTERN), 100100.0)]
+        )
+
+        result = metrics.append_provisional_close(
+            series,
+            intraday,
+            now=datetime(2026, 8, 26, 12, 0, tzinfo=metrics.EASTERN),
+            market_is_open=True,
+            base_value=100000.0,
+        )
+
+        self.assertEqual(result, series)
+
+    def test_official_daily_close_wins_over_intraday_fallback(self):
+        series = metrics.equity_series(history([(date(2026, 8, 26), 99955.0)]))
+        intraday = intraday_history(
+            [(datetime(2026, 8, 26, 15, 30, tzinfo=metrics.EASTERN), 99954.52)]
+        )
+
+        result = metrics.append_provisional_close(
+            series,
+            intraday,
+            now=datetime(2026, 8, 27, 1, 30, tzinfo=metrics.EASTERN),
+            market_is_open=False,
+            base_value=100000.0,
+        )
+
+        self.assertEqual(result, series)
+        self.assertFalse(result[-1].provisional)
 
     def test_closed_basket_totals(self):
         trades = metrics.closed_basket(

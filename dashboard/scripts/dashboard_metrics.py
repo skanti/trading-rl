@@ -47,6 +47,7 @@ class EquityPoint:
     equity: float
     profit_loss: float
     profit_loss_pct: float
+    provisional: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,12 +127,15 @@ class Statistics:
 def _point_dict(point: EquityPoint | None) -> dict[str, Any] | None:
     if point is None:
         return None
-    return {
+    result = {
         "day": point.day.isoformat(),
         "equity": point.equity,
         "profit_loss": point.profit_loss,
         "profit_loss_pct": point.profit_loss_pct
     }
+    if point.provisional:
+        result["provisional"] = True
+    return result
 
 
 def session_date(epoch_seconds: float) -> date:
@@ -202,6 +206,66 @@ def equity_series(
     # A same-day duplicate can appear when a period boundary overlaps; keep the last.
     deduplicated: dict[date, EquityPoint] = {point.day: point for point in points}
     return [deduplicated[day] for day in sorted(deduplicated)]
+
+
+def append_provisional_close(
+    series: Sequence[EquityPoint],
+    intraday_history: Mapping[str, Any],
+    *,
+    now: datetime,
+    market_is_open: bool,
+    base_value: float,
+    since: date | None = None
+) -> list[EquityPoint]:
+    """Backfill a delayed daily close from Alpaca's hourly market-hours history.
+
+    Alpaca's 1D portfolio history can lag its intraday history during overnight
+    processing. The last hourly point for a completed regular session is a useful
+    provisional close, but a point from the currently open session is not. Rebuilding
+    this list on every publish means the official daily point automatically replaces
+    the provisional one without accumulating extra Firestore documents.
+    """
+    reference = now.astimezone(EASTERN)
+    timestamps = list(intraday_history.get("timestamp") or [])
+    equities = list(intraday_history.get("equity") or [])
+    candidates: dict[date, float] = {}
+
+    for index, stamp in enumerate(timestamps):
+        if index >= len(equities):
+            break
+        equity = equities[index]
+        if equity is None:
+            continue
+        moment = datetime.fromtimestamp(float(stamp), tz=timezone.utc).astimezone(EASTERN)
+        if since is not None and moment.date() < since:
+            continue
+        if moment.date() > reference.date():
+            continue
+        if moment.date() == reference.date() and market_is_open:
+            continue
+        # Timestamps are ordered by Alpaca; retaining the last value gives us the
+        # final hourly market-hours bucket for each session.
+        candidates[moment.date()] = _float(equity)
+
+    if not candidates:
+        return list(series)
+
+    latest_day = max(candidates)
+    if series and latest_day <= series[-1].day:
+        return list(series)
+
+    equity = candidates[latest_day]
+    pnl = equity - base_value
+    return [
+        *series,
+        EquityPoint(
+            day=latest_day,
+            equity=equity,
+            profit_loss=pnl,
+            profit_loss_pct=(pnl / base_value) if base_value > 0.0 else 0.0,
+            provisional=True,
+        ),
+    ]
 
 
 def inception_equity(history: Mapping[str, Any], series: Sequence[EquityPoint]) -> float:
