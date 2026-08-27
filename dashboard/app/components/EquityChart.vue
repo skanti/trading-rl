@@ -32,8 +32,8 @@ const geometry = computed(() => ({
   width: chartWidth.value,
   height: props.height,
   padding: compact.value
-    ? { top: 16, right: 12, bottom: 32, left: 64 }
-    : { top: 16, right: 16, bottom: 32, left: 72 }
+    ? { top: 10, right: 8, bottom: 24, left: 50 }
+    : { top: 12, right: 12, bottom: 26, left: 60 }
 }))
 const scale = computed(() => buildScale(props.points, geometry.value))
 
@@ -109,7 +109,7 @@ function shortDay(day: string | null | undefined): string {
 </script>
 
 <template>
-  <div class="relative rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+  <div class="relative rounded-xl border border-slate-800 bg-slate-900/50 p-3 sm:p-4">
     <div
       v-if="!points.length"
       class="flex h-48 items-center justify-center text-sm text-slate-500"
@@ -195,7 +195,7 @@ function shortDay(day: string | null | undefined): string {
             <text
               v-for="row in grid"
               :key="`label-${row.value}`"
-              :x="geometry.padding.left - 8"
+              :x="geometry.padding.left - 6"
               :y="row.y + 4"
               text-anchor="end"
               fill="#64748b"
@@ -252,23 +252,12 @@ function shortDay(day: string | null | undefined): string {
             v-for="tick in ticks"
             :key="`tick-${tick.index}`"
             :x="tick.x"
-            :y="height - 8"
+            :y="height - 6"
             :text-anchor="tick.anchor"
             fill="#64748b"
             :font-size="compact ? 10 : 11"
           >{{ tick.label }}</text>
         </svg>
-
-        <div class="mt-1 flex items-start justify-between gap-4 px-1 text-[11px] text-slate-500 sm:hidden">
-          <span>
-            <span class="block uppercase tracking-wide text-slate-600">Start</span>
-            {{ dayLabel(points[0]?.day) }}
-          </span>
-          <span class="text-right">
-            <span class="block uppercase tracking-wide text-slate-600">Latest</span>
-            {{ dayLabel(points[points.length - 1]?.day) }}
-          </span>
-        </div>
       </div>
     </template>
   </div>
