@@ -5,8 +5,6 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
-import numpy as np
-
 from baseline.live_overnight_liquidity import (
     DEFAULT_EXCHANGES,
     EASTERN,
@@ -30,7 +28,7 @@ from baseline.live_overnight_liquidity import (
 )
 
 
-def config(top=2):
+def config(top=2, fill_timeout_seconds=1.0):
     return StrategyConfig(
         top=top,
         ema_span=2,
@@ -45,7 +43,7 @@ def config(top=2):
         capital=None,
         capital_fraction=0.95,
         cash_buffer_fraction=0.02,
-        fill_timeout_seconds=1.0,
+        fill_timeout_seconds=fill_timeout_seconds,
         poll_seconds=0.001,
     )
 
@@ -143,6 +141,16 @@ class FakeQueuedBroker(FakeBroker):
         }
         self.orders[payload["client_order_id"]] = order
         return order
+
+
+class FakeWorkingExitBroker(FakeQueuedBroker):
+    def __init__(self):
+        super().__init__()
+        self.cancellations = []
+
+    def cancel_order(self, order_id):
+        self.cancellations.append(order_id)
+        raise AssertionError("a working exit order must not be canceled on the fill timeout")
 
 
 class FakeClockBroker:
@@ -368,12 +376,19 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         )
         self.assertEqual(budget, 950.0)
 
-    def test_budget_respects_reserved_non_marginable_buying_power(self):
+    def test_budget_does_not_treat_non_marginable_power_as_stock_cash(self):
         budget = available_budget(
             {"cash": "1000", "buying_power": "4000", "non_marginable_buying_power": "600"},
             config(top=10),
         )
-        self.assertEqual(budget, 588.0)
+        self.assertEqual(budget, 950.0)
+
+    def test_budget_respects_regular_stock_buying_power(self):
+        budget = available_budget(
+            {"cash": "1000", "buying_power": "600", "non_marginable_buying_power": "1000"},
+            config(top=10),
+        )
+        self.assertEqual(budget, 600.0)
 
     def test_entry_skips_conflicting_position_and_is_idempotent(self):
         broker = FakeBroker()
@@ -398,6 +413,8 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(second["status"], "open")
         self.assertEqual(len(broker.submissions), 2)
         self.assertTrue(all(order["side"] == "buy" for order in broker.submissions))
+        self.assertEqual(first["entry_account_snapshot"]["cash"], "1000")
+        self.assertEqual(first["entry_account_snapshot"]["buying_power"], "4000")
 
     def test_exit_sells_only_strategy_owned_symbols(self):
         broker = FakeBroker()
@@ -502,6 +519,41 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "closed")
         self.assertEqual(broker.submissions[0]["client_order_id"], "olq-20260824-x-A-2")
+
+    def test_working_exit_survives_the_fill_timeout_without_replacement(self):
+        broker = FakeWorkingExitBroker()
+        broker.current_positions["A"] = {"symbol": "A", "qty": "0.75"}
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.json")
+            state = store.load()
+            state["position"] = {
+                "entry_date": "2026-08-24",
+                "exit_date": "2026-08-25",
+                "status": "open",
+                "symbols": ["A"],
+                "filled_symbols": ["A"],
+                "entry_orders": {},
+                "exit_orders": {},
+            }
+            store.save(state)
+
+            first = exit_position(
+                broker,
+                store,
+                config(top=1, fill_timeout_seconds=0.005),
+                submit=True,
+            )
+            second = exit_position(
+                broker,
+                store,
+                config(top=1, fill_timeout_seconds=0.005),
+                submit=True,
+            )
+
+        self.assertEqual(first["status"], "exiting")
+        self.assertEqual(second["status"], "exiting")
+        self.assertEqual(len(broker.submissions), 1)
+        self.assertEqual(broker.cancellations, [])
 
     def test_exit_recovers_an_entry_accepted_before_state_was_saved(self):
         broker = FakeBroker()

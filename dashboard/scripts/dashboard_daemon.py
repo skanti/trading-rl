@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from omegaconf import DictConfig, OmegaConf
 import requests
 
+import dashboard_digest
 import dashboard_metrics as performance
 from dashboard_config import (
     DashboardConfigError,
@@ -160,6 +161,17 @@ class AlpacaClient:
             )
         )
 
+    def orders(self, *, after: str) -> list[dict[str, Any]]:
+        return list(
+            self._get(
+                "orders",
+                status="all",
+                after=after,
+                direction="asc",
+                limit=500,
+            )
+        )
+
     def clock(self) -> dict[str, Any]:
         return dict(self._get("clock"))
 
@@ -250,7 +262,11 @@ def first_trade_date(work_dir: Path) -> date | None:
     return None
 
 
-def session_records(work_dir: Path, limit: int = 120) -> list[dict[str, Any]]:
+def session_records(
+    work_dir: Path,
+    limit: int = 120,
+    order_history: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Turn per-day ``summary.json`` artifacts into dashboard session rows."""
     if not work_dir.exists():
         return []
@@ -259,9 +275,10 @@ def session_records(work_dir: Path, limit: int = 120) -> list[dict[str, Any]]:
         (child for child in work_dir.iterdir() if child.is_dir() and _DAY_DIRECTORY.match(child.name)),
         key=lambda child: child.name,
         reverse=True
-    )[:limit]
+    )
 
     records: list[dict[str, Any]] = []
+    seen_baskets: set[tuple[str, str]] = set()
     for directory in days:
         summary_path = directory / "summary.json"
         if not summary_path.exists():
@@ -273,25 +290,56 @@ def session_records(work_dir: Path, limit: int = 120) -> list[dict[str, Any]]:
             continue
 
         position = summary.get("position") or {}
+        entry_orders = position.get("entry_orders") or {}
+        if performance.filled_notional(entry_orders) <= 0.0:
+            continue
+        entry_date = str(position.get("entry_date") or summary.get("trading_day") or directory.name)
+        exit_date = str(position.get("exit_date") or "")
+        basket_key = (entry_date, exit_date)
+        if basket_key in seen_baskets:
+            continue
+        seen_baskets.add(basket_key)
+
         execution = summary.get("execution") or {}
-        trades = performance.closed_basket(position)
+        trades = (
+            performance.closed_basket_from_order_history(position, order_history)
+            if order_history is not None and position.get("status") == "closed"
+            else performance.closed_basket(position)
+        )
+        totals = performance.basket_totals(trades) if trades else {}
+        entry_notional = (
+            totals["entry_notional"]
+            if totals
+            else performance._float(execution.get("entry_filled_notional"))
+        )
+        exit_notional = (
+            totals["exit_notional"]
+            if totals
+            else performance._float(execution.get("exit_filled_notional"))
+        )
+        realized_pnl = totals.get("pnl") if totals else execution.get("realized_pnl_before_fees")
+        realized_return = (
+            totals.get("pnl_pct") if totals else execution.get("realized_return_before_fees")
+        )
         records.append(
             {
-                "trading_day": summary.get("trading_day") or directory.name,
+                "trading_day": entry_date,
                 "last_action": summary.get("last_action"),
                 "updated_at": summary.get("updated_at"),
                 "status": position.get("status"),
                 "entry_date": position.get("entry_date"),
                 "exit_date": position.get("exit_date"),
                 "symbols": list(position.get("symbols") or []),
-                "entry_notional": performance._float(execution.get("entry_filled_notional")),
-                "exit_notional": performance._float(execution.get("exit_filled_notional")),
-                "realized_pnl": execution.get("realized_pnl_before_fees"),
-                "realized_return": execution.get("realized_return_before_fees"),
+                "entry_notional": entry_notional,
+                "exit_notional": exit_notional,
+                "realized_pnl": realized_pnl,
+                "realized_return": realized_return,
                 "trades": [trade.as_dict() for trade in trades],
                 "error": summary.get("error")
             }
         )
+        if len(records) >= limit:
+            break
     return records
 
 
@@ -299,7 +347,8 @@ def build_snapshot(
     client: Any,
     state: Mapping[str, Any],
     inception: date | None = None,
-    now: datetime | None = None
+    now: datetime | None = None,
+    order_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fetch everything the dashboard shows and shape it into one Firestore document."""
     reference = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
@@ -325,6 +374,19 @@ def build_snapshot(
 
     position = state.get("position") or {}
     closed = performance.closed_basket(position) if position else []
+    if position.get("status") == "closed" and position.get("entry_date"):
+        try:
+            history = (
+                order_history
+                if order_history is not None
+                else client.orders(after=f"{position['entry_date']}T00:00:00Z")
+            )
+            closed = performance.closed_basket_from_order_history(position, history)
+        except (AttributeError, NotImplementedError):
+            # Small fake clients and alternate read-only clients may not expose orders.
+            pass
+        except Exception:  # noqa: BLE001 - fill detail is optional dashboard decoration
+            LOGGER.warning("could not reconcile partial exit fills from order history")
 
     try:
         clock = client.clock()
@@ -405,20 +467,22 @@ def publish(
 ) -> None:
     """Write the snapshot document and the session subcollection."""
     collection = str(OmegaConf.select(config, "firebase.collection"))
-    document = str(OmegaConf.select(config, "firebase.document"))
+    document_name = str(OmegaConf.select(config, "firebase.document"))
 
     client = _firestore_client(config)
-    reference = client.collection(collection).document(document)
+    reference = client.collection(collection).document(document_name)
     reference.set(dict(snapshot))
 
     sessions_reference = reference.collection(SESSIONS_SUBCOLLECTION)
     batch = client.batch()
     written = 0
+    published_days: set[str] = set()
     for record in sessions:
         day = str(record.get("trading_day") or "")
         if not day:
             continue
         batch.set(sessions_reference.document(day), dict(record))
+        published_days.add(day)
         written += 1
         if written % 400 == 0:  # Firestore caps a batch at 500 writes.
             batch.commit()
@@ -426,8 +490,35 @@ def publish(
     if written % 400 != 0:
         batch.commit()
 
+    # A basket summary is written to both its entry-day and exit-day artifact
+    # directories for auditing. Older dashboard versions published both as separate
+    # sessions. Remove only stale documents inside the refreshed window, preserving
+    # history older than ``--sessions-limit``.
+    removed = 0
+    if published_days:
+        oldest_published = min(published_days)
+        stale = []
+        for session_reference in sessions_reference.list_documents():
+            if session_reference.id in published_days:
+                continue
+            inside_refresh_window = session_reference.id >= oldest_published
+            payload = session_reference.get().to_dict() or {}
+            pretrade_artifact = not payload.get("entry_date")
+            if inside_refresh_window or pretrade_artifact:
+                stale.append(session_reference)
+        for offset in range(0, len(stale), 400):
+            cleanup = client.batch()
+            for session_reference in stale[offset : offset + 400]:
+                cleanup.delete(session_reference)
+                removed += 1
+            cleanup.commit()
+
     LOGGER.info(
-        "published %s/%s with %d session record(s)", collection, document, written
+        "published %s/%s with %d session record(s); removed %d stale record(s)",
+        collection,
+        document_name,
+        written,
+        removed,
     )
 
 
@@ -446,6 +537,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true", help="publish one snapshot and exit")
     parser.add_argument("--interval-seconds", type=float, default=300.0)
     parser.add_argument("--sessions-limit", type=int, default=120)
+    parser.add_argument(
+        "--digest-state-path",
+        default=None,
+        help="delivered-email marker file (default: <work-dir>/.dashboard-digest-state.json)",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="do not send the once-per-closed-basket digest email",
+    )
     parser.add_argument(
         "--trading-url",
         default=None,
@@ -481,6 +582,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     work_dir = Path(args.work_dir).expanduser() if args.work_dir else DEFAULT_WORK_DIR
     state_path = Path(args.state_path).expanduser() if args.state_path else work_dir / "state.json"
+    digest_state_path = (
+        Path(args.digest_state_path).expanduser()
+        if args.digest_state_path
+        else work_dir / ".dashboard-digest-state.json"
+    )
 
     key, secret = load_credentials()
     client = AlpacaClient(key, secret, trading_url)
@@ -488,12 +594,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     def publish_once() -> None:
         state = load_state(state_path)
         inception = first_trade_date(work_dir)
-        snapshot = build_snapshot(client, state, inception=inception)
-        sessions = session_records(work_dir, limit=args.sessions_limit)
+        order_history = None
+        if inception is not None:
+            try:
+                order_history = client.orders(after=f"{inception.isoformat()}T00:00:00Z")
+            except Exception:  # noqa: BLE001 - fall back to durable artifact summaries
+                LOGGER.warning("could not load order history; using artifact session totals")
+        snapshot = build_snapshot(
+            client,
+            state,
+            inception=inception,
+            order_history=order_history,
+        )
+        sessions = session_records(
+            work_dir,
+            limit=args.sessions_limit,
+            order_history=order_history,
+        )
         if args.dry_run:
             print(json.dumps({"snapshot": snapshot, "sessions": sessions}, indent=2, default=str))
             return
         publish(snapshot, sessions, config)
+        if not args.no_email:
+            key = dashboard_digest.digest_key(state, str(snapshot["trading_day"]))
+            if key and key not in dashboard_digest.delivered_keys(digest_state_path):
+                try:
+                    recipients = dashboard_digest.send_digest(snapshot, state, config)
+                except Exception as error:  # noqa: BLE001 - SMTP cannot affect publishing
+                    LOGGER.exception("digest email failed; it will be retried: %s", error)
+                else:
+                    dashboard_digest.mark_delivered(digest_state_path, key)
+                    LOGGER.info("digest emailed to %s", ", ".join(recipients))
 
     if args.once or args.dry_run:
         publish_once()

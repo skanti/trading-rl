@@ -23,25 +23,25 @@ const summary = computed(() => {
 
 <template>
   <div class="scroll-x">
-    <table class="w-full min-w-[38rem] text-sm">
+    <table class="w-full table-fixed text-sm sm:min-w-[38rem] sm:table-auto">
       <thead>
         <tr class="text-xs uppercase tracking-wide text-slate-500">
-          <th class="px-4 py-2 text-left font-medium">
+          <th class="w-[32%] px-3 py-2 text-left font-medium sm:w-auto sm:px-4">
             Symbol
           </th>
-          <th class="px-4 py-2 text-right font-medium">
+          <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
             Qty
           </th>
-          <th class="px-4 py-2 text-right font-medium">
+          <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
             Entry
           </th>
-          <th class="px-4 py-2 text-right font-medium">
+          <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
             Exit
           </th>
-          <th class="px-4 py-2 text-right font-medium">
+          <th class="px-2 py-2 text-right font-medium sm:px-4">
             P&amp;L
           </th>
-          <th class="px-4 py-2 text-right font-medium">
+          <th class="px-3 py-2 text-right font-medium sm:px-4">
             %
           </th>
         </tr>
@@ -53,37 +53,37 @@ const summary = computed(() => {
           class="border-t border-slate-800/70"
         >
           <td
-            :class="dense ? 'px-4 py-1.5' : 'px-4 py-2.5'"
+            :class="dense ? 'px-3 py-1.5 sm:px-4' : 'px-3 py-2.5 sm:px-4'"
             class="font-semibold text-slate-100"
           >
             {{ trade.symbol }}
           </td>
           <td
-            class="numeric px-4 text-right text-slate-400"
+            class="numeric hidden px-4 text-right text-slate-400 sm:table-cell"
             :class="dense ? 'py-1.5' : 'py-2.5'"
           >
             {{ formatQuantity(trade.qty) }}
           </td>
           <td
-            class="numeric px-4 text-right text-slate-300"
+            class="numeric hidden px-4 text-right text-slate-300 sm:table-cell"
             :class="dense ? 'py-1.5' : 'py-2.5'"
           >
             {{ formatCurrency(trade.entry_price) }}
           </td>
           <td
-            class="numeric px-4 text-right text-slate-300"
+            class="numeric hidden px-4 text-right text-slate-300 sm:table-cell"
             :class="dense ? 'py-1.5' : 'py-2.5'"
           >
             {{ formatCurrency(trade.exit_price) }}
           </td>
           <td
-            class="numeric px-4 text-right font-semibold"
+            class="numeric px-2 text-right font-semibold sm:px-4"
             :class="[toneClass(trade.pnl), dense ? 'py-1.5' : 'py-2.5']"
           >
             {{ formatSignedCurrency(trade.pnl) }}
           </td>
           <td
-            class="numeric px-4 text-right"
+            class="numeric px-3 text-right sm:px-4"
             :class="[toneClass(trade.pnl), dense ? 'py-1.5' : 'py-2.5']"
           >
             {{ formatSignedPercent(trade.pnl_pct) }}
@@ -91,9 +91,26 @@ const summary = computed(() => {
         </tr>
       </tbody>
       <tfoot>
+        <tr class="border-t border-slate-700 sm:hidden">
+          <td class="px-3 py-2.5 font-semibold text-slate-200">
+            Total
+          </td>
+          <td
+            class="numeric px-2 py-2.5 text-right font-semibold"
+            :class="toneClass(summary.pnl ?? 0)"
+          >
+            {{ formatSignedCurrency(summary.pnl ?? 0) }}
+          </td>
+          <td
+            class="numeric px-3 py-2.5 text-right"
+            :class="toneClass(summary.pnl ?? 0)"
+          >
+            {{ formatSignedPercent(summary.pnl_pct ?? 0) }}
+          </td>
+        </tr>
         <!-- Notional totals sit under the columns they belong to: deployed under
              Entry, realised under Exit. -->
-        <tr class="border-t border-slate-700">
+        <tr class="hidden border-t border-slate-700 sm:table-row">
           <td
             class="px-4 py-2.5 font-semibold text-slate-200"
             colspan="2"

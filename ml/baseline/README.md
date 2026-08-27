@@ -159,6 +159,14 @@ python -m baseline.live_overnight_liquidity run \
   --submit
 ```
 
+Basket sizing remains cash-only even on a margin-enabled account. The requested
+capital is capped by positive cash after `--cash-buffer-fraction` and by Alpaca's
+regular stock `buying_power`. It deliberately does not use
+`non_marginable_buying_power`, because that settlement-sensitive field can exclude
+same-day stock-sale proceeds even though they are immediately reusable for equities.
+The pre-entry account fields used for sizing are saved in strategy state and daily
+summaries for auditability.
+
 When both data variables are set, SIP screener and historical-bar requests use
 that subscription while account, position, calendar, and order requests keep
 using the trading credentials. If neither data variable is set, market-data
@@ -185,8 +193,10 @@ python -m baseline.live_overnight_liquidity preview \
 Exit submission times from 09:00 through 09:29 queue fractional `day` market
 orders for the regular-session open. The daemon records `exit_queued` without
 canceling those orders on the normal fill timeout, then reconciles their fills
-at 09:30 and retries only when necessary. Entry submissions still require an
-open regular session.
+at 09:30 and retries only when necessary. Once the market is open, a still-working
+or partially filled exit is also left in place across 45-second reconciliation
+windows instead of being canceled and replaced. Entry submissions still require
+an open regular session.
 
 ```bash
 python -m baseline.live_overnight_liquidity rank

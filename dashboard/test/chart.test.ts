@@ -16,6 +16,8 @@ function points(values: number[]): EquityPoint[] {
 describe('buildScale', () => {
   it('maps the domain across the inner plot area', () => {
     const scale = buildScale(points([100, 200]), GEOMETRY)
+    expect(scale.min).toBeCloseTo(88)
+    expect(scale.max).toBeCloseTo(212)
     expect(scale.x(0)).toBe(60)
     expect(scale.x(1)).toBe(890) // padding.left + innerWidth (900 - 60 - 10)
     expect(scale.y(scale.max)).toBeCloseTo(10)

@@ -894,15 +894,20 @@ def _client_order_id(entry_date: date, side: str, symbol: str, attempt: int = 1)
 
 def available_budget(account: Mapping[str, object], config: StrategyConfig) -> float:
     cash = max(0.0, _float(account.get("cash"), "account.cash"))
-    non_marginable = account.get("non_marginable_buying_power")
-    cash_available = (
-        min(cash, max(0.0, _float(non_marginable, "account.non_marginable_buying_power")))
-        if non_marginable is not None
+    buying_power_value = account.get("buying_power")
+    stock_buying_power = (
+        max(0.0, _float(buying_power_value, "account.buying_power"))
+        if buying_power_value is not None
         else cash
     )
-    usable_cash = cash_available * (1.0 - config.cash_buffer_fraction)
+    # These are marginable US equities. ``non_marginable_buying_power`` tracks
+    # settled dollars for assets such as crypto and can exclude same-day stock-sale
+    # proceeds until T+1, even though Alpaca permits those proceeds to be reused for
+    # equities immediately. Cap at cash to avoid borrowing, and at regular buying
+    # power so account restrictions or other open orders are still respected.
+    usable_cash = cash * (1.0 - config.cash_buffer_fraction)
     requested = config.capital if config.capital is not None else cash * config.capital_fraction
-    budget = min(float(requested), usable_cash)
+    budget = min(float(requested), usable_cash, stock_buying_power)
     if budget <= 0.0:
         raise RuntimeError("account has no cash available for the basket")
     if budget / config.top < 1.0:
@@ -934,7 +939,17 @@ def _wait_for_orders(
     orders: Mapping[str, Mapping[str, object]],
     timeout_seconds: float,
     poll_seconds: float,
+    *,
+    cancel_on_timeout: bool = True,
 ) -> dict[str, dict[str, Any]]:
+    """Poll orders for one reconciliation window.
+
+    Entry orders are canceled when their fill window expires so a late entry cannot
+    create an unmanaged overnight position. Exit orders are different: canceling a
+    partially filled market sell and replacing it every 45 seconds creates avoidable
+    churn. Callers closing positions therefore leave active orders working and resume
+    monitoring the same Alpaca order on the next daemon pass.
+    """
     latest = {symbol: dict(order) for symbol, order in orders.items()}
     deadline = time_module.monotonic() + timeout_seconds
     while True:
@@ -949,7 +964,10 @@ def _wait_for_orders(
         for symbol, order_id in active:
             latest[symbol] = client.order(order_id)
     for symbol, order in list(latest.items()):
-        if str(order.get("status", "")) not in TERMINAL_ORDER_STATUSES:
+        if (
+            cancel_on_timeout
+            and str(order.get("status", "")) not in TERMINAL_ORDER_STATUSES
+        ):
             try:
                 client.cancel_order(str(order["id"]))
             except AlpacaAPIError as error:
@@ -1039,7 +1057,8 @@ def enter_for_day(
             selected = _select_unconflicted_candidates(
                 ranking, held_symbols, open_order_symbols, config.top
             )
-            budget = available_budget(client.account(), config)
+            account = client.account()
+            budget = available_budget(account, config)
             per_symbol = math.floor((budget / config.top) * 100.0) / 100.0
             position = {
                 "entry_date": trade_date.isoformat(),
@@ -1048,6 +1067,21 @@ def enter_for_day(
                 "symbols": selected,
                 "budget": budget,
                 "per_symbol_notional": per_symbol,
+                "entry_account_snapshot": {
+                    key: account.get(key)
+                    for key in (
+                        "cash",
+                        "equity",
+                        "buying_power",
+                        "regt_buying_power",
+                        "non_marginable_buying_power",
+                        "long_market_value",
+                        "initial_margin",
+                        "maintenance_margin",
+                        "multiplier",
+                    )
+                },
+                "entry_account_snapshot_at": _iso_now(now),
                 "entry_orders": {},
                 "exit_orders": {},
                 "created_at": _iso_now(now),
@@ -1220,24 +1254,47 @@ def exit_position(
             return position
 
         final_orders = _wait_for_orders(
-            client, submitted, config.fill_timeout_seconds, config.poll_seconds
+            client,
+            submitted,
+            config.fill_timeout_seconds,
+            config.poll_seconds,
+            cancel_on_timeout=False,
         )
         for symbol, order in final_orders.items():
             position["exit_orders"][symbol] = _order_summary(order)
         remaining = [symbol for symbol in owned_symbols if client.position(symbol) is not None]
         position["remaining_symbols"] = remaining
-        position["status"] = "closed" if not remaining else "exit_incomplete"
-        position["exit_completed_at"] = _iso_now()
+        remaining_set = set(remaining)
+        active_orders = [
+            symbol
+            for symbol, order in final_orders.items()
+            if symbol in remaining_set
+            if str(order.get("status", "")) not in TERMINAL_ORDER_STATUSES
+        ]
+        position["status"] = (
+            "closed" if not remaining else "exiting" if active_orders else "exit_incomplete"
+        )
+        if not remaining:
+            position["exit_completed_at"] = _iso_now()
         state["position"] = position
         state["updated_at"] = _iso_now()
         store.save(state)
-        LOGGER.info(
-            "exit complete for entry %s: state=%s, remaining=%d",
-            entry_date,
-            position["status"],
-            len(remaining),
-        )
-        if remaining:
+        if active_orders:
+            LOGGER.info(
+                "exit orders still working for entry %s after %.0fs: active=%d, remaining=%d",
+                entry_date,
+                config.fill_timeout_seconds,
+                len(active_orders),
+                len(remaining),
+            )
+        else:
+            LOGGER.info(
+                "exit complete for entry %s: state=%s, remaining=%d",
+                entry_date,
+                position["status"],
+                len(remaining),
+            )
+        if remaining and not active_orders:
             raise RuntimeError("positions remain after exit attempt: " + ", ".join(remaining))
         return position
 

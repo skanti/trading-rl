@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 import dashboard_metrics as metrics
 import dashboard_daemon
+import dashboard_digest
 from dashboard_config import DashboardConfigError
 from dashboard_daemon import (
     AlpacaClient,
@@ -110,6 +111,40 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(trades[0].pnl, 100.0)
         self.assertEqual(metrics.basket_totals(trades)["pnl"], 100.0)
 
+    def test_closed_basket_aggregates_partial_exit_attempts(self):
+        position = {
+            "entry_date": "2026-08-25",
+            "entry_orders": {"NVDA": order(10, 100.0)},
+            "exit_orders": {"NVDA": order(6, 111.0)},
+        }
+        orders = [
+            {
+                "id": "first",
+                "client_order_id": "olq-20260825-x-NVDA",
+                "symbol": "NVDA",
+                "side": "sell",
+                "status": "canceled",
+                "filled_qty": "4",
+                "filled_avg_price": "109",
+            },
+            {
+                "id": "second",
+                "client_order_id": "olq-20260825-x-NVDA-2",
+                "symbol": "NVDA",
+                "side": "sell",
+                "status": "filled",
+                "filled_qty": "6",
+                "filled_avg_price": "111",
+            },
+        ]
+
+        trades = metrics.closed_basket_from_order_history(position, orders)
+
+        self.assertEqual(trades[0].qty, 10.0)
+        self.assertEqual(trades[0].exit_notional, 1102.0)
+        self.assertEqual(trades[0].exit_price, 110.2)
+        self.assertEqual(trades[0].pnl, 102.0)
+
 
 class SnapshotTest(unittest.TestCase):
     def test_snapshot_preserves_the_frontend_contract(self):
@@ -200,6 +235,58 @@ class ArtifactTest(unittest.TestCase):
                 )
             self.assertEqual(first_trade_date(root), date(2026, 8, 25))
 
+    def test_session_history_reconciles_partial_fills_and_deduplicates_artifacts(self):
+        position = {
+            "status": "closed",
+            "entry_date": "2026-08-25",
+            "exit_date": "2026-08-26",
+            "entry_orders": {"NVDA": order(10, 100.0)},
+            "exit_orders": {"NVDA": order(6, 111.0)},
+        }
+        order_history = [
+            {
+                "id": "first",
+                "client_order_id": "olq-20260825-x-NVDA",
+                "symbol": "NVDA",
+                "side": "sell",
+                "filled_qty": "4",
+                "filled_avg_price": "109",
+            },
+            {
+                "id": "second",
+                "client_order_id": "olq-20260825-x-NVDA-2",
+                "symbol": "NVDA",
+                "side": "sell",
+                "filled_qty": "6",
+                "filled_avg_price": "111",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for day in ("2026-08-25", "2026-08-26"):
+                folder = root / day
+                folder.mkdir()
+                (folder / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "trading_day": day,
+                            "position": position,
+                            "execution": {
+                                "entry_filled_notional": 1000.0,
+                                "exit_filled_notional": 666.0,
+                                "realized_return_before_fees": -0.334,
+                            },
+                        }
+                    )
+                )
+
+            records = session_records(root, order_history=order_history)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["trading_day"], "2026-08-25")
+        self.assertEqual(records[0]["exit_notional"], 1102.0)
+        self.assertEqual(records[0]["realized_return"], 0.102)
+
 
 class SafetyTest(unittest.TestCase):
     def test_paper_endpoint_check_uses_the_hostname(self):
@@ -230,6 +317,92 @@ class SafetyTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(DashboardConfigError):
                 _firestore_client(config)
+
+
+class DigestTest(unittest.TestCase):
+    def setUp(self):
+        self.config = OmegaConf.create(
+            {
+                "dashboard": {"title": "Overnight Liquidity", "url": "https://dash.example"},
+                "smtp": {
+                    "host": "smtp.example",
+                    "port": 587,
+                    "user": "bot@example",
+                    "password": "app-password",
+                },
+                "notifications": {"recipients": ["a@example", "b@example"]},
+            }
+        )
+        self.state = {
+            "position": {
+                "status": "closed",
+                "entry_date": "2026-08-25",
+                "exit_date": "2026-08-26",
+                "exit_completed_at": "2026-08-26T09:35:00-04:00",
+            }
+        }
+        self.snapshot = {
+            "trading_day": "2026-08-26",
+            "account": {"equity": 100500.0, "cash": 100500.0},
+            "performance": {
+                "today": {
+                    "label": "Today",
+                    "pnl": 500.0,
+                    "pnl_pct": 0.005,
+                }
+            },
+            "closed_basket": [
+                {
+                    "symbol": "NVDA",
+                    "qty": 10.0,
+                    "entry_price": 100.0,
+                    "exit_price": 110.0,
+                    "pnl": 100.0,
+                    "pnl_pct": 0.1,
+                }
+            ],
+        }
+
+    def test_digest_only_keys_a_basket_on_its_exit_day(self):
+        self.assertIsNotNone(dashboard_digest.digest_key(self.state, "2026-08-26"))
+        self.assertIsNone(dashboard_digest.digest_key(self.state, "2026-08-27"))
+
+    def test_message_is_multipart_and_addressed_to_all_recipients(self):
+        message = dashboard_digest.build_message(self.snapshot, self.state, self.config)
+        self.assertTrue(message.is_multipart())
+        self.assertIn("a@example", message["To"])
+        self.assertIn("+$500.00", message["Subject"])
+        self.assertIn("NVDA", dashboard_digest.render_text(self.snapshot, self.state, self.config))
+
+    def test_html_colors_profits_green_and_losses_red(self):
+        html = dashboard_digest.render_html(self.snapshot, self.state, self.config)
+        self.assertIn("color:#047857", html)
+        losing = dict(self.snapshot)
+        losing["performance"] = {
+            "today": {"label": "Today", "pnl": -5.0, "pnl_pct": -0.001}
+        }
+        losing["closed_basket"] = [
+            {**self.snapshot["closed_basket"][0], "pnl": -5.0, "pnl_pct": -0.005}
+        ]
+        self.assertIn("color:#be123c", dashboard_digest.render_html(losing, self.state, self.config))
+
+    def test_send_uses_starttls_and_login(self):
+        with mock.patch("dashboard_digest.smtplib.SMTP") as smtp:
+            session = smtp.return_value.__enter__.return_value
+            recipients = dashboard_digest.send_digest(self.snapshot, self.state, self.config)
+        smtp.assert_called_once_with("smtp.example", 587, timeout=30)
+        session.starttls.assert_called_once()
+        session.login.assert_called_once_with("bot@example", "app-password")
+        session.send_message.assert_called_once()
+        self.assertEqual(recipients, ["a@example", "b@example"])
+
+    def test_delivery_marker_is_durable_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "digest-state.json"
+            dashboard_digest.mark_delivered(path, "first")
+            dashboard_digest.mark_delivered(path, "first")
+            dashboard_digest.mark_delivered(path, "second")
+            self.assertEqual(dashboard_digest.delivered_keys(path), {"first", "second"})
 
 
 if __name__ == "__main__":

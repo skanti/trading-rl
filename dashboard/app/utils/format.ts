@@ -31,6 +31,24 @@ export function formatCompactCurrency(value: number | null | undefined): string 
   return COMPACT_CURRENCY.format(value as number)
 }
 
+/** Currency labels that stay distinct when a chart zooms into a narrow equity range. */
+export function formatAxisCurrency(
+  value: number | null | undefined,
+  domainSpan: number
+): string {
+  if (!Number.isFinite(value ?? NaN)) return '—'
+  const amount = value as number
+  const span = Math.abs(domainSpan)
+  if (span >= 10_000 || Math.abs(amount) >= 1_000_000) return formatCompactCurrency(amount)
+  const fractionDigits = span < 10 ? 2 : 0
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits
+  }).format(amount)
+}
+
 export function formatSignedCurrency(value: number | null | undefined): string {
   if (!Number.isFinite(value ?? NaN)) return '—'
   const amount = value as number

@@ -19,8 +19,10 @@ trading state.json ──read──▶ scripts/dashboard_daemon.py
 ```
 
 `accounts/paper` holds the snapshot; `accounts/paper/sessions/{YYYY-MM-DD}` holds one
-document per trading day. `firestore.rules` allows authenticated reads and no browser
-writes at all — the publisher writes through the Admin SDK, which bypasses rules.
+document per completed basket, keyed by its entry trading day. Entry- and exit-day
+copies of the same audit summary are collapsed into that one record. `firestore.rules`
+allows authenticated reads and no browser writes at all — the publisher writes through
+the Admin SDK, which bypasses rules.
 
 ## Configuration
 
@@ -86,7 +88,10 @@ After the first deploy, update `dashboard.url` in `config.yaml` to the real site
 
 The dashboard daemon is intentionally separate from trading. Run it under the same
 process supervisor as the trading daemon; it publishes immediately, then every five
-minutes by default.
+minutes by default. After it observes a basket reach `closed` on its configured exit
+day, it also sends one digest email using `smtp` and `notifications.recipients` from
+`config.yaml`. A durable marker prevents duplicate messages across daemon restarts;
+SMTP failures are logged and retried without affecting Firestore publishing.
 
 ```bash
 set -a && source ../ml/.env && set +a
@@ -101,7 +106,8 @@ separate dependency set and is not supported for the Firebase daemon.
 
 Use `--interval-seconds 60` to change the cadence, `--work-dir` when strategy artifacts
 are somewhere other than `/data/ppv1/live`, and `--state-path` to select a separate
-state file. A failed publish is logged and retried on the next interval.
+state file. Use `--no-email` to disable digests. A failed publish is logged and retried
+on the next interval.
 
 It refuses any endpoint other than `paper-api.alpaca.markets` unless started with
 `--allow-live-endpoint`, so an unlucky `ALPACA_URL` cannot point it at real money.

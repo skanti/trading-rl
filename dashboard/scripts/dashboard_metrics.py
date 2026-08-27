@@ -402,6 +402,67 @@ def closed_basket(position: Mapping[str, Any]) -> list[ClosedTrade]:
     return trades
 
 
+def closed_basket_from_order_history(
+    position: Mapping[str, Any], orders: Iterable[Mapping[str, Any]]
+) -> list[ClosedTrade]:
+    """Aggregate every partial exit fill for a closed strategy basket.
+
+    Legacy trading state kept only the latest exit attempt for each symbol. When an
+    order partially filled before being canceled, using that state alone understated
+    proceeds. Alpaca's closed-order history retains all attempts, so the dashboard can
+    reconstruct the weighted exit price without modifying trading state.
+    """
+    entry_date = str(position.get("entry_date") or "")
+    if not entry_date:
+        return closed_basket(position)
+    prefix = f"olq-{entry_date.replace('-', '')}-x-"
+    by_symbol: dict[str, list[Mapping[str, Any]]] = {}
+    seen_ids: set[str] = set()
+    for order in orders:
+        order_id = str(order.get("id") or order.get("client_order_id") or "")
+        client_id = str(order.get("client_order_id") or "")
+        symbol = str(order.get("symbol") or "")
+        if (
+            not symbol
+            or not client_id.startswith(prefix)
+            or str(order.get("side") or "").lower() != "sell"
+            or order_id in seen_ids
+        ):
+            continue
+        seen_ids.add(order_id)
+        if _float(order.get("filled_qty")) > 0.0:
+            by_symbol.setdefault(symbol, []).append(order)
+
+    entry_orders: Mapping[str, Mapping[str, Any]] = position.get("entry_orders") or {}
+    trades: list[ClosedTrade] = []
+    for symbol in sorted(entry_orders):
+        fills = by_symbol.get(symbol) or []
+        entry_price = _float(entry_orders[symbol].get("filled_avg_price"))
+        exit_qty = sum(_float(order.get("filled_qty")) for order in fills)
+        exit_notional = sum(
+            _float(order.get("filled_qty")) * _float(order.get("filled_avg_price"))
+            for order in fills
+        )
+        if entry_price <= 0.0 or exit_qty <= 0.0:
+            continue
+        entry_notional = exit_qty * entry_price
+        exit_price = exit_notional / exit_qty
+        pnl = exit_notional - entry_notional
+        trades.append(
+            ClosedTrade(
+                symbol=symbol,
+                qty=exit_qty,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                entry_notional=entry_notional,
+                exit_notional=exit_notional,
+                pnl=pnl,
+                pnl_pct=(pnl / entry_notional) if entry_notional > 0.0 else 0.0,
+            )
+        )
+    return trades or closed_basket(position)
+
+
 def basket_totals(trades: Iterable[ClosedTrade]) -> dict[str, float]:
     """Aggregate a closed basket into the email's total row."""
     entry_total = 0.0

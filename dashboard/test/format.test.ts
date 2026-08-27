@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  formatAxisCurrency,
   formatCompactCurrency,
   formatCurrency,
   formatDay,
@@ -27,6 +28,12 @@ describe('currency', () => {
 
   it('compacts axis labels', () => {
     expect(formatCompactCurrency(105000)).toBe('$105K')
+  })
+
+  it('keeps nearby chart ticks distinct inside a narrow domain', () => {
+    expect(formatAxisCurrency(99967, 50)).toBe('$99,967')
+    expect(formatAxisCurrency(99967.25, 5)).toBe('$99,967.25')
+    expect(formatAxisCurrency(105000, 20000)).toBe('$105K')
   })
 })
 

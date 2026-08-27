@@ -22,7 +22,11 @@ export interface ChartScale {
  * scaling would divide by zero and collapse the line onto an edge. Padding the domain
  * in that case draws the flat line through the middle of the plot instead.
  */
-export function buildScale(points: EquityPoint[], geometry: ChartGeometry): ChartScale {
+export function buildScale(
+  points: EquityPoint[],
+  geometry: ChartGeometry,
+  domainPaddingRatio = 0.12
+): ChartScale {
   const { width, height, padding } = geometry
   const innerWidth = Math.max(1, width - padding.left - padding.right)
   const innerHeight = Math.max(1, height - padding.top - padding.bottom)
@@ -37,7 +41,7 @@ export function buildScale(points: EquityPoint[], geometry: ChartGeometry): Char
     max += cushion
   } else {
     // Breathing room so the extremes do not sit exactly on the frame.
-    const cushion = (max - min) * 0.08
+    const cushion = (max - min) * Math.max(0, domainPaddingRatio)
     min -= cushion
     max += cushion
   }
