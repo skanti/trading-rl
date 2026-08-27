@@ -72,14 +72,14 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
 
       <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile
-          label="Today"
+          label="Realized today"
           icon="i-lucide-calendar"
           :value="formatSignedCurrency(today?.pnl)"
           :tone="toneClass(today?.pnl)"
           :hint="formatSignedPercent(today?.pnl_pct)"
         />
         <StatTile
-          label="Since inception"
+          label="Realized since inception"
           icon="i-lucide-trending-up"
           :value="formatSignedCurrency(inception?.pnl)"
           :tone="toneClass(inception?.pnl)"
@@ -103,6 +103,7 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
       <EquityChart
         :points="curve"
         :baseline="inception?.start_equity"
+        :sessions="stats?.sessions"
       />
 
       <div class="grid gap-5 lg:grid-cols-2">

@@ -47,7 +47,6 @@ class EquityPoint:
     equity: float
     profit_loss: float
     profit_loss_pct: float
-    provisional: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,15 +126,12 @@ class Statistics:
 def _point_dict(point: EquityPoint | None) -> dict[str, Any] | None:
     if point is None:
         return None
-    result = {
+    return {
         "day": point.day.isoformat(),
         "equity": point.equity,
         "profit_loss": point.profit_loss,
         "profit_loss_pct": point.profit_loss_pct
     }
-    if point.provisional:
-        result["provisional"] = True
-    return result
 
 
 def session_date(epoch_seconds: float) -> date:
@@ -208,64 +204,61 @@ def equity_series(
     return [deduplicated[day] for day in sorted(deduplicated)]
 
 
-def append_provisional_close(
-    series: Sequence[EquityPoint],
-    intraday_history: Mapping[str, Any],
+def realized_equity_series(
+    sessions: Sequence[Mapping[str, Any]],
     *,
-    now: datetime,
-    market_is_open: bool,
     base_value: float,
-    since: date | None = None
+    inception: date | None = None
 ) -> list[EquityPoint]:
-    """Backfill a delayed daily close from Alpaca's hourly market-hours history.
+    """Build cumulative strategy equity from completed basket fill results.
 
-    Alpaca's 1D portfolio history can lag its intraday history during overnight
-    processing. The last hourly point for a completed regular session is a useful
-    provisional close, but a point from the currently open session is not. Rebuilding
-    this list on every publish means the official daily point automatically replaces
-    the provisional one without accumulating extra Firestore documents.
+    The first point is the untraded baseline. Each later point applies one or more
+    baskets realized on that exit date. Open sessions are deliberately absent: live
+    mark-to-market account equity is displayed separately by the dashboard.
     """
-    reference = now.astimezone(EASTERN)
-    timestamps = list(intraday_history.get("timestamp") or [])
-    equities = list(intraday_history.get("equity") or [])
-    candidates: dict[date, float] = {}
-
-    for index, stamp in enumerate(timestamps):
-        if index >= len(equities):
-            break
-        equity = equities[index]
-        if equity is None:
+    closed: list[tuple[date, float]] = []
+    entry_days: list[date] = []
+    for session in sessions:
+        if session.get("status") != "closed" or session.get("realized_pnl") is None:
             continue
-        moment = datetime.fromtimestamp(float(stamp), tz=timezone.utc).astimezone(EASTERN)
-        if since is not None and moment.date() < since:
+        try:
+            exit_day = date.fromisoformat(
+                str(session.get("exit_date") or session.get("trading_day"))
+            )
+        except ValueError:
             continue
-        if moment.date() > reference.date():
-            continue
-        if moment.date() == reference.date() and market_is_open:
-            continue
-        # Timestamps are ordered by Alpaca; retaining the last value gives us the
-        # final hourly market-hours bucket for each session.
-        candidates[moment.date()] = _float(equity)
+        raw_entry_day = session.get("entry_date") or session.get("trading_day")
+        try:
+            entry_days.append(date.fromisoformat(str(raw_entry_day)))
+        except ValueError:
+            pass
+        closed.append((exit_day, _float(session["realized_pnl"])))
 
-    if not candidates:
-        return list(series)
+    baseline_day = inception or (min(entry_days) if entry_days else None)
+    if baseline_day is None:
+        return []
 
-    latest_day = max(candidates)
-    if series and latest_day <= series[-1].day:
-        return list(series)
+    balance = base_value
+    cumulative_pnl = 0.0
+    points = [EquityPoint(baseline_day, balance, 0.0, 0.0)]
+    realized_by_day: dict[date, float] = {}
+    for exit_day, pnl in sorted(closed):
+        realized_by_day[exit_day] = realized_by_day.get(exit_day, 0.0) + pnl
 
-    equity = candidates[latest_day]
-    pnl = equity - base_value
-    return [
-        *series,
-        EquityPoint(
-            day=latest_day,
-            equity=equity,
-            profit_loss=pnl,
-            profit_loss_pct=(pnl / base_value) if base_value > 0.0 else 0.0,
-            provisional=True,
-        ),
-    ]
+    for exit_day in sorted(realized_by_day):
+        cumulative_pnl += realized_by_day[exit_day]
+        balance = base_value + cumulative_pnl
+        point = EquityPoint(
+            day=exit_day,
+            equity=balance,
+            profit_loss=cumulative_pnl,
+            profit_loss_pct=(cumulative_pnl / base_value) if base_value > 0.0 else 0.0,
+        )
+        if exit_day == baseline_day:
+            points[0] = point
+        else:
+            points.append(point)
+    return points
 
 
 def inception_equity(history: Mapping[str, Any], series: Sequence[EquityPoint]) -> float:
@@ -293,7 +286,8 @@ def bucket(
     *,
     key: str,
     end_equity: float,
-    fallback_equity: float
+    fallback_equity: float,
+    baseline_is_first: bool = False
 ) -> PerformanceBucket:
     """Profit and loss from the close before ``boundary`` through ``end_equity``.
 
@@ -302,12 +296,16 @@ def bucket(
     if boundary is None:
         start_equity = fallback_equity
         start_day = series[0].day if series else None
-        sessions = len(series)
+        sessions = max(0, len(series) - 1) if baseline_is_first else len(series)
     else:
         anchor = _baseline_before(series, boundary)
         start_equity = anchor.equity if anchor is not None else fallback_equity
         start_day = anchor.day if anchor is not None else (series[0].day if series else None)
-        sessions = sum(1 for point in series if point.day >= boundary)
+        sessions = sum(
+            1
+            for index, point in enumerate(series)
+            if point.day >= boundary and (not baseline_is_first or index > 0)
+        )
 
     pnl = end_equity - start_equity
     pnl_pct = (pnl / start_equity) if start_equity > 0.0 else 0.0
@@ -377,8 +375,40 @@ def performance_table(
     }
 
 
-def statistics(series: Sequence[EquityPoint]) -> Statistics:
-    """Drawdown, extremes and hit rate over the daily equity curve."""
+def realized_performance_table(
+    series: Sequence[EquityPoint],
+    now: datetime | None = None
+) -> dict[str, PerformanceBucket]:
+    """Performance buckets based only on closed strategy baskets."""
+    reference = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
+    today = reference.date()
+    end_equity = series[-1].equity if series else 0.0
+    start_value = series[0].equity if series else 0.0
+    week_start = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    year_start = today.replace(month=1, day=1)
+
+    def realized_bucket(boundary: date | None, key: str) -> PerformanceBucket:
+        return bucket(
+            series,
+            boundary,
+            key=key,
+            end_equity=end_equity,
+            fallback_equity=start_value,
+            baseline_is_first=True,
+        )
+
+    return {
+        "today": realized_bucket(today, "today"),
+        "week": realized_bucket(week_start, "week"),
+        "month": realized_bucket(month_start, "month"),
+        "year": realized_bucket(year_start, "year"),
+        "inception": realized_bucket(None, "inception"),
+    }
+
+
+def statistics(series: Sequence[EquityPoint], *, baseline_is_first: bool = False) -> Statistics:
+    """Drawdown, extremes and hit rate over an equity curve."""
     if not series:
         return Statistics(0.0, 0.0, None, None, 0.0, 0, 0, 0)
 
@@ -393,10 +423,22 @@ def statistics(series: Sequence[EquityPoint]) -> Statistics:
             max_drawdown_pct = (drawdown / peak) if peak > 0.0 else 0.0
 
     # Day-over-day moves; the first point has no predecessor to compare against.
-    moves = [
-        (series[index], series[index].equity - series[index - 1].equity)
-        for index in range(1, len(series))
-    ]
+    moves: list[tuple[EquityPoint, float]] = []
+    for index in range(1, len(series)):
+        previous = series[index - 1]
+        current = series[index]
+        change = current.equity - previous.equity
+        moves.append(
+            (
+                EquityPoint(
+                    day=current.day,
+                    equity=current.equity,
+                    profit_loss=change,
+                    profit_loss_pct=(change / previous.equity) if previous.equity > 0.0 else 0.0,
+                ),
+                change,
+            )
+        )
     traded = [(point, change) for point, change in moves if change != 0.0]
     winners = [point for point, change in traded if change > 0.0]
     losers = [point for point, change in traded if change < 0.0]
@@ -412,7 +454,7 @@ def statistics(series: Sequence[EquityPoint]) -> Statistics:
         win_rate=(len(winners) / len(traded)) if traded else 0.0,
         winning_sessions=len(winners),
         losing_sessions=len(losers),
-        sessions=len(series)
+        sessions=max(0, len(series) - 1) if baseline_is_first else len(series)
     )
 
 

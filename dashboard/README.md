@@ -1,8 +1,9 @@
 # Trading dashboard
 
 A Nuxt 4 single-page app on Firebase Hosting showing the live performance of the
-overnight-liquidity Alpaca paper account: equity curve, day/week/month/year P&L, open
-positions, and a session-by-session trade log — behind a login.
+overnight-liquidity Alpaca paper account: live broker equity, realized strategy equity,
+day/week/month/year realized P&L, open positions, and a session-by-session trade log —
+behind a login.
 
 ## How the data gets here
 
@@ -23,6 +24,11 @@ document per completed basket, keyed by its entry trading day. Entry- and exit-d
 copies of the same audit summary are collapsed into that one record. `firestore.rules`
 allows authenticated reads and no browser writes at all — the publisher writes through
 the Admin SDK, which bypasses rules.
+
+The chart is reconstructed from closed basket fills and dated by exit day. Open baskets
+affect the separately displayed live account equity but do not enter the realized curve
+until their exits complete. This keeps the chart consistent with Session History and
+independent of Alpaca's delayed daily portfolio-history rollover.
 
 ## Configuration
 

@@ -7,9 +7,11 @@ const props = withDefaults(defineProps<{
   points: EquityPoint[]
   baseline?: number
   height?: number
+  sessions?: number
 }>(), {
   baseline: undefined,
-  height: 300
+  height: 300,
+  sessions: undefined
 })
 
 const DEFAULT_WIDTH = 960
@@ -40,6 +42,7 @@ const scale = computed(() => buildScale(props.points, geometry.value))
 const anchor = computed(() => props.baseline ?? props.points[0]?.equity ?? 0)
 const latest = computed(() => props.points[props.points.length - 1]?.equity ?? 0)
 const gaining = computed(() => latest.value >= anchor.value)
+const sessionCount = computed(() => props.sessions ?? Math.max(0, props.points.length - 1))
 
 const line = computed(() => linePath(props.points, scale.value))
 const area = computed(() => areaPath(
@@ -121,7 +124,7 @@ function shortDay(day: string | null | undefined): string {
       <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <div>
           <p class="text-xs font-medium uppercase tracking-wide text-slate-400">
-            Equity curve · {{ points.length }} sessions
+            Realized strategy equity · {{ sessionCount }} closed session{{ sessionCount === 1 ? '' : 's' }}
           </p>
           <p class="numeric mt-1 text-2xl font-semibold text-white">
             {{ formatCurrency(active?.point.equity ?? latest) }}
@@ -137,8 +140,8 @@ function shortDay(day: string | null | undefined): string {
           </p>
           <p class="numeric text-xs text-slate-500">
             {{ active
-              ? `${active.point.provisional ? 'Provisional close · ' : ''}${dayLabel(active.point.day)}`
-              : `${points[points.length - 1]?.provisional ? 'Provisional close' : 'Last close'} · ${dayLabel(points[points.length - 1]?.day)}` }}
+              ? dayLabel(active.point.day)
+              : `Last realized · ${dayLabel(points[points.length - 1]?.day)}` }}
           </p>
         </div>
       </div>

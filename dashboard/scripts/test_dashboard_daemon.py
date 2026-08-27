@@ -39,13 +39,6 @@ def history(rows: list[tuple[date, float]]) -> dict[str, object]:
     }
 
 
-def intraday_history(rows: list[tuple[datetime, float]]) -> dict[str, object]:
-    return {
-        "timestamp": [moment.timestamp() for moment, _ in rows],
-        "equity": [equity for _, equity in rows],
-    }
-
-
 def order(qty: float, price: float) -> dict[str, str]:
     return {"filled_qty": str(qty), "filled_avg_price": str(price)}
 
@@ -69,7 +62,7 @@ class FakeAlpacaClient:
     def positions(self):
         return [{"symbol": "NVDA", "qty": "10", "market_value": "1100"}]
 
-    def portfolio_history(self, period="1A", timeframe="1D", intraday_reporting=None):
+    def portfolio_history(self, period="1A", timeframe="1D"):
         return dict(self._history)
 
     def clock(self):
@@ -108,60 +101,72 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(table["today"].pnl, 5.0)
         self.assertEqual(metrics.statistics(series).max_drawdown, 30.0)
 
-    def test_delayed_daily_close_is_backfilled_from_completed_intraday_session(self):
-        series = metrics.equity_series(history([(date(2026, 8, 25), 99987.75)]))
-        intraday = intraday_history(
-            [
-                (datetime(2026, 8, 26, 14, 30, tzinfo=metrics.EASTERN), 99960.0),
-                (datetime(2026, 8, 26, 15, 30, tzinfo=metrics.EASTERN), 99954.52),
-            ]
-        )
+    def test_realized_equity_uses_exit_date_and_excludes_open_session(self):
+        sessions = [
+            {
+                "trading_day": "2026-08-26",
+                "entry_date": "2026-08-26",
+                "exit_date": "2026-08-27",
+                "status": "open",
+                "realized_pnl": None,
+            },
+            {
+                "trading_day": "2026-08-25",
+                "entry_date": "2026-08-25",
+                "exit_date": "2026-08-26",
+                "status": "closed",
+                "realized_pnl": -45.47051112189365,
+            },
+        ]
 
-        result = metrics.append_provisional_close(
-            series,
-            intraday,
-            now=datetime(2026, 8, 27, 1, 30, tzinfo=metrics.EASTERN),
-            market_is_open=False,
+        result = metrics.realized_equity_series(
+            sessions,
             base_value=100000.0,
+            inception=date(2026, 8, 25),
         )
 
         self.assertEqual([point.day for point in result], [date(2026, 8, 25), date(2026, 8, 26)])
-        self.assertAlmostEqual(result[-1].equity, 99954.52)
-        self.assertAlmostEqual(result[-1].profit_loss, -45.48)
-        self.assertTrue(result[-1].provisional)
+        self.assertEqual(result[0].equity, 100000.0)
+        self.assertAlmostEqual(result[-1].equity, 99954.5294888781)
+        self.assertAlmostEqual(result[-1].profit_loss, -45.47051112189365)
 
-    def test_provisional_close_never_uses_an_open_session(self):
-        series = metrics.equity_series(history([(date(2026, 8, 25), 99987.75)]))
-        intraday = intraday_history(
-            [(datetime(2026, 8, 26, 10, 30, tzinfo=metrics.EASTERN), 100100.0)]
-        )
+    def test_realized_equity_aggregates_baskets_closed_on_the_same_day(self):
+        sessions = [
+            {
+                "trading_day": "2026-08-25",
+                "entry_date": "2026-08-25",
+                "exit_date": "2026-08-26",
+                "status": "closed",
+                "realized_pnl": -45.0,
+            },
+            {
+                "trading_day": "2026-08-26",
+                "entry_date": "2026-08-26",
+                "exit_date": "2026-08-26",
+                "status": "closed",
+                "realized_pnl": 20.0,
+            },
+        ]
 
-        result = metrics.append_provisional_close(
-            series,
-            intraday,
-            now=datetime(2026, 8, 26, 12, 0, tzinfo=metrics.EASTERN),
-            market_is_open=True,
+        result = metrics.realized_equity_series(
+            sessions,
             base_value=100000.0,
+            inception=date(2026, 8, 25),
         )
 
-        self.assertEqual(result, series)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[-1].day, date(2026, 8, 26))
+        self.assertEqual(result[-1].profit_loss, -25.0)
 
-    def test_official_daily_close_wins_over_intraday_fallback(self):
-        series = metrics.equity_series(history([(date(2026, 8, 26), 99955.0)]))
-        intraday = intraday_history(
-            [(datetime(2026, 8, 26, 15, 30, tzinfo=metrics.EASTERN), 99954.52)]
-        )
-
-        result = metrics.append_provisional_close(
-            series,
-            intraday,
-            now=datetime(2026, 8, 27, 1, 30, tzinfo=metrics.EASTERN),
-            market_is_open=False,
+    def test_realized_equity_starts_flat_before_the_first_exit(self):
+        result = metrics.realized_equity_series(
+            [],
             base_value=100000.0,
+            inception=date(2026, 8, 25),
         )
 
-        self.assertEqual(result, series)
-        self.assertFalse(result[-1].provisional)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].equity, 100000.0)
 
     def test_closed_basket_totals(self):
         trades = metrics.closed_basket(
@@ -222,7 +227,17 @@ class SnapshotTest(unittest.TestCase):
         snapshot = build_snapshot(
             FakeAlpacaClient(),
             state,
+            inception=date(2026, 8, 24),
             now=datetime(2026, 8, 25, 9, 40, tzinfo=metrics.EASTERN),
+            session_history=[
+                {
+                    "trading_day": "2026-08-24",
+                    "entry_date": "2026-08-24",
+                    "exit_date": "2026-08-25",
+                    "status": "closed",
+                    "realized_pnl": 100.0,
+                }
+            ],
         )
         self.assertEqual(
             set(snapshot),
@@ -245,6 +260,8 @@ class SnapshotTest(unittest.TestCase):
         self.assertIsInstance(snapshot["account"]["equity"], float)
         self.assertIsInstance(snapshot["positions"][0]["qty"], float)
         self.assertEqual(snapshot["basket_totals"]["pnl"], 100.0)
+        self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-08-25")
+        self.assertEqual(snapshot["equity_curve"][-1]["profit_loss"], 100.0)
 
 
 class ArtifactTest(unittest.TestCase):

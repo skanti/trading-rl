@@ -36,7 +36,7 @@ from dashboard_metrics import EASTERN
 
 LOGGER = logging.getLogger("dashboard-daemon")
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 SESSIONS_SUBCOLLECTION = "sessions"
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
@@ -151,16 +151,14 @@ class AlpacaClient:
     def positions(self) -> list[dict[str, Any]]:
         return list(self._get("positions"))
 
-    def portfolio_history(
-        self,
-        period: str = "1A",
-        timeframe: str = "1D",
-        intraday_reporting: str | None = None,
-    ) -> dict[str, Any]:
-        params: dict[str, object] = {"period": period, "timeframe": timeframe}
-        if intraday_reporting:
-            params["intraday_reporting"] = intraday_reporting
-        return dict(self._get("account/portfolio/history", **params))
+    def portfolio_history(self, period: str = "1A", timeframe: str = "1D") -> dict[str, Any]:
+        return dict(
+            self._get(
+                "account/portfolio/history",
+                period=period,
+                timeframe=timeframe,
+            )
+        )
 
     def orders(self, *, after: str) -> list[dict[str, Any]]:
         return list(
@@ -265,7 +263,7 @@ def first_trade_date(work_dir: Path) -> date | None:
 
 def session_records(
     work_dir: Path,
-    limit: int = 120,
+    limit: int | None = 120,
     order_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Turn per-day ``summary.json`` artifacts into dashboard session rows."""
@@ -339,7 +337,7 @@ def session_records(
                 "error": summary.get("error")
             }
         )
-        if len(records) >= limit:
+        if limit is not None and len(records) >= limit:
             break
     return records
 
@@ -350,6 +348,7 @@ def build_snapshot(
     inception: date | None = None,
     now: datetime | None = None,
     order_history: Sequence[Mapping[str, Any]] | None = None,
+    session_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fetch everything the dashboard shows and shape it into one Firestore document."""
     reference = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
@@ -381,26 +380,14 @@ def build_snapshot(
         except ValueError:
             series_start = None
 
-    series = performance.equity_series(history, since=series_start)
-    try:
-        intraday_history = client.portfolio_history(
-            period="7D",
-            timeframe="1H",
-            intraday_reporting="market_hours",
-        )
-        series = performance.append_provisional_close(
-            series,
-            intraday_history,
-            now=reference,
-            market_is_open=bool(market.get("is_open", True)),
-            base_value=performance.inception_equity(history, series),
-            since=series_start,
-        )
-    except Exception:  # noqa: BLE001 - official daily history remains authoritative
-        LOGGER.warning("could not load intraday history; publishing finalized closes only")
-
-    buckets = performance.performance_table(series, account, history, now=reference)
-    stats = performance.statistics(series)
+    account_series = performance.equity_series(history, since=series_start)
+    series = performance.realized_equity_series(
+        session_history or [],
+        base_value=performance.inception_equity(history, account_series),
+        inception=inception,
+    )
+    buckets = performance.realized_performance_table(series, now=reference)
+    stats = performance.statistics(series, baseline_is_first=True)
 
     position = state.get("position") or {}
     closed = performance.closed_basket(position) if position else []
@@ -430,8 +417,7 @@ def build_snapshot(
                 "day": point.day.isoformat(),
                 "equity": point.equity,
                 "profit_loss": point.profit_loss,
-                "profit_loss_pct": point.profit_loss_pct,
-                **({"provisional": True} if point.provisional else {})
+                "profit_loss_pct": point.profit_loss_pct
             }
             for point in series
         ],
@@ -619,16 +605,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 order_history = client.orders(after=f"{inception.isoformat()}T00:00:00Z")
             except Exception:  # noqa: BLE001 - fall back to durable artifact summaries
                 LOGGER.warning("could not load order history; using artifact session totals")
+        all_sessions = session_records(
+            work_dir,
+            limit=None,
+            order_history=order_history,
+        )
+        sessions = all_sessions[:args.sessions_limit]
         snapshot = build_snapshot(
             client,
             state,
             inception=inception,
             order_history=order_history,
-        )
-        sessions = session_records(
-            work_dir,
-            limit=args.sessions_limit,
-            order_history=order_history,
+            session_history=all_sessions,
         )
         if args.dry_run:
             print(json.dumps({"snapshot": snapshot, "sessions": sessions}, indent=2, default=str))
