@@ -550,11 +550,13 @@ class StrategyConfig:
     exchanges: frozenset[str]
     data_batch_size: int
     data_workers: int
+    order_submit_workers: int
     capital: float | None
     capital_fraction: float
     cash_buffer_fraction: float
     fill_timeout_seconds: float
     poll_seconds: float
+    entry_preflight_seconds: float
     share_mode: str
     quote_max_age_seconds: float
 
@@ -1024,6 +1026,39 @@ def _order_summary(order: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _submit_entry_order(
+    client: AlpacaClient,
+    symbol: str,
+    payload: Mapping[str, object],
+    *,
+    recover_existing: bool,
+) -> tuple[str, dict[str, Any], dict[str, object]]:
+    """Submit one entry order, recovering deterministic IDs after uncertain failures."""
+    started_at = datetime.now(tz=EASTERN)
+    started_monotonic = time_module.monotonic()
+    client_order_id = str(payload["client_order_id"])
+    order = client.order_by_client_id(client_order_id) if recover_existing else None
+    recovered = order is not None
+    if order is None:
+        try:
+            order = client.submit_order(payload)
+        except Exception:
+            # A timed-out POST can still have reached Alpaca. Query its deterministic
+            # ID before allowing the daemon to retry, preventing a duplicate order.
+            order = client.order_by_client_id(client_order_id)
+            if order is None:
+                raise
+            recovered = True
+    completed_at = datetime.now(tz=EASTERN)
+    telemetry: dict[str, object] = {
+        "dispatch_started_at": _iso_now(started_at),
+        "dispatch_completed_at": _iso_now(completed_at),
+        "dispatch_duration_ms": (time_module.monotonic() - started_monotonic) * 1000.0,
+        "recovered_by_client_order_id": recovered,
+    }
+    return symbol, dict(order), telemetry
+
+
 def _exit_order_time_in_force(
     position: Mapping[str, object], now: datetime | None = None
 ) -> str:
@@ -1136,7 +1171,13 @@ def enter_for_day(
     trade_date: date,
     submit: bool,
     now: datetime | None = None,
+    *,
+    preflight_only: bool = False,
+    dispatch_target: datetime | None = None,
+    preflight_market_validated: bool = False,
 ) -> dict[str, Any]:
+    if preflight_only and not submit:
+        raise ValueError("preflight_only requires an authorized submit workflow")
     with store.locked():
         state = store.load()
         ranking = state.get("ranking") or {}
@@ -1151,6 +1192,8 @@ def enter_for_day(
         ):
             raise RuntimeError(f"no current ranking for {trade_date}; run the rank action first")
         if resuming:
+            if preflight_only:
+                return dict(previous)
             if not submit and previous.get("status") == "planned":
                 return dict(previous)
             LOGGER.info("entry workflow for %s already exists; resuming it", trade_date)
@@ -1171,6 +1214,7 @@ def enter_for_day(
                 raise RuntimeError(
                     f"strategy position from {previous.get('entry_date')} is still {previous.get('status')}"
                 )
+            preflight_started_at = now or datetime.now(tz=EASTERN)
             held_symbols = {str(item["symbol"]) for item in client.positions()}
             open_order_symbols = {str(item["symbol"]) for item in client.list_orders("open")}
             selected = _select_unconflicted_candidates(
@@ -1192,7 +1236,7 @@ def enter_for_day(
             position = {
                 "entry_date": trade_date.isoformat(),
                 "exit_date": _next_session(client, trade_date).isoformat(),
-                "status": "planned" if not submit else "entering",
+                "status": "planned" if preflight_only or not submit else "entering",
                 "share_mode": share_mode,
                 "quote_feed": config.quote_feed if share_mode == "whole" else None,
                 "symbols": selected,
@@ -1214,6 +1258,14 @@ def enter_for_day(
                     )
                 },
                 "entry_account_snapshot_at": _iso_now(now),
+                "entry_preflight_started_at": _iso_now(preflight_started_at),
+                "entry_preflight_completed_at": _iso_now(),
+                "entry_dispatch_target_at": _iso_now(dispatch_target)
+                if dispatch_target is not None
+                else None,
+                "entry_preflight_seconds": config.entry_preflight_seconds,
+                "entry_preflight_market_validated": preflight_market_validated,
+                "order_submit_workers": config.order_submit_workers,
                 "entry_orders": {},
                 "exit_orders": {},
                 "created_at": _iso_now(now),
@@ -1222,6 +1274,21 @@ def enter_for_day(
                 state["position"] = position
                 state["updated_at"] = _iso_now(now)
                 store.save(state)
+
+        if preflight_only:
+            LOGGER.info(
+                "entry preflight prepared for %s: symbols=%d, orders=%d, target=%s",
+                trade_date,
+                len(selected),
+                sum(
+                    int(value) > 0
+                    for value in (position.get("target_quantities") or {}).values()
+                )
+                if share_mode == "whole"
+                else len(selected),
+                position.get("entry_dispatch_target_at"),
+            )
+            return position
 
         if not submit:
             return position
@@ -1238,38 +1305,104 @@ def enter_for_day(
             target_quantities = {}
             order_symbols = selected
 
-        submitted: dict[str, dict[str, Any]] = {}
+        payloads: dict[str, dict[str, object]] = {}
         for symbol in order_symbols:
             client_id = _client_order_id(trade_date, "buy", symbol)
-            order = client.order_by_client_id(client_id)
-            if order is None:
-                size = (
-                    {"qty": str(target_quantities[symbol])}
-                    if share_mode == "whole"
-                    else {"notional": f"{per_symbol:.2f}"}
-                )
-                order = client.submit_order(
-                    {
-                        "symbol": symbol,
-                        **size,
-                        "side": "buy",
-                        "type": "market",
-                        "time_in_force": "day",
-                        "client_order_id": client_id,
-                    }
-                )
+            size = (
+                {"qty": str(target_quantities[symbol])}
+                if share_mode == "whole"
+                else {"notional": f"{per_symbol:.2f}"}
+            )
+            payloads[symbol] = {
+                "symbol": symbol,
+                **size,
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "client_order_id": client_id,
+            }
+
+        recover_existing = bool(position.get("entry_dispatch_started_at"))
+        dispatch_started_at = datetime.now(tz=EASTERN)
+        position["status"] = "entering"
+        position.setdefault("entry_dispatch_started_at", _iso_now(dispatch_started_at))
+        position["entry_dispatch_last_attempt_at"] = _iso_now(dispatch_started_at)
+        target_value = position.get("entry_dispatch_target_at")
+        if target_value and "entry_dispatch_lateness_ms" not in position:
+            target_at = _parse_timestamp(str(target_value)).astimezone(EASTERN)
+            position["entry_dispatch_lateness_ms"] = (
+                dispatch_started_at - target_at
+            ).total_seconds() * 1000.0
+        state["position"] = position
+        state["updated_at"] = _iso_now(dispatch_started_at)
+        store.save(state)
+
+        workers = max(
+            1,
+            min(
+                int(position.get("order_submit_workers") or config.order_submit_workers),
+                len(order_symbols),
+            ),
+        )
+        results: dict[str, tuple[dict[str, Any], dict[str, object]]] = {}
+        failures: dict[str, Exception] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _submit_entry_order,
+                    client,
+                    symbol,
+                    payloads[symbol],
+                    recover_existing=recover_existing,
+                ): symbol
+                for symbol in order_symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    _, order, telemetry = future.result()
+                except Exception as error:  # noqa: BLE001 - persist partial dispatch
+                    failures[symbol] = error
+                else:
+                    results[symbol] = (order, telemetry)
+
+        submitted: dict[str, dict[str, Any]] = {}
+        for symbol in order_symbols:
+            result = results.get(symbol)
+            if result is None:
+                continue
+            order, telemetry = result
             submitted[symbol] = order
-            position["entry_orders"][symbol] = _order_summary(order)
-            state["position"] = position
-            state["updated_at"] = _iso_now(now)
-            store.save(state)
+            previous_summary = position["entry_orders"].get(symbol, {})
+            summary = {
+                **previous_summary,
+                **_order_summary(order),
+            }
+            for key, value in telemetry.items():
+                summary.setdefault(key, value)
+            summary["recovered_by_client_order_id"] = bool(
+                previous_summary.get("recovered_by_client_order_id")
+                or telemetry.get("recovered_by_client_order_id")
+            )
+            position["entry_orders"][symbol] = summary
+        position["entry_dispatch_completed_at"] = _iso_now()
+        state["position"] = position
+        state["updated_at"] = _iso_now()
+        store.save(state)
+        if failures:
+            failed = ", ".join(sorted(failures))
+            first_error = failures[next(iter(failures))]
+            raise RuntimeError(f"entry submission failed for: {failed}") from first_error
 
         final_orders = _wait_for_orders(
             client, submitted, config.fill_timeout_seconds, config.poll_seconds
         )
         filled_symbols = []
         for symbol, order in final_orders.items():
-            position["entry_orders"][symbol] = _order_summary(order)
+            position["entry_orders"][symbol] = {
+                **position["entry_orders"].get(symbol, {}),
+                **_order_summary(order),
+            }
             if _float(order.get("filled_qty", 0), "order.filled_qty") > 0.0:
                 filled_symbols.append(symbol)
         position["filled_symbols"] = filled_symbols
@@ -1458,7 +1591,11 @@ def _print_entry_plan(
     submit: bool,
     console: Console = CONSOLE,
 ) -> None:
-    table = Table(title="Overnight basket entry" if submit else "DRY RUN — overnight basket entry")
+    if submit and position.get("status") == "planned":
+        title = "PREPARED — overnight basket entry"
+    else:
+        title = "Overnight basket entry" if submit else "DRY RUN — overnight basket entry"
+    table = Table(title=title)
     table.add_column("Symbol")
     share_mode = str(position.get("share_mode") or "fractional")
     table.add_column("Quantity" if share_mode == "whole" else "Notional", justify="right")
@@ -1637,6 +1774,7 @@ def run_daemon(
     while True:
         now = datetime.now(tz=EASTERN)
         today = now.date()
+        sleep_seconds = config.poll_seconds
         artifacts.directory(today)
         try:
             state = store.load()
@@ -1692,8 +1830,10 @@ def run_daemon(
             same_day_status = (
                 position.get("status") if position.get("entry_date") == today.isoformat() else None
             )
-            new_entry_due = entry_at <= now <= entry_deadline and same_day_status is None
-            restart_due = same_day_status == "entering" and now < _combine(today, time(16, 0))
+            preflight_at = entry_at - timedelta(seconds=config.entry_preflight_seconds)
+            preflight_due = (
+                preflight_at <= now < entry_at and same_day_status is None
+            )
             ranking_ready = (
                 ranking.get("trade_date") == today.isoformat()
                 and ranking.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
@@ -1701,13 +1841,53 @@ def run_daemon(
             ranking_early = ranking_ready and _ranking_is_early_enough(
                 ranking, entry_at, minimum_ranking_lead_minutes
             )
+            if preflight_due and ranking_early and may_attempt("entry-preflight", now):
+                _validate_live_clock(client, today)
+                prepared = enter_for_day(
+                    client,
+                    store,
+                    config,
+                    today,
+                    submit=True,
+                    now=now,
+                    preflight_only=True,
+                    dispatch_target=entry_at,
+                    preflight_market_validated=True,
+                )
+                _print_entry_plan(prepared, True)
+                artifacts.write_summary(today, "entry-preflight", store, config)
+
+            # Preflight can take long enough to cross the target second. Refresh the
+            # clock and state before deciding whether dispatch is due.
+            now = datetime.now(tz=EASTERN)
+            state = store.load()
+            position = state.get("position") or {}
+            same_day_status = (
+                position.get("status") if position.get("entry_date") == today.isoformat() else None
+            )
+            new_entry_due = (
+                entry_at <= now <= entry_deadline
+                and same_day_status in (None, "planned")
+            )
+            restart_due = same_day_status == "entering" and now < _combine(today, time(16, 0))
             if (
                 (new_entry_due or restart_due)
                 and ranking_early
                 and may_attempt("entry", now)
             ):
-                _validate_live_clock(client, today)
-                result = enter_for_day(client, store, config, today, submit=True, now=now)
+                # A planned entry already passed the live clock check during
+                # preflight. Avoid another network round trip at the target second.
+                if not position.get("entry_preflight_market_validated"):
+                    _validate_live_clock(client, today)
+                result = enter_for_day(
+                    client,
+                    store,
+                    config,
+                    today,
+                    submit=True,
+                    now=now,
+                    dispatch_target=entry_at,
+                )
                 _print_entry_plan(result, True)
                 artifacts.write_summary(today, "enter", store, config)
             elif new_entry_due and not ranking_early and may_attempt("missing-ranking", now):
@@ -1716,6 +1896,15 @@ def run_daemon(
                     minimum_ranking_lead_minutes,
                     entry_time.strftime("%H:%M"),
                 )
+            state = store.load()
+            position = state.get("position") or {}
+            if (
+                position.get("entry_date") == today.isoformat()
+                and position.get("status") == "planned"
+            ):
+                remaining = (entry_at - datetime.now(tz=EASTERN)).total_seconds()
+                if 0.0 < remaining < sleep_seconds:
+                    sleep_seconds = max(0.001, remaining)
             last_error_key = None
         except Exception as error:
             key = (today.isoformat(), str(error))
@@ -1723,7 +1912,7 @@ def run_daemon(
                 LOGGER.exception("scheduled action failed; the daemon will retry: %s", error)
                 last_error_key = key
             artifacts.write_summary(today, "error", store, config, error=str(error))
-        time_module.sleep(config.poll_seconds)
+        time_module.sleep(sleep_seconds)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1779,6 +1968,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exchanges", default=",".join(sorted(DEFAULT_EXCHANGES)))
     parser.add_argument("--data-batch-size", type=int, default=100)
     parser.add_argument("--data-workers", type=int, default=4)
+    parser.add_argument(
+        "--order-submit-workers",
+        type=int,
+        default=8,
+        help="maximum concurrent entry-order submissions (default: 8)",
+    )
     capital = parser.add_mutually_exclusive_group()
     capital.add_argument("--capital", type=float, default=None, help="maximum dollars deployed")
     capital.add_argument(
@@ -1802,6 +1997,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--fill-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--entry-preflight-seconds",
+        type=float,
+        default=10.0,
+        help="prepare account checks, quotes, and sizing this many seconds before entry (default: 10)",
+    )
     parser.add_argument(
         "--work-dir",
         default=str(DEFAULT_WORK_DIR),
@@ -1846,6 +2047,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("activity-candidates must be in [1, 100]")
     if not 1 <= args.data_batch_size <= 200 or not 1 <= args.data_workers <= 16:
         parser.error("data-batch-size must be 1..200 and data-workers must be 1..16")
+    if not 1 <= args.order_submit_workers <= 32:
+        parser.error("order-submit-workers must be in [1, 32]")
     if args.capital is not None and args.capital <= 0.0:
         parser.error("capital must be positive")
     if not 0.0 < args.capital_fraction <= 1.0:
@@ -1860,8 +2063,15 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error(
             "fill-timeout-seconds, poll-seconds, and quote-max-age-seconds must be positive"
         )
-    if args.minimum_ranking_lead_minutes < 0 or args.entry_grace_seconds < 0:
-        parser.error("minimum-ranking-lead-minutes and entry-grace-seconds must be non-negative")
+    if (
+        args.minimum_ranking_lead_minutes < 0
+        or args.entry_grace_seconds < 0
+        or args.entry_preflight_seconds < 0.0
+    ):
+        parser.error(
+            "minimum-ranking-lead-minutes, entry-grace-seconds, and "
+            "entry-preflight-seconds must be non-negative"
+        )
     if args.request_timeout_seconds <= 0.0:
         parser.error("request-timeout-seconds must be positive")
     regular_open = time(9, 30)
@@ -1898,11 +2108,13 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         exchanges=exchanges,
         data_batch_size=args.data_batch_size,
         data_workers=args.data_workers,
+        order_submit_workers=args.order_submit_workers,
         capital=args.capital,
         capital_fraction=args.capital_fraction,
         cash_buffer_fraction=args.cash_buffer_fraction,
         fill_timeout_seconds=args.fill_timeout_seconds,
         poll_seconds=args.poll_seconds,
+        entry_preflight_seconds=args.entry_preflight_seconds,
         share_mode=args.share_mode,
         quote_max_age_seconds=args.quote_max_age_seconds,
     )

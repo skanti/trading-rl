@@ -1,8 +1,10 @@
 import json
 import logging
 import tempfile
+import threading
+import time
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from rich.console import Console
@@ -46,11 +48,13 @@ def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
         exchanges=DEFAULT_EXCHANGES,
         data_batch_size=100,
         data_workers=1,
+        order_submit_workers=8,
         capital=None,
         capital_fraction=0.95,
         cash_buffer_fraction=0.02,
         fill_timeout_seconds=fill_timeout_seconds,
         poll_seconds=0.001,
+        entry_preflight_seconds=10.0,
         share_mode=share_mode,
         quote_max_age_seconds=120.0,
     )
@@ -169,6 +173,29 @@ class FakeWorkingExitBroker(FakeQueuedBroker):
         raise AssertionError("a working exit order must not be canceled on the fill timeout")
 
 
+class FakeConcurrentBroker(FakeBroker):
+    def __init__(self):
+        super().__init__()
+        self.active_submissions = 0
+        self.max_active_submissions = 0
+        self._activity_lock = threading.Lock()
+        self._submission_lock = threading.Lock()
+
+    def submit_order(self, payload):
+        with self._activity_lock:
+            self.active_submissions += 1
+            self.max_active_submissions = max(
+                self.max_active_submissions, self.active_submissions
+            )
+        try:
+            time.sleep(0.01)
+            with self._submission_lock:
+                return super().submit_order(payload)
+        finally:
+            with self._activity_lock:
+                self.active_submissions -= 1
+
+
 class FakeClockBroker:
     def __init__(self, timestamp, is_open):
         self.timestamp = timestamp
@@ -239,10 +266,14 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(args.quote_feed, "iex")
         self.assertEqual(args.capital_fraction, 1.0)
         self.assertEqual(args.quote_max_age_seconds, 120.0)
+        self.assertEqual(args.entry_preflight_seconds, 10.0)
+        self.assertEqual(args.order_submit_workers, 8)
         self.assertEqual(parsed.capital_fraction, 1.0)
         self.assertEqual(parsed.feed, "sip")
         self.assertEqual(parsed.quote_feed, "iex")
         self.assertEqual(parsed.quote_max_age_seconds, 120.0)
+        self.assertEqual(parsed.entry_preflight_seconds, 10.0)
+        self.assertEqual(parsed.order_submit_workers, 8)
         self.assertEqual(parsed.poll_seconds, 1.0)
 
         preview_args = parser.parse_args(["preview"])
@@ -554,6 +585,71 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(len(broker.submissions), 1)
         self.assertEqual(broker.submissions[0]["qty"], "3")
         self.assertNotIn("notional", broker.submissions[0])
+        self.assertEqual(
+            second["entry_orders"]["A"]["dispatch_started_at"],
+            first["entry_orders"]["A"]["dispatch_started_at"],
+        )
+        self.assertTrue(
+            second["entry_orders"]["A"]["recovered_by_client_order_id"]
+        )
+
+    def test_preflight_persists_sizing_then_dispatches_orders_concurrently(self):
+        broker = FakeConcurrentBroker()
+        symbols = [f"S{index}" for index in range(8)]
+        broker.latest_quote_rows = {
+            symbol: {"ap": 10.0, "t": "2026-08-24T19:58:50Z"}
+            for symbol in symbols
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.json")
+            state = store.load()
+            state["ranking"] = {
+                "trade_date": "2026-08-24",
+                "ranking_pipeline_version": RANKING_PIPELINE_VERSION,
+                "candidates": [
+                    {"rank": index + 1, "symbol": symbol}
+                    for index, symbol in enumerate(symbols)
+                ],
+            }
+            store.save(state)
+            target = datetime(2026, 8, 24, 15, 59, tzinfo=EASTERN)
+
+            prepared = enter_for_day(
+                broker,
+                store,
+                config(top=8, share_mode="whole"),
+                date(2026, 8, 24),
+                submit=True,
+                now=target - timedelta(seconds=10),
+                preflight_only=True,
+                dispatch_target=target,
+            )
+
+            self.assertEqual(prepared["status"], "planned")
+            self.assertEqual(prepared["order_submit_workers"], 8)
+            self.assertEqual(broker.submissions, [])
+            self.assertEqual(len(broker.latest_quote_calls), 1)
+
+            entered = enter_for_day(
+                broker,
+                store,
+                config(top=8, share_mode="whole"),
+                date(2026, 8, 24),
+                submit=True,
+                now=target,
+                dispatch_target=target,
+            )
+
+        self.assertEqual(entered["status"], "open")
+        self.assertEqual(len(broker.submissions), 8)
+        self.assertEqual(len(broker.latest_quote_calls), 1)
+        self.assertGreater(broker.max_active_submissions, 1)
+        self.assertTrue(
+            all(
+                "dispatch_duration_ms" in order
+                for order in entered["entry_orders"].values()
+            )
+        )
 
     def test_entry_skips_conflicting_position_and_is_idempotent(self):
         broker = FakeBroker()

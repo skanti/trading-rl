@@ -9,6 +9,11 @@
 4. Equal-weight the selected stocks, then close them at 09:45 on the next
    trading session.
 
+Transaction costs default to 1 basis point per side, or 2 basis points for a
+complete entry-and-exit round trip. Override this with `--transaction-cost-bps`.
+The potentially long per-symbol trade-frequency table is hidden by default;
+include `--show-symbol-trade-frequency` when that breakdown is needed.
+
 Every simulated stock must have at least 100 completed observed trading
 sessions before it can be selected. The current session is not counted. Change
 this causal listing-history filter with `--minimum-trading-days`; the default
@@ -186,6 +191,8 @@ python -m baseline.live_overnight_liquidity run \
   --top 10 \
   --ranking-time 15:00 \
   --entry-time 15:55 \
+  --entry-preflight-seconds 10 \
+  --order-submit-workers 8 \
   --exit-time 09:00 \
   --feed sip \
   --quote-feed iex \
@@ -203,9 +210,20 @@ same-day stock-sale proceeds even though they are immediately reusable for equit
 The pre-entry account fields used for sizing are saved in strategy state and daily
 summaries for auditability.
 
-Live execution defaults to `--share-mode whole`. Immediately before entry it requests
-the latest ask for every selected stock from `--quote-feed iex`, rejects missing quotes
-or quotes older than the default `--quote-max-age-seconds 120`, and floors each
+In persistent `run` mode, entry is a two-phase operation. By default, the daemon
+checks the account and conflicts, fetches the basket's latest quotes, calculates
+whole-share quantities, and durably records the plan 10 seconds before
+`--entry-time`. At the target second it performs no quote or account refresh; it
+dispatches the prepared orders with up to eight concurrent workers. Configure
+these values with `--entry-preflight-seconds` and `--order-submit-workers`.
+Deterministic client order IDs make a partial or uncertain concurrent dispatch
+restart-safe, and the state records per-order dispatch timing for later analysis.
+Alpaca has no batch request for unrelated equity orders, so every symbol remains
+an individual `POST /v2/orders` request.
+
+Live execution defaults to `--share-mode whole`. During entry preflight it requests the
+latest ask for every selected stock from `--quote-feed iex`, rejects missing quotes or
+quotes older than the default `--quote-max-age-seconds 120`, and floors each
 equal-notional allocation to an integer quantity using the same rule as the simulator.
 Unused dollars and any allocation too small to buy one share remain cash; they are not
 redistributed to cheaper names. The quote prices, timestamps, target quantities, skipped

@@ -33,6 +33,7 @@ from week_dataset import forward_fill_positions
 
 
 REFERENCE_SYMBOL = "ST-SPY"
+DEFAULT_TRANSACTION_COST_BPS = 1.0
 EXTENDED_OPEN_MINUTE = 4 * 60
 
 # Reg T governs anything held past the close, so an overnight strategy cannot reach the
@@ -1525,7 +1526,12 @@ def main() -> None:
     )
     parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:55"))
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:45"))
-    parser.add_argument("--transaction-cost-bps", type=float, default=0.0, help="cost per side")
+    parser.add_argument(
+        "--transaction-cost-bps",
+        type=float,
+        default=DEFAULT_TRANSACTION_COST_BPS,
+        help="transaction cost in basis points per side (default: 1.0)",
+    )
     parser.add_argument(
         "--share-mode",
         choices=("fractional", "whole"),
@@ -1591,6 +1597,11 @@ def main() -> None:
     )
     parser.add_argument("--output-csv", default=None)
     parser.add_argument("--summary-json", default=None)
+    parser.add_argument(
+        "--show-symbol-trade-frequency",
+        action="store_true",
+        help="print the per-symbol trade-frequency and average-return table",
+    )
     args = parser.parse_args()
 
     if args.leverage < 1.0:
@@ -1822,7 +1833,8 @@ def main() -> None:
         print_scheme_comparison(summaries)
     else:
         print_summary_table(summaries[args.liquidity_scheme])
-    print_symbol_trade_counts(trades_by_scheme)
+    if args.show_symbol_trade_frequency:
+        print_symbol_trade_counts(trades_by_scheme)
 
     if args.output_csv:
         output_csv = Path(args.output_csv)

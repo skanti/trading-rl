@@ -7,6 +7,7 @@ import pandas as pd
 from rich.console import Console
 
 from baseline.overnight_liquidity import (
+    DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
     activity_union_candidate_mask,
     basket_quantities,
@@ -25,6 +26,9 @@ from baseline.overnight_liquidity import (
 
 
 class OvernightLiquidityBaselineTest(unittest.TestCase):
+    def test_default_transaction_cost_is_one_basis_point_per_side(self):
+        self.assertEqual(DEFAULT_TRANSACTION_COST_BPS, 1.0)
+
     def test_whole_share_sizing_rounds_down_without_exceeding_budget(self):
         prices = np.array([120.0, 300.0, 700.0])
 
