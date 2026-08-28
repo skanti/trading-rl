@@ -14,8 +14,11 @@ from baseline.overnight_liquidity import (
     causal_ema_log_liquidity,
     causal_completed_trading_days,
     company_universe_mask,
+    exchange_universe_mask,
     is_company_security,
     liquidity_scores,
+    load_opening_auction_prices,
+    load_primary_auction_exchange_mask,
     print_scheme_comparison,
     print_symbol_trade_counts,
     print_summary_table,
@@ -25,9 +28,107 @@ from baseline.overnight_liquidity import (
 )
 
 
+def write_auction_npz(path: Path, rows: list[dict[str, object]]) -> None:
+    np.savez_compressed(
+        path,
+        split_adjusted=np.asarray(True),
+        symbol=np.asarray([row["symbol"] for row in rows]),
+        date=np.asarray([row["date"] for row in rows], dtype="datetime64[D]"),
+        session=np.asarray(
+            [0 if row["session"] == "open" else 1 for row in rows], dtype=np.uint8
+        ),
+        condition=np.asarray([row["condition"] for row in rows]),
+        price=np.asarray([row["price"] for row in rows], dtype=np.float64),
+        size=np.asarray([row["size"] for row in rows], dtype=np.float64),
+        exchange=np.asarray([row["exchange"] for row in rows]),
+    )
+
+
 class OvernightLiquidityBaselineTest(unittest.TestCase):
     def test_default_transaction_cost_is_one_basis_point_per_side(self):
         self.assertEqual(DEFAULT_TRANSACTION_COST_BPS, 1.0)
+
+    def test_opening_auction_loader_uses_only_official_condition_o(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auctions.npz"
+            write_auction_npz(
+                path,
+                [
+                    {
+                        "symbol": "AAPL",
+                        "date": "2026-08-25",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 100.0,
+                        "size": 10,
+                        "exchange": "V",
+                    },
+                    {
+                        "symbol": "AAPL",
+                        "date": "2026-08-25",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 50.5,
+                        "size": 2_000,
+                        "exchange": "Q",
+                    },
+                    {
+                        "symbol": "AAPL",
+                        "date": "2026-08-25",
+                        "session": "close",
+                        "condition": "6",
+                        "price": 102.0,
+                        "size": 2_000,
+                        "exchange": "Q",
+                    },
+                ],
+            )
+
+            prices = load_opening_auction_prices(
+                path,
+                pd.DatetimeIndex(["2026-08-25"]),
+                np.array(["ST-AAPL", "ST-MSFT"]),
+            )
+
+        self.assertEqual(prices[0, 0], 50.5)
+        self.assertTrue(np.isnan(prices[0, 1]))
+
+    def test_historical_exchange_mask_overrides_known_listing_transfer_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auctions.npz"
+            write_auction_npz(
+                path,
+                [
+                    {
+                        "symbol": "PLTR",
+                        "date": "2024-11-21",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 62.61,
+                        "size": 735_725,
+                        "exchange": "N",
+                    },
+                    {
+                        "symbol": "PLTR",
+                        "date": "2024-11-27",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 66.00,
+                        "size": 800_000,
+                        "exchange": "Q",
+                    },
+                ],
+            )
+
+            mask, known = load_primary_auction_exchange_mask(
+                path,
+                pd.DatetimeIndex(["2024-11-21", "2024-11-27"]),
+                np.array(["ST-PLTR", "ST-UNKNOWN"]),
+                "nasdaq",
+            )
+
+        self.assertEqual(known, 2)
+        self.assertEqual(mask.tolist(), [[False, True], [True, True]])
 
     def test_whole_share_sizing_rounds_down_without_exceeding_budget(self):
         prices = np.array([120.0, 300.0, 700.0])
@@ -368,6 +469,17 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertEqual(mask.tolist(), [True])
         self.assertEqual(reasons, {})
         self.assertEqual(unclassified, 1)
+
+    def test_exchange_mask_reranks_nasdaq_candidates_and_keeps_spy_benchmark(self):
+        symbols = np.array(["ST-SPY", "ST-AAPL", "ST-JPM", "ST-UNKNOWN"])
+        security_master = {
+            "AAPL": {"exchange": "Q"},
+            "JPM": {"exchange": "N"},
+        }
+
+        mask = exchange_universe_mask(symbols, security_master, "nasdaq")
+
+        self.assertEqual(mask.tolist(), [True, True, False, False])
 
     def test_rank_segment_can_exclude_the_most_liquid_names(self):
         selected = top_liquid_indices(

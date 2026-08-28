@@ -95,6 +95,108 @@ no fresh print exists at 09:45, the backtest uses the latest causal mark up to
 is preferable to silently replacing the stock with next-morning lookahead, but
 such a stale mark is not evidence that a live order could have filled at 09:45.
 
+### Incremental minute-bar updates
+
+Existing `.npy` bar files can be extended without redownloading every ticker's full
+history:
+
+```bash
+.venv/bin/python ../scripts/download_bars.py \
+  --source alpaca \
+  --tickers_path /path/to/tickers.txt \
+  --out_dir /data/ppv1/updates/bars \
+  --since 2022-08-27 \
+  --update_existing
+```
+
+For an existing ticker, the downloader fetches a 30-calendar-day overlap, compares
+timestamps, split-adjusted open prices, volumes, and trade counts exactly, and appends
+only when the overlap matches. Any difference—including the historical rewrite caused
+by a new split—automatically escalates that ticker to a full retained-history refresh.
+Other tickers remain incremental. `--since` supplies the start for new ticker files;
+an existing file supplies its own retained start. Use `--overlap_days` to widen the
+verification window.
+
+Use `--timeframe 1Day` for complete daily bars. Daily files retain timestamp,
+OHLC prices, volume, trade count, and VWAP; the exact column order is recorded in
+`_download_manifest.json`. They use `int64` so extreme split-adjusted histories do
+not overflow. The downloader excludes a still-forming New York session.
+Future updates can reuse the manifest's start date:
+
+```bash
+.venv/bin/python ../scripts/download_bars.py \
+  --source alpaca \
+  --timeframe 1Day \
+  --tickers_path /home/aavetisyan/dev/trading-rl/data/master.txt \
+  --out_dir /data/ppv1/updates/daily_bars_2016-01-01 \
+  --update_existing
+```
+
+### Opening-auction exit prices
+
+For an OPG comparison, download Alpaca's SIP auction prints and ask the simulator
+to replace the 09:30 minute-bar exit with the primary exchange's official opening
+auction. The downloader retains both opening and closing records, but the simulator
+selects the largest opening record with condition `O` for each symbol-date. Alpaca
+can return smaller alternate-venue auctions and duplicate tape records alongside the
+primary listing auction. The columnar NPZ stores consumer-facing prices and sizes
+already adjusted with Alpaca's complete forward/reverse split ledger. It also embeds
+the raw fields and ledger so every update can recompute all adjustments; the simulator
+does not apply splits itself.
+
+```bash
+set -a
+source .env
+set +a
+.venv/bin/python ../scripts/download_auctions.py \
+  --start 2022-01-01 \
+  --end 2026-08-27 \
+  --symbols-from-trades /tmp/overnight_liquidity_48m_minute.csv \
+  --output /data/ppv1/updates/alpaca_auctions_2022-01-01.npz
+```
+
+For later updates, reuse the same output and provide only a new end date:
+
+```bash
+.venv/bin/python ../scripts/download_auctions.py \
+  --update \
+  --end 2026-09-04 \
+  --output /data/ppv1/updates/alpaca_auctions_2022-01-01.npz
+```
+
+The JSON manifest supplies the original start date and symbol universe. Update mode
+redownloads and replaces only a seven-calendar-day overlap plus the new tail, which
+captures late corrections without downloading years again. Split actions are small,
+so their full retained history is refreshed and reapplied to every raw auction record
+before the NPZ is atomically replaced. Pass `--overlap-days` to change the
+overlap, or `--symbols`/`--symbols-from-trades` to add symbols; only a newly added
+symbol receives a full-history download. Use the last completed trading date for
+`--end` when the Alpaca plan does not permit querying the most recent SIP data.
+
+Then run the comparison:
+
+```bash
+python -m baseline.overnight_liquidity \
+  --top 12 \
+  --months 24 \
+  --budget 10000 \
+  --share-mode fractional \
+  --entry-time 15:59 \
+  --exit-time 09:30 \
+  --exit-price-source opening-auction \
+  --transaction-cost-bps 1
+```
+
+There is no 15:59 auction. The entry therefore remains the 15:59 SIP minute-bar
+open. Substituting the 16:00 closing auction would model a different entry time.
+
+Use `--exchange-filter nasdaq` to remove non-Nasdaq candidates before ranking.
+The top basket is then reranked from the remaining Nasdaq company universe; the
+filter does not merely discard NYSE names after selection. SPY remains available
+only as the benchmark. When the auction file is present, historical primary-auction
+venues override the current directory for known symbol-dates, so a listing transfer
+such as PLTR's 2024 NYSE-to-Nasdaq move is handled at the correct session.
+
 ```bash
 python -m baseline.overnight_liquidity \
   --top 100 \

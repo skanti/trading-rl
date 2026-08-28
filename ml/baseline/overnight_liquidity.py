@@ -46,6 +46,7 @@ MAINTENANCE_MARGIN = 0.30
 MARGIN_INTEREST_DIVISOR = 360.0
 DEFAULT_DAYS_PATH = "/data/ppv1/updates/full_2026-08-22_10d.csv"
 DEFAULT_DATA_DIR = "/data/ppv1/updates/full_2026-08-22"
+DEFAULT_AUCTIONS_PATH = "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
 DEFAULT_SECURITY_MASTER_CACHE = "/tmp/trading/baseline_cache/nasdaq_security_master.json"
 NASDAQ_SYMBOL_DIRECTORY_URLS = (
     "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
@@ -68,6 +69,105 @@ def _security_symbol(sample_id: str) -> str:
     if symbol.startswith("ST-"):
         symbol = symbol[3:]
     return symbol.replace("-", ".").upper()
+
+
+def _load_auction_records(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() != ".npz":
+        raise ValueError(f"auction data must use the split-adjusted NPZ format: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        required = {"symbol", "date", "session", "condition", "price", "size", "exchange"}
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"{path} is missing auction arrays: {sorted(missing)}")
+        if "split_adjusted" not in data.files or not bool(data["split_adjusted"].item()):
+            raise ValueError(f"{path} does not contain pre-adjusted auction prices")
+        session_codes = np.asarray(data["session"], dtype=np.uint8)
+        records = pd.DataFrame(
+            {
+                "symbol": data["symbol"].astype(str),
+                "date": pd.to_datetime(data["date"]),
+                "session": np.where(session_codes == 0, "open", "close"),
+                "condition": data["condition"].astype(str),
+                "price": np.asarray(data["price"], dtype=np.float64),
+                "size": np.asarray(data["size"], dtype=np.float64),
+                "exchange": data["exchange"].astype(str),
+            }
+        )
+    return records
+
+
+def _official_opening_auctions(path: Path) -> pd.DataFrame:
+    """Select the largest condition-O print from pre-adjusted NPZ data."""
+    records = _load_auction_records(path)
+    official = records[
+        records.session.eq("open")
+        & records.condition.eq("O")
+        & np.isfinite(records.price)
+        & records.price.gt(0.0)
+    ].copy()
+    if official.empty:
+        raise ValueError(f"{path} contains no condition-O opening auctions")
+    primary_venue_priority = {"N": 0, "Q": 0, "P": 0, "A": 0, "T": 1, "V": 2}
+    official["venue_priority"] = (
+        official.exchange.map(primary_venue_priority).fillna(3).astype(np.int8)
+    )
+    official.sort_values(["size", "venue_priority"], ascending=[False, True], inplace=True)
+    official.drop_duplicates(["symbol", "date"], inplace=True)
+    return official
+
+
+def load_primary_auction_exchange_mask(
+    path: Path,
+    dates: pd.DatetimeIndex,
+    symbols: np.ndarray,
+    exchange: str,
+) -> tuple[np.ndarray, int]:
+    """Use historical primary auctions to refine a current-exchange universe.
+
+    Missing symbol-dates remain eligible because the current security master has
+    already applied the requested venue filter. Known historical auctions override
+    it, which handles listing transfers without excluding symbols lacking downloaded
+    auction history before they are ever selected.
+    """
+    exchange_codes = {"nasdaq": "Q"}
+    if exchange not in exchange_codes:
+        raise ValueError(f"unsupported exchange filter: {exchange}")
+    wanted = exchange_codes[exchange]
+    official = _official_opening_auctions(path)
+    date_positions = {pd.Timestamp(day): index for index, day in enumerate(dates)}
+    symbol_positions = {
+        _security_symbol(sample_id): index for index, sample_id in enumerate(symbols)
+    }
+    mask = np.ones((len(dates), len(symbols)), dtype=bool)
+    known = 0
+    for record in official.itertuples(index=False):
+        row = date_positions.get(pd.Timestamp(record.date))
+        column = symbol_positions.get(str(record.symbol).upper())
+        if row is not None and column is not None:
+            mask[row, column] = str(record.exchange) == wanted
+            known += 1
+    return mask, known
+
+
+def load_opening_auction_prices(
+    path: Path,
+    dates: pd.DatetimeIndex,
+    symbols: np.ndarray,
+) -> np.ndarray:
+    """Build a date-by-symbol primary-opening matrix from adjusted NPZ prices."""
+    official = _official_opening_auctions(path)
+
+    date_positions = {pd.Timestamp(day): index for index, day in enumerate(dates)}
+    symbol_positions = {
+        _security_symbol(sample_id): index for index, sample_id in enumerate(symbols)
+    }
+    prices = np.full((len(dates), len(symbols)), np.nan, dtype=np.float64)
+    for record in official.itertuples(index=False):
+        row = date_positions.get(pd.Timestamp(record.date))
+        column = symbol_positions.get(str(record.symbol).upper())
+        if row is not None and column is not None:
+            prices[row, column] = float(record.price)
+    return prices
 
 
 # "Alphabet Inc. - Class C Capital Stock" and "Alphabet Inc. - Class A Common Stock"
@@ -131,8 +231,12 @@ def load_nasdaq_security_master(
         payload = json.loads(cache_path.read_text())
         fetched_at = datetime.fromisoformat(str(payload["fetched_at"]))
         age = datetime.now(timezone.utc) - fetched_at.astimezone(timezone.utc)
-        if age.days < int(max_age_days):
-            return dict(payload["securities"])
+        cached_securities = dict(payload["securities"])
+        has_exchange_metadata = all(
+            "exchange" in record for record in cached_securities.values()
+        )
+        if age.days < int(max_age_days) and has_exchange_metadata:
+            return cached_securities
 
     frames = []
     for url in NASDAQ_SYMBOL_DIRECTORY_URLS:
@@ -146,16 +250,24 @@ def load_nasdaq_security_master(
         frame = frame[~frame.iloc[:, 0].astype(str).str.startswith("File Creation Time")]
         if "Symbol" in frame.columns:
             frame = frame.rename(columns={"Symbol": "symbol", "Security Name": "name"})
+            frame["exchange"] = "Q"
         else:
-            frame = frame.rename(columns={"ACT Symbol": "symbol", "Security Name": "name"})
+            frame = frame.rename(
+                columns={
+                    "ACT Symbol": "symbol",
+                    "Security Name": "name",
+                    "Exchange": "exchange",
+                }
+            )
         frame = frame.rename(columns={"ETF": "etf", "Test Issue": "test_issue"})
-        frames.append(frame.loc[:, ["symbol", "name", "etf", "test_issue"]])
+        frames.append(frame.loc[:, ["symbol", "name", "etf", "test_issue", "exchange"]])
     combined = pd.concat(frames, ignore_index=True).drop_duplicates("symbol", keep="first")
     securities = {
         str(row.symbol).upper(): {
             "name": str(row.name),
             "etf": str(row.etf),
             "test_issue": str(row.test_issue),
+            "exchange": str(row.exchange),
         }
         for row in combined.itertuples(index=False)
     }
@@ -205,6 +317,28 @@ def company_universe_mask(
         if not keep:
             reasons[reason] = reasons.get(reason, 0) + 1
     return mask, reasons, unclassified
+
+
+def exchange_universe_mask(
+    symbols: np.ndarray,
+    security_master: Mapping[str, Mapping[str, object]],
+    exchange: str,
+    reference_symbol: str = REFERENCE_SYMBOL,
+) -> np.ndarray:
+    """Restrict candidates to a current primary listing venue, keeping SPY as benchmark."""
+    exchange_codes = {"nasdaq": "Q"}
+    if exchange not in exchange_codes:
+        raise ValueError(f"unsupported exchange filter: {exchange}")
+    wanted = exchange_codes[exchange]
+    return np.asarray(
+        [
+            sample_id == reference_symbol
+            or str(security_master.get(_security_symbol(sample_id), {}).get("exchange", ""))
+            == wanted
+            for sample_id in np.asarray(symbols, dtype=str)
+        ],
+        dtype=bool,
+    )
 
 
 def causal_ema_log_liquidity(
@@ -874,6 +1008,12 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         _metric_text(summary),
     )
     details.add_row("Cost", f"{summary['transaction_cost_bps_per_side']:.2f} bps per side")
+    details.add_row(
+        "Exit pricing",
+        "split-adjusted primary opening auction (Alpaca SIP condition O)"
+        if summary.get("exit_price_source") == "opening-auction"
+        else f"Alpaca SIP minute-bar open at {str(summary['exit_time_eastern']).split()[0]}",
+    )
     if summary.get("budget") is not None:
         details.add_row(
             "Position sizing",
@@ -1145,6 +1285,8 @@ def run_backtest(
     reference_symbol: str = REFERENCE_SYMBOL,
     share_mode: str = "fractional",
     budget: float | None = None,
+    exit_price_source: str = "minute",
+    execution_exchange_mask: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if transaction_cost_bps < 0.0:
         raise ValueError("transaction_cost_bps must be non-negative")
@@ -1152,6 +1294,8 @@ def run_backtest(
         raise ValueError("minimum_trading_days must be positive")
     if share_mode not in {"fractional", "whole"}:
         raise ValueError("share_mode must be 'fractional' or 'whole'")
+    if exit_price_source not in {"minute", "opening-auction"}:
+        raise ValueError("exit_price_source must be 'minute' or 'opening-auction'")
     if budget is not None and (not np.isfinite(budget) or float(budget) <= 0.0):
         raise ValueError("budget must be finite and positive")
     if share_mode == "whole" and budget is None:
@@ -1166,6 +1310,10 @@ def run_backtest(
         min_history_days,
     )
     completed_trading_days = causal_completed_trading_days(dollar_volume)
+    if execution_exchange_mask is not None:
+        execution_exchange_mask = np.asarray(execution_exchange_mask, dtype=bool)
+        if execution_exchange_mask.shape != scores.shape:
+            raise ValueError("execution_exchange_mask must match the liquidity arrays")
     if liquidity_scheme == "activity_union_ema":
         if activity_candidate_mask is None:
             activity_candidate_mask = activity_union_candidate_mask(
@@ -1206,6 +1354,10 @@ def run_backtest(
             scores[date_index, stock_mask],
             np.nan,
         )
+        if execution_exchange_mask is not None:
+            date_scores = np.where(
+                execution_exchange_mask[date_index + 1, stock_mask], date_scores, np.nan
+            )
         if liquidity_scheme == "activity_union_ema":
             date_scores = np.where(
                 activity_candidate_mask[date_index, stock_mask], date_scores, np.nan
@@ -1276,6 +1428,7 @@ def run_backtest(
                     "quantity": quantities,
                     "entry_price": selected_entries,
                     "exit_price": exits,
+                    "exit_price_source": exit_price_source,
                     "entry_notional": entry_notional,
                     "exit_notional": exit_notional,
                     "entry_staleness_minutes": entry_staleness[date_index, selected],
@@ -1396,6 +1549,7 @@ def run_backtest(
         "ranking_time_eastern": f"{ranking_minute // 60:02d}:{ranking_minute % 60:02d}",
         "entry_time_eastern": f"{entry_minute // 60:02d}:{entry_minute % 60:02d}",
         "exit_time_eastern": f"{exit_minute // 60:02d}:{exit_minute % 60:02d} next trading session",
+        "exit_price_source": exit_price_source,
         "first_entry_date": str(pd.Timestamp(daily.index[0]).date()),
         "last_entry_date": str(pd.Timestamp(daily.index[-1]).date()),
         "last_exit_date": str(trades.exit_date.iloc[-1]),
@@ -1527,6 +1681,17 @@ def main() -> None:
     parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:55"))
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:45"))
     parser.add_argument(
+        "--exit-price-source",
+        choices=("minute", "opening-auction"),
+        default="minute",
+        help="minute uses the configured minute-bar open; opening-auction uses Alpaca SIP condition O",
+    )
+    parser.add_argument(
+        "--auctions-path",
+        default=DEFAULT_AUCTIONS_PATH,
+        help="split-adjusted NPZ written by scripts/download_auctions.py",
+    )
+    parser.add_argument(
         "--transaction-cost-bps",
         type=float,
         default=DEFAULT_TRANSACTION_COST_BPS,
@@ -1559,6 +1724,12 @@ def main() -> None:
         choices=("companies", "all"),
         default="companies",
         help="companies excludes funds, ETFs/ETNs, units, preferreds, rights/warrants, and SPAC shells",
+    )
+    parser.add_argument(
+        "--exchange-filter",
+        choices=("all", "nasdaq"),
+        default="all",
+        help="restrict the candidate universe before ranking; SPY remains as benchmark",
     )
     parser.add_argument(
         "--unclassified-asset-policy",
@@ -1640,6 +1811,8 @@ def main() -> None:
         parser.error("exclude-top must be in [0, top)")
     if not 9 * 60 + 30 <= args.ranking_time < args.entry_time:
         parser.error("ranking-time must be during regular hours and strictly before entry-time")
+    if args.exit_price_source == "opening-auction" and args.exit_time != 9 * 60 + 30:
+        parser.error("--exit-price-source opening-auction requires --exit-time 09:30")
     if (
         args.workers < 1
         or args.max_entry_staleness_minutes < 0
@@ -1731,12 +1904,14 @@ def main() -> None:
     unfiltered_candidates = int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum()))
     excluded_asset_reasons: dict[str, int] = {}
     unclassified_asset_symbols = 0
-    if args.asset_filter == "companies":
+    security_master: dict[str, dict[str, object]] = {}
+    if args.asset_filter == "companies" or args.exchange_filter != "all":
         security_master = load_nasdaq_security_master(
             Path(args.security_master_cache),
             refresh=args.refresh_security_master,
             max_age_days=args.security_master_max_age_days,
         )
+    if args.asset_filter == "companies":
         company_mask, excluded_asset_reasons, unclassified_asset_symbols = company_universe_mask(
             symbols,
             security_master,
@@ -1767,6 +1942,46 @@ def main() -> None:
                 f"historical/unclassified symbols: {unclassified_asset_symbols:,} "
                 f"(policy={args.unclassified_asset_policy})"
             )
+    if args.exchange_filter != "all":
+        exchange_mask = exchange_universe_mask(symbols, security_master, args.exchange_filter)
+        before_exchange_filter = int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum()))
+        symbols = symbols[exchange_mask]
+        dollar_volume = dollar_volume[:, exchange_mask]
+        alpaca_share_volume = alpaca_share_volume[:, exchange_mask]
+        alpaca_trade_count = alpaca_trade_count[:, exchange_mask]
+        entry_prices = entry_prices[:, exchange_mask]
+        morning_prices = morning_prices[:, exchange_mask]
+        entry_staleness = entry_staleness[:, exchange_mask]
+        morning_staleness = morning_staleness[:, exchange_mask]
+        if activity_candidate_mask is not None:
+            activity_candidate_mask = activity_candidate_mask[:, exchange_mask]
+        retained_exchange_candidates = int(
+            len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())
+        )
+        print(
+            f"{args.exchange_filter} universe: retained {retained_exchange_candidates:,}/"
+            f"{before_exchange_filter:,} candidate symbols before ranking"
+        )
+    execution_exchange_mask = None
+    if args.exchange_filter != "all" and Path(args.auctions_path).exists():
+        execution_exchange_mask, known_exchange_sessions = load_primary_auction_exchange_mask(
+            Path(args.auctions_path), cache_dates, symbols, args.exchange_filter
+        )
+        print(
+            f"historical exchange check: matched {known_exchange_sessions:,} "
+            "symbol-sessions from primary auctions"
+        )
+    if args.exit_price_source == "opening-auction":
+        auction_path = Path(args.auctions_path)
+        if not auction_path.exists():
+            parser.error(f"auction data does not exist: {auction_path}")
+        morning_prices = load_opening_auction_prices(auction_path, cache_dates, symbols)
+        morning_staleness = np.where(np.isfinite(morning_prices), 0.0, np.inf)
+        official_opens = int(np.isfinite(morning_prices).sum())
+        print(
+            f"auction exits: loaded {official_opens:,} primary opening prices from "
+            f"{auction_path}"
+        )
     schemes = (
         ("dollar_ema", "activity_union_ema", "alpaca_volume", "alpaca_trades")
         if args.liquidity_scheme == "compare"
@@ -1809,9 +2024,12 @@ def main() -> None:
             exit_minute=args.exit_time,
             share_mode=args.share_mode,
             budget=args.budget,
+            exit_price_source=args.exit_price_source,
+            execution_exchange_mask=execution_exchange_mask,
         )
         scheme_summary["cache_path"] = str(cache_path)
         scheme_summary["asset_filter"] = args.asset_filter
+        scheme_summary["exchange_filter"] = args.exchange_filter
         scheme_summary["unclassified_asset_policy"] = args.unclassified_asset_policy
         scheme_summary["unclassified_asset_symbols"] = unclassified_asset_symbols
         scheme_summary["unfiltered_candidate_symbols"] = unfiltered_candidates
