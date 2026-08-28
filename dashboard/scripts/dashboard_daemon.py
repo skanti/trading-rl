@@ -672,7 +672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return
         publish(snapshot, sessions, config, trading_mode=trading_mode)
         if not args.no_email:
-            key = dashboard_digest.digest_key(state, str(snapshot["trading_day"]))
+            key = dashboard_digest.digest_key(state)
             if key and key not in dashboard_digest.delivered_keys(digest_state_path):
                 try:
                     recipients = dashboard_digest.send_digest(snapshot, state, config)

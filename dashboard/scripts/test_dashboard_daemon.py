@@ -482,6 +482,7 @@ class DigestTest(unittest.TestCase):
         }
         self.snapshot = {
             "trading_day": "2026-08-26",
+            "meta": {"mode": "live"},
             "account": {"equity": 100500.0, "cash": 100500.0},
             "performance": {
                 "today": {
@@ -500,18 +501,35 @@ class DigestTest(unittest.TestCase):
                     "pnl_pct": 0.1,
                 }
             ],
+            "basket_totals": {
+                "entry_notional": 1000.0,
+                "exit_notional": 1100.0,
+                "pnl": 100.0,
+                "pnl_pct": 0.1,
+            },
         }
 
-    def test_digest_only_keys_a_basket_on_its_exit_day(self):
-        self.assertIsNotNone(dashboard_digest.digest_key(self.state, "2026-08-26"))
-        self.assertIsNone(dashboard_digest.digest_key(self.state, "2026-08-27"))
+    def test_digest_keys_a_closed_basket_even_after_its_exit_day(self):
+        self.assertIsNotNone(dashboard_digest.digest_key(self.state))
+        open_state = {"position": {**self.state["position"], "status": "open"}}
+        self.assertIsNone(dashboard_digest.digest_key(open_state))
 
     def test_message_is_multipart_and_addressed_to_all_recipients(self):
         message = dashboard_digest.build_message(self.snapshot, self.state, self.config)
         self.assertTrue(message.is_multipart())
         self.assertIn("a@example", message["To"])
-        self.assertIn("+$500.00", message["Subject"])
-        self.assertIn("NVDA", dashboard_digest.render_text(self.snapshot, self.state, self.config))
+        self.assertIn("[LIVE]", message["Subject"])
+        self.assertIn("+$100.00", message["Subject"])
+        self.assertNotIn("+$500.00", message["Subject"])
+        text = dashboard_digest.render_text(self.snapshot, self.state, self.config)
+        self.assertIn("NVDA", text)
+        self.assertIn("TOTAL", text)
+
+    def test_html_labels_mode_and_includes_fill_based_total(self):
+        html = dashboard_digest.render_html(self.snapshot, self.state, self.config)
+        self.assertIn("[LIVE]", html)
+        self.assertIn("TOTAL", html)
+        self.assertIn("+$100.00", html)
 
     def test_html_colors_profits_green_and_losses_red(self):
         html = dashboard_digest.render_html(self.snapshot, self.state, self.config)

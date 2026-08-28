@@ -149,7 +149,7 @@ python -m baseline.overnight_liquidity \
 
 `live_overnight_liquidity.py` applies the same causal liquidity idea to an
 Alpaca account. By default it starts ranking at 15:00 ET, opens an equal-notional top-10
-basket at 15:55, and closes that basket at 09:35 on the next trading session.
+basket at 15:55, and submits its exit at 09:00 on the next trading session.
 The fast candidate screen unions Alpaca's current top 100 SIP symbols by share
 volume, current top 100 by trade count, and the previous day's screened
 universe. It then downloads only those candidates' completed daily bars from
@@ -186,7 +186,7 @@ python -m baseline.live_overnight_liquidity run \
   --top 10 \
   --ranking-time 15:00 \
   --entry-time 15:55 \
-  --exit-time 09:35 \
+  --exit-time 09:00 \
   --feed sip \
   --quote-feed iex \
   --capital-fraction 1.00 \
@@ -237,13 +237,16 @@ python -m baseline.live_overnight_liquidity preview \
   --capital-fraction 0.95
 ```
 
-Exit submission times from 09:00 through 09:29 queue `day` market
-orders for the regular-session open. The daemon records `exit_queued` without
-canceling those orders on the normal fill timeout, then reconciles their fills
-at 09:30 and retries only when necessary. Once the market is open, a still-working
-or partially filled exit is also left in place across 45-second reconciliation
-windows instead of being canceled and replaced. Entry submissions still require
-an open regular session.
+Whole-share exits submitted before Alpaca's 09:28 cutoff use `market` + `opg`
+and participate in the primary exchange's opening auction. The default 09:00
+exit time leaves a safety margin before that cutoff. Fractional exits remain
+`day` market orders because Alpaca does not support OPG for fractional shares.
+The daemon records `exit_queued` without canceling working orders on the normal
+fill timeout, then reconciles fills at 09:30. If an OPG order is rejected,
+cancelled, or leaves shares behind, the post-open recovery uses a `day` market
+order. A still-working or partially filled exit remains in place across
+45-second reconciliation windows instead of being canceled and replaced.
+Entry submissions still require an open regular session.
 
 ```bash
 python -m baseline.live_overnight_liquidity rank

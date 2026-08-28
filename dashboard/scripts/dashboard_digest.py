@@ -40,16 +40,21 @@ def _tone(value: object) -> str:
     return "#475569"
 
 
-def digest_key(state: Mapping[str, Any], trading_day: str) -> str | None:
-    """Stable identity for today's completed basket, or ``None`` until it closes."""
+def digest_key(state: Mapping[str, Any]) -> str | None:
+    """Stable identity for a completed basket, or ``None`` until it closes."""
     position = state.get("position") or {}
-    if position.get("status") != "closed" or position.get("exit_date") != trading_day:
+    if position.get("status") != "closed":
         return None
     entry_date = position.get("entry_date")
     completed_at = position.get("exit_completed_at")
     if not entry_date or not completed_at:
         return None
     return f"{entry_date}:{completed_at}"
+
+
+def _account_mode(snapshot: Mapping[str, Any]) -> str:
+    mode = str((snapshot.get("meta") or {}).get("mode") or "").lower()
+    return mode.upper() if mode in {"paper", "live"} else "ACCOUNT"
 
 
 def _mail_settings(config: DictConfig) -> tuple[str, int, str, str, list[str]]:
@@ -79,10 +84,11 @@ def render_text(
     snapshot: Mapping[str, Any], state: Mapping[str, Any], config: DictConfig
 ) -> str:
     title = str(OmegaConf.select(config, "dashboard.title") or "Trading account")
+    mode = _account_mode(snapshot)
     account = snapshot.get("account") or {}
     position = state.get("position") or {}
     lines = [
-        title,
+        f"{title} [{mode}]",
         f"Trading day {snapshot.get('trading_day')}",
         f"Basket {position.get('entry_date')} -> {position.get('exit_date')}: closed",
         "",
@@ -115,6 +121,13 @@ def render_text(
                 f"{_money(trade.get('pnl'), signed=True):>16}"
                 f"{_percent(trade.get('pnl_pct'), signed=True):>12}"
             )
+        totals = snapshot.get("basket_totals") or {}
+        lines += [
+            "-" * 73,
+            f"{'TOTAL':<44}"
+            f"{_money(totals.get('pnl'), signed=True):>16}"
+            f"{_percent(totals.get('pnl_pct'), signed=True):>12}",
+        ]
     else:
         lines.append("No per-symbol fills were available.")
 
@@ -136,6 +149,7 @@ def render_html(
     snapshot: Mapping[str, Any], state: Mapping[str, Any], config: DictConfig
 ) -> str:
     title = escape(str(OmegaConf.select(config, "dashboard.title") or "Trading account"))
+    mode = _account_mode(snapshot)
     account = snapshot.get("account") or {}
     position = state.get("position") or {}
     buckets = snapshot.get("performance") or {}
@@ -150,6 +164,7 @@ def render_html(
         for key in performance.BUCKET_ORDER
         if (bucket := buckets.get(key))
     )
+    trades = list(snapshot.get("closed_basket") or [])
     trade_rows = "".join(
         "<tr>"
         f"<td>{escape(str(trade.get('symbol') or ''))}</td>"
@@ -161,9 +176,21 @@ def render_html(
         f"<td class='number' style='color:{_tone(trade.get('pnl'))}'>"
         f"{_percent(trade.get('pnl_pct'), signed=True)}</td>"
         "</tr>"
-        for trade in snapshot.get("closed_basket") or []
+        for trade in trades
     )
-    if not trade_rows:
+    if trades:
+        totals = snapshot.get("basket_totals") or {}
+        total_tone = _tone(totals.get("pnl"))
+        trade_rows += (
+            "<tr class='total'>"
+            "<td colspan='4'>TOTAL</td>"
+            f"<td class='number' style='color:{total_tone}'>"
+            f"{_money(totals.get('pnl'), signed=True)}</td>"
+            f"<td class='number' style='color:{total_tone}'>"
+            f"{_percent(totals.get('pnl_pct'), signed=True)}</td>"
+            "</tr>"
+        )
+    else:
         trade_rows = "<tr><td colspan='6'>No per-symbol fills were available.</td></tr>"
     dashboard_url = escape(str(OmegaConf.select(config, "dashboard.url") or ""), quote=True)
     link = f"<p><a class='button' href='{dashboard_url}'>View dashboard</a></p>" if dashboard_url else ""
@@ -174,11 +201,12 @@ body {{ background:#f8fafc; color:#0f172a; font-family:Arial,sans-serif; padding
 table {{ border-collapse:collapse; width:100%; margin-bottom:24px }}
 th,td {{ border-bottom:1px solid #e2e8f0; padding:9px 10px; text-align:left }}
 th {{ color:#64748b; font-size:12px; text-transform:uppercase }}
+.total td {{ border-top:2px solid #cbd5e1; font-weight:bold }}
 .number {{ text-align:right; font-variant-numeric:tabular-nums }}
 .muted {{ color:#64748b }}
 .button {{ background:#0f172a; border-radius:8px; color:white; display:inline-block; padding:10px 16px; text-decoration:none }}
 </style></head><body><div class="card">
-<h1>{title}</h1>
+<h1>{title} <span class="mode">[{mode}]</span></h1>
 <p class="muted">Trading day {escape(str(snapshot.get('trading_day') or ''))} · equity {_money(account.get('equity'))}</p>
 <p>Basket {escape(str(position.get('entry_date') or ''))} → {escape(str(position.get('exit_date') or ''))}: closed</p>
 <h2>Performance</h2>
@@ -193,11 +221,14 @@ def build_message(
     snapshot: Mapping[str, Any], state: Mapping[str, Any], config: DictConfig
 ) -> EmailMessage:
     _, _, sender, _, recipients = _mail_settings(config)
-    today = (snapshot.get("performance") or {}).get("today") or {}
+    totals = snapshot.get("basket_totals") or {}
+    position = state.get("position") or {}
+    mode = _account_mode(snapshot)
     title = str(OmegaConf.select(config, "dashboard.title") or "Trading account")
     subject = (
-        f"{title} — {snapshot.get('trading_day')} — "
-        f"{_money(today.get('pnl'), signed=True)} ({_percent(today.get('pnl_pct'), signed=True)})"
+        f"[{mode}] {title} — {position.get('exit_date') or snapshot.get('trading_day')} — "
+        f"{_money(totals.get('pnl'), signed=True)} "
+        f"({_percent(totals.get('pnl_pct'), signed=True)})"
     )
     message = EmailMessage()
     message["Subject"] = subject

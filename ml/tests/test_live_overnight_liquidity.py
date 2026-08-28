@@ -17,6 +17,7 @@ from baseline.live_overnight_liquidity import (
     StateStore,
     StrategyConfig,
     _completed_session_end,
+    _exit_order_time_in_force,
     _print_entry_plan,
     _select_unconflicted_candidates,
     _validate_args,
@@ -115,6 +116,7 @@ class FakeBroker:
             "notional": payload.get("notional"),
             "filled_qty": quantity,
             "filled_avg_price": "100",
+            "time_in_force": payload["time_in_force"],
             "submitted_at": "2026-08-24T19:55:00Z",
             "filled_at": "2026-08-24T19:55:00Z",
         }
@@ -149,6 +151,7 @@ class FakeQueuedBroker(FakeBroker):
             "notional": None,
             "filled_qty": "0",
             "filled_avg_price": None,
+            "time_in_force": payload["time_in_force"],
             "submitted_at": "2026-08-25T13:00:00Z",
             "filled_at": None,
         }
@@ -604,9 +607,9 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual({order["symbol"] for order in broker.submissions}, {"A", "B"})
         self.assertTrue(all(order["side"] == "sell" for order in broker.submissions))
 
-    def test_preopen_exit_stays_queued_and_is_reconciled_after_open(self):
+    def test_whole_share_opg_exit_stays_queued_and_is_reconciled_after_open(self):
         broker = FakeQueuedBroker()
-        broker.current_positions["A"] = {"symbol": "A", "qty": "0.75"}
+        broker.current_positions["A"] = {"symbol": "A", "qty": "1"}
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.json")
             state = store.load()
@@ -614,6 +617,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
                 "entry_date": "2026-08-24",
                 "exit_date": "2026-08-25",
                 "status": "open",
+                "share_mode": "whole",
                 "symbols": ["A"],
                 "filled_symbols": ["A"],
                 "entry_orders": {},
@@ -624,7 +628,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             queued = exit_position(
                 broker,
                 store,
-                config(top=1),
+                config(top=1, share_mode="whole"),
                 submit=True,
                 now=datetime(2026, 8, 25, 9, 0, tzinfo=EASTERN),
                 wait_for_fill=False,
@@ -632,16 +636,17 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             queued_order = broker.orders["olq-20260824-x-A"]
             self.assertEqual(queued["status"], "exit_queued")
             self.assertEqual(queued_order["status"], "accepted")
+            self.assertEqual(queued["exit_orders"]["A"]["time_in_force"], "opg")
             self.assertIn("A", broker.current_positions)
-            self.assertEqual(broker.submissions[0]["time_in_force"], "day")
+            self.assertEqual(broker.submissions[0]["time_in_force"], "opg")
 
             queued_order["status"] = "filled"
-            queued_order["filled_qty"] = "0.75"
+            queued_order["filled_qty"] = "1"
             broker.current_positions.pop("A")
             closed = exit_position(
                 broker,
                 store,
-                config(top=1),
+                config(top=1, share_mode="whole"),
                 submit=True,
                 now=datetime(2026, 8, 25, 9, 30, tzinfo=EASTERN),
                 wait_for_fill=True,
@@ -650,6 +655,64 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(closed["status"], "closed")
         self.assertEqual(closed["exit_orders"]["A"]["status"], "filled")
         self.assertEqual(len(broker.submissions), 1)
+
+    def test_fractional_exit_remains_a_day_order(self):
+        position = {"share_mode": "fractional"}
+        preopen = datetime(2026, 8, 25, 9, 0, tzinfo=EASTERN)
+
+        self.assertEqual(_exit_order_time_in_force(position, preopen), "day")
+
+    def test_whole_share_exit_uses_day_only_as_post_open_recovery(self):
+        position = {"share_mode": "whole"}
+        preopen = datetime(2026, 8, 25, 9, 0, tzinfo=EASTERN)
+        after_open = datetime(2026, 8, 25, 9, 30, tzinfo=EASTERN)
+
+        self.assertEqual(_exit_order_time_in_force(position, preopen), "opg")
+        self.assertEqual(_exit_order_time_in_force(position, after_open), "day")
+        with self.assertRaisesRegex(RuntimeError, "09:28 ET OPG cutoff"):
+            _exit_order_time_in_force(
+                position, datetime(2026, 8, 25, 9, 29, tzinfo=EASTERN)
+            )
+
+    def test_cancelled_opg_uses_a_new_day_order_after_open(self):
+        broker = FakeBroker()
+        broker.current_positions["A"] = {"symbol": "A", "qty": "1"}
+        broker.orders["olq-20260824-x-A"] = {
+            "id": "canceled-opg",
+            "client_order_id": "olq-20260824-x-A",
+            "symbol": "A",
+            "side": "sell",
+            "status": "canceled",
+            "qty": "1",
+            "filled_qty": "0",
+            "time_in_force": "opg",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.json")
+            state = store.load()
+            state["position"] = {
+                "entry_date": "2026-08-24",
+                "exit_date": "2026-08-25",
+                "status": "exit_incomplete",
+                "share_mode": "whole",
+                "symbols": ["A"],
+                "filled_symbols": ["A"],
+                "entry_orders": {},
+                "exit_orders": {},
+            }
+            store.save(state)
+
+            result = exit_position(
+                broker,
+                store,
+                config(top=1, share_mode="whole"),
+                submit=True,
+                now=datetime(2026, 8, 25, 9, 30, tzinfo=EASTERN),
+            )
+
+        self.assertEqual(result["status"], "closed")
+        self.assertEqual(broker.submissions[0]["client_order_id"], "olq-20260824-x-A-2")
+        self.assertEqual(broker.submissions[0]["time_in_force"], "day")
 
     def test_exit_retries_a_canceled_order_with_a_new_id(self):
         broker = FakeBroker()

@@ -49,6 +49,8 @@ DEFAULT_DATA_URL = "https://data.alpaca.markets/v2"
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_STATE_PATH = str(DEFAULT_WORK_DIR / "state.json")
 DEFAULT_EXCHANGES = frozenset({"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE"})
+OPENING_AUCTION_CUTOFF = time(9, 28)
+REGULAR_MARKET_OPEN = time(9, 30)
 TERMINAL_ORDER_STATUSES = frozenset(
     {"filled", "canceled", "expired", "rejected", "replaced", "done_for_day"}
 )
@@ -1015,10 +1017,28 @@ def _order_summary(order: Mapping[str, object]) -> dict[str, object]:
             "notional",
             "filled_qty",
             "filled_avg_price",
+            "time_in_force",
             "submitted_at",
             "filled_at",
         )
     }
+
+
+def _exit_order_time_in_force(
+    position: Mapping[str, object], now: datetime | None = None
+) -> str:
+    """Use the opening auction for whole shares and DAY only as post-open recovery."""
+    if str(position.get("share_mode") or "fractional") != "whole":
+        return "day"
+    current = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
+    current_time = current.time().replace(tzinfo=None)
+    if current_time < OPENING_AUCTION_CUTOFF:
+        return "opg"
+    if current_time < REGULAR_MARKET_OPEN:
+        raise RuntimeError(
+            "the 09:28 ET OPG cutoff has passed; whole-share exit will retry at market open"
+        )
+    return "day"
 
 
 def _wait_for_orders(
@@ -1341,13 +1361,14 @@ def exit_position(
             if attempt > 20:
                 raise RuntimeError(f"too many exit attempts for {symbol}")
             if order is None:
+                time_in_force = _exit_order_time_in_force(position, now)
                 order = client.submit_order(
                     {
                         "symbol": symbol,
                         "qty": str(current["qty"]),
                         "side": "sell",
                         "type": "market",
-                        "time_in_force": "day",
+                        "time_in_force": time_in_force,
                         "client_order_id": client_id,
                     }
                 )
@@ -1714,7 +1735,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--entry-time", type=parse_clock, default=parse_clock("15:55"))
-    parser.add_argument("--exit-time", type=parse_clock, default=parse_clock("09:35"))
+    parser.add_argument("--exit-time", type=parse_clock, default=parse_clock("09:00"))
     parser.add_argument(
         "--ranking-time",
         type=parse_clock,
@@ -1849,6 +1870,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("entry-time must be within regular US equity hours [09:30, 16:00)")
     if not time(9, 0) <= args.exit_time < regular_close:
         parser.error("exit-time must be within the exit submission window [09:00, 16:00)")
+    if args.share_mode == "whole" and args.exit_time >= OPENING_AUCTION_CUTOFF:
+        parser.error("--share-mode whole requires --exit-time before 09:28 for OPG exits")
     lead = datetime.combine(date.min, args.entry_time) - datetime.combine(date.min, args.ranking_time)
     if lead < timedelta(minutes=args.minimum_ranking_lead_minutes):
         parser.error(
@@ -1969,6 +1992,7 @@ def main() -> None:
             artifacts.write_summary(trade_date, "enter", store, config)
         elif args.action == "exit":
             market_open = True
+            exit_now = datetime.now(tz=EASTERN)
             if args.submit:
                 market_open = _validate_exit_clock(client, trade_date)
             result = exit_position(
@@ -1976,6 +2000,7 @@ def main() -> None:
                 store,
                 config,
                 args.submit,
+                now=exit_now,
                 wait_for_fill=market_open,
             )
             _print_exit(result, args.submit)
