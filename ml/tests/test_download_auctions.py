@@ -29,6 +29,15 @@ def auction_row(symbol: str, date: str, price: object) -> dict[str, object]:
 
 
 class AuctionUpdateTests(unittest.TestCase):
+    def test_symbols_file_normalizes_legacy_ids_and_ignores_comments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "symbols.txt"
+            path.write_text("AAPL\n\n# benchmark\nST-BRK-B\nmsft\n", encoding="utf-8")
+
+            symbols = download_auctions.symbols_from_file(path)
+
+        self.assertEqual(symbols, ["AAPL", "BRK.B", "MSFT"])
+
     def test_overlapping_tail_is_replaced_instead_of_blindly_appended(self):
         existing = [
             auction_row("AAPL", "2026-08-24", "100.0"),

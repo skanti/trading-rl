@@ -67,11 +67,11 @@ class ShiftedReferenceMLPTest(unittest.TestCase):
                 np.stack((asset_secs, np.arange(100_000, 100_700, 100), np.ones(7)), axis=1),
             )
             np.save(
-                path / "ST-SPY.npy",
+                path / "SPY.npy",
                 np.stack((spy_secs, np.arange(500_000, 500_700, 100), np.ones(7)), axis=1),
             )
             rows = []
-            for symbol in ("ASSET", "ST-SPY"):
+            for symbol in ("ASSET", "SPY"):
                 for date, sod, eod, sod_idx, eod_idx in (
                     ("2025-01-02", 0, 120, 0, 2),
                     ("2025-01-03", 180, 420, 3, 6),
@@ -91,7 +91,7 @@ class ShiftedReferenceMLPTest(unittest.TestCase):
                         }
                     )
             dataset = MarketReferenceDataset(
-                pd.DataFrame(rows), str(path), "ST-SPY", window_size=4, rollout_size=4
+                pd.DataFrame(rows), str(path), "SPY", window_size=4, rollout_size=4
             )
             item = dataset[0]
             self.assertEqual(set(item), {"_id", "prices", "reference_prices", "secs"})

@@ -7,7 +7,6 @@ import torch
 from omegaconf import OmegaConf
 
 from classify_evaluate import (
-    RegularMinuteSweepDataset,
     evaluate_bets,
     parse_anchor_time,
     summarize_trades,
@@ -37,7 +36,7 @@ class ClassifyEvaluateTest(unittest.TestCase):
             dtype=np.int64,
         )
         positions = forward_fill_positions(
-            source, np.array([60, 119, 120]), "ST-BAD"
+            source, np.array([60, 119, 120]), "BAD"
         )
         self.assertEqual(positions.tolist(), [0, 0, 2])
 
@@ -72,7 +71,7 @@ class ClassifyEvaluateTest(unittest.TestCase):
             ]
         )
         batch = {
-            "_id": ["ST-A", "ST-B", "ST-C"],
+            "_id": ["A", "B", "C"],
             "date": ["2026-08-03"] * 3,
             "target_date": ["2026-08-05"] * 3,
             "anchor_time": ["13:00"] * 3,
@@ -122,7 +121,7 @@ class ClassifyEvaluateTest(unittest.TestCase):
             0.80,
             "relative",
             10.0,
-            ("ST-A", "ST-B", "ST-C"),
+            ("A", "B", "C"),
         )
         self.assertEqual(summary["trades"], 2)
         self.assertAlmostEqual(summary["coverage"], 2 / 3)
@@ -134,7 +133,7 @@ class ClassifyEvaluateTest(unittest.TestCase):
     def test_stock_mode_charges_one_leg_round_trip(self):
         classifier = FixedClassifier([2.1972246])
         batch = {
-            "_id": ["ST-A"],
+            "_id": ["A"],
             "date": ["2026-08-03"],
             "target_date": ["2026-08-05"],
             "anchor_time": ["13:00"],

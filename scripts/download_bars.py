@@ -1,6 +1,5 @@
 import os
 import argparse
-import re
 import json
 import pathlib
 import random
@@ -66,13 +65,15 @@ ALPACA_RATE_LIMITER = RateLimiter(ALPACA_REQUESTS_PER_MINUTE)
 def dataframe_to_array(
     data: pd.DataFrame, name: str, timeframe: str = "1Min"
 ) -> np.ndarray | None:
-    """Convert API bars to the established int32 on-disk schema."""
+    """Convert API bars to the compact integer on-disk schema."""
     required_columns = {"t", "o", "v", "n"}
     if timeframe == "1Day":
         required_columns.update({"h", "l", "c", "vw"})
     missing_columns = required_columns.difference(data.columns)
     if missing_columns:
-        logger.warning("Columns missing, name=%s, columns=%s", name, sorted(missing_columns))
+        logger.warning(
+            "Columns missing, name=%s, columns=%s", name, sorted(missing_columns)
+        )
         return None
     data = data.copy()
     data["dt"] = pd.to_datetime(data["t"], utc=True)  # convert to datetime
@@ -95,15 +96,17 @@ def dataframe_to_array(
     num = data.n
     prices = [np.rint(data.o * 1000)]
     if timeframe == "1Day":
-        prices.extend(
-            np.rint(getattr(data, field) * 1000) for field in ("h", "l", "c")
-        )
+        prices.extend(np.rint(getattr(data, field) * 1000) for field in ("h", "l", "c"))
         prices.append(np.rint(data.vw * 1000))
     values_to_check = [secs, *prices, volume, num]
     if not all(np.isfinite(values).all() for values in values_to_check):
         logger.warning("Non-finite values, name=%s", name)
         return None
 
+    # Keep minute bars in their established compact format. Symbols whose
+    # split-adjusted values cannot be represented safely are logged and skipped.
+    # Daily aggregate volumes can legitimately exceed int32 (including NVDA),
+    # so the distinct daily schema remains int64.
     dtype = np.int64 if timeframe == "1Day" else np.int32
     integer_max = np.iinfo(dtype).max
     if secs.max() > integer_max:
@@ -133,7 +136,9 @@ def dataframe_to_array(
 
     # check
     dt_roundtrip = pd.to_datetime(secs, unit="s", origin=ANNO.date(), utc=True)
-    assert (dt_roundtrip == data.dt).all(), f"Datetime encoding, name={name}, ANNO={ANNO}"
+    assert (dt_roundtrip == data.dt).all(), (
+        f"Datetime encoding, name={name}, ANNO={ANNO}"
+    )
 
     # to matrix
     if timeframe == "1Day":
@@ -169,9 +174,7 @@ def save_array(array: np.ndarray, out_path: str) -> None:
     os.replace(tmp_path, out_path)
 
 
-def save_as_npy(
-    data: pd.DataFrame, out_path: str, timeframe: str = "1Min"
-) -> bool:
+def save_as_npy(data: pd.DataFrame, out_path: str, timeframe: str = "1Min") -> bool:
     array = dataframe_to_array(data, os.path.basename(out_path), timeframe)
     if array is None:
         return False
@@ -241,7 +244,10 @@ def request_json(
                 if retry_after:
                     delay = float(retry_after)
                 elif rate_limit_reset:
-                    delay = max(float(rate_limit_reset) - time.time(), 1.0) + random.random()
+                    delay = (
+                        max(float(rate_limit_reset) - time.time(), 1.0)
+                        + random.random()
+                    )
                 else:
                     delay = min(2**attempt, 60) + random.random()
                 logger.warning(
@@ -263,11 +269,15 @@ def request_json(
             if not isinstance(payload, dict):
                 raise ValueError("response JSON must be an object")
             if "message" in payload and "bars" not in payload:
-                raise RuntimeError(f"API error for ticker={ticker}: {payload['message']}")
+                raise RuntimeError(
+                    f"API error for ticker={ticker}: {payload['message']}"
+                )
             return payload
         except (requests.RequestException, ValueError) as exc:
             if attempt + 1 == REQUEST_RETRIES:
-                raise RuntimeError(f"request failed for {ticker} after {REQUEST_RETRIES} attempts") from exc
+                raise RuntimeError(
+                    f"request failed for {ticker} after {REQUEST_RETRIES} attempts"
+                ) from exc
             delay = min(2**attempt, 60) + random.random()
             logger.warning(
                 "Request error, ticker=%s, retry=%d/%d, delay=%.1fs, error=%s",
@@ -281,15 +291,17 @@ def request_json(
     raise AssertionError("retry loop exited unexpectedly")
 
 
+def storage_ticker(ticker: str) -> str:
+    """Normalize a symbol for an unprefixed on-disk filename."""
+    symbol = str(ticker).upper()
+    if symbol.startswith("ST-"):
+        return symbol[3:].replace("-", ".")
+    return symbol
+
+
 def clean_ticker(ticker: str) -> str:
-    # clean ticker
-    pattern = r"^[A-Z]{2}-"
-    if re.match(pattern, ticker):
-        ticker = ticker[3:]
-    ticker = ticker.upper()
-    # restore dot characters
-    ticker = ticker.replace("-", ".")
-    return ticker
+    """Normalize a stored symbol for Alpaca's dot-separated API notation."""
+    return storage_ticker(ticker)
 
 
 def download_bars_alpaca(
@@ -417,6 +429,7 @@ def process_ticker(
     overlap_days: int = 30,
     timeframe: str = "1Min",
 ) -> bool:
+    ticker = storage_ticker(ticker)
     out_path = f"{out_dir}/{ticker}.npy"
     if skip_existing and os.path.exists(out_path):
         logger.info(f"Ticker exists already - skip, ticker={ticker}")
@@ -425,11 +438,7 @@ def process_ticker(
         if update_existing and os.path.exists(out_path):
             base = np.load(out_path)
             expected_columns = len(BAR_COLUMNS[timeframe])
-            if (
-                base.ndim != 2
-                or base.shape[1] != expected_columns
-                or len(base) == 0
-            ):
+            if base.ndim != 2 or base.shape[1] != expected_columns or len(base) == 0:
                 raise ValueError(f"invalid existing bar array shape: {base.shape}")
             base_start = ANNO + timedelta(seconds=int(base[0, 0]))
             base_last = ANNO + timedelta(seconds=int(base[-1, 0]))
@@ -574,16 +583,28 @@ def main(
         res = list(tqdm(map(fn, tickers), total=tickers_num, desc="Processing tickers"))
     else:
         with ThreadPoolExecutor(max_workers=workers_num) as pool:
-            res = list(tqdm(pool.map(fn, tickers), total=tickers_num, desc="Processing tickers"))
+            res = list(
+                tqdm(
+                    pool.map(fn, tickers), total=tickers_num, desc="Processing tickers"
+                )
+            )
     t1 = time.perf_counter()
 
     success_num = sum(res)
-    failed_tickers = [ticker for ticker, succeeded in zip(tickers, res) if not succeeded]
+    failed_tickers = [
+        ticker for ticker, succeeded in zip(tickers, res) if not succeeded
+    ]
     failed_path = pathlib.Path(out_dir) / "_failed_tickers.txt"
     failed_path.write_text("".join(f"{ticker}\n" for ticker in failed_tickers))
-    logger.info(f"Downloading done, success_num={success_num}, tickers_num={tickers_num}")
+    logger.info(
+        f"Downloading done, success_num={success_num}, tickers_num={tickers_num}"
+    )
     if failed_tickers:
-        logger.warning("Tickers failed, failed_num=%d, manifest=%s", len(failed_tickers), failed_path)
+        logger.warning(
+            "Tickers failed, failed_num=%d, manifest=%s",
+            len(failed_tickers),
+            failed_path,
+        )
 
     manifest = {
         "updated_at": datetime.now(UTC).isoformat(),
@@ -619,10 +640,16 @@ parser.add_argument(
     help="Source of data",
 )
 parser.add_argument("--tickers_path", type=str, required=True, help="File with tickers")
-parser.add_argument("--out_dir", type=str, required=True, help="Directory to save the dataset")
+parser.add_argument(
+    "--out_dir", type=str, required=True, help="Directory to save the dataset"
+)
 parser.add_argument("--days", type=int, default=None, help="Days to look back for data")
-parser.add_argument("--since", type=str, default=None, help="Date to look back for data")
-parser.add_argument("--workers_num", type=int, default=8, help="Number of workers to use")
+parser.add_argument(
+    "--since", type=str, default=None, help="Date to look back for data"
+)
+parser.add_argument(
+    "--workers_num", type=int, default=8, help="Number of workers to use"
+)
 parser.add_argument(
     "--timeframe",
     choices=("1Min", "1Day"),

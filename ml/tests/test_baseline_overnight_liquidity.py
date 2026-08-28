@@ -22,6 +22,7 @@ from baseline.overnight_liquidity import (
     print_scheme_comparison,
     print_symbol_trade_counts,
     print_summary_table,
+    reference_session_calendar,
     run_backtest,
     strategy_metrics,
     top_liquid_indices,
@@ -87,7 +88,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             prices = load_opening_auction_prices(
                 path,
                 pd.DatetimeIndex(["2026-08-25"]),
-                np.array(["ST-AAPL", "ST-MSFT"]),
+                np.array(["AAPL", "MSFT"]),
             )
 
         self.assertEqual(prices[0, 0], 50.5)
@@ -123,7 +124,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             mask, known = load_primary_auction_exchange_mask(
                 path,
                 pd.DatetimeIndex(["2024-11-21", "2024-11-27"]),
-                np.array(["ST-PLTR", "ST-UNKNOWN"]),
+                np.array(["PLTR", "UNKNOWN"]),
                 "nasdaq",
             )
 
@@ -143,7 +144,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
 
     def test_whole_share_backtest_weights_returns_by_integer_notional_and_idle_cash(self):
         dates = pd.date_range("2026-08-24", periods=4, freq="B")
-        symbols = np.array(["ST-SPY", "ST-A", "ST-B"])
+        symbols = np.array(["SPY", "A", "B"])
         dollar_volume = np.array(
             [
                 [1_000.0, 3_000.0, 2_000.0],
@@ -333,38 +334,123 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertTrue(np.isnan(union_scores[0]).all())
 
     def test_activity_cutoff_excludes_the_ranking_minute_bar(self):
-        context_start = 1_000_000
+        context_start = int(
+            (
+                pd.Timestamp("2026-08-24 04:00", tz="America/New_York").tz_convert("UTC")
+                - pd.Timestamp("2010-01-01", tz="UTC")
+            ).total_seconds()
+        )
         regular_start = context_start + (9 * 60 + 30 - 4 * 60) * 60
         ranking_second = context_start + (15 * 60 + 15 - 4 * 60) * 60
-        source = np.array(
-            [
-                [regular_start, 100_000, 10, 1],
-                [ranking_second - 60, 100_000, 20, 2],
-                [ranking_second, 100_000, 1_000, 100],
-                [ranking_second + 60, 100_000, 2_000, 200],
-            ],
-            dtype=np.int64,
+        seconds = np.arange(regular_start, regular_start + 391 * 60, 60, dtype=np.int64)
+        source = np.column_stack(
+            (
+                seconds,
+                np.full(391, 100_000, dtype=np.int64),
+                np.ones(391, dtype=np.int64),
+                np.ones(391, dtype=np.int64),
+            )
         )
+        ranking_row = int(np.flatnonzero(seconds == ranking_second)[0])
+        source[ranking_row, 2:] = (1_000, 100)
+        source[ranking_row + 1, 2:] = (2_000, 200)
         with tempfile.TemporaryDirectory() as directory:
-            np.save(Path(directory) / "ST-X.npy", source)
-            rows = pd.DataFrame(
-                {"date": [pd.Timestamp("2026-08-24")], "sod_idx": [0], "eod_idx": [3]}
+            minute_dir = Path(directory) / "minute"
+            daily_dir = Path(directory) / "daily"
+            minute_dir.mkdir()
+            daily_dir.mkdir()
+            np.save(minute_dir / "X.npy", source)
+            daily_second = int(
+                (
+                    pd.Timestamp("2026-08-24", tz="America/New_York").tz_convert("UTC")
+                    - pd.Timestamp("2010-01-01", tz="UTC")
+                ).total_seconds()
+            )
+            np.save(
+                daily_dir / "X.npy",
+                np.array(
+                    [[daily_second, 90_000, 110_000, 80_000, 95_000, 50, 10, 100_000]],
+                    dtype=np.int64,
+                ),
             )
             result = _symbol_daily_arrays(
-                "ST-X",
-                rows,
+                "X",
                 {pd.Timestamp("2026-08-24"): 0},
                 np.array([context_start]),
-                Path(directory),
+                minute_dir,
+                daily_dir,
                 15 * 60 + 55,
                 9 * 60 + 45,
                 15 * 60 + 15,
                 1,
             )
 
-        self.assertEqual(result[2][0], 30.0)
-        self.assertEqual(result[3][0], 3.0)
-        self.assertGreater(result[1][0], 300_000.0)
+        self.assertEqual(result[2][0], 345.0)
+        self.assertEqual(result[3][0], 345.0)
+        self.assertEqual(result[1][0], 5_000.0)
+
+    def test_daily_dollar_volume_falls_back_to_close_when_vwap_is_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            minute_dir = Path(directory) / "minute"
+            daily_dir = Path(directory) / "daily"
+            minute_dir.mkdir()
+            daily_dir.mkdir()
+            daily_second = int(
+                (
+                    pd.Timestamp("2026-01-05", tz="America/New_York").tz_convert("UTC")
+                    - pd.Timestamp("2010-01-01", tz="UTC")
+                ).total_seconds()
+            )
+            np.save(
+                daily_dir / "X.npy",
+                np.array(
+                    [[daily_second, 90_000, 110_000, 80_000, 95_000, 50, 10, 0]],
+                    dtype=np.int64,
+                ),
+            )
+            result = _symbol_daily_arrays(
+                "X",
+                {pd.Timestamp("2026-01-05"): 0},
+                np.array([0]),
+                minute_dir,
+                daily_dir,
+                15 * 60 + 55,
+                9 * 60 + 45,
+                15 * 60 + 15,
+                1,
+            )
+
+        self.assertEqual(result[1][0], 4_750.0)
+
+    def test_reference_calendar_is_derived_from_complete_minute_sessions(self):
+        def session_seconds(day: str, close: str) -> np.ndarray:
+            start = pd.Timestamp(f"{day} 09:30", tz="America/New_York").tz_convert("UTC")
+            end = pd.Timestamp(f"{day} {close}", tz="America/New_York").tz_convert("UTC")
+            timestamps = pd.date_range(start, end, freq="1min")
+            return (
+                (timestamps - pd.Timestamp("2010-01-01", tz="UTC"))
+                .total_seconds()
+                .to_numpy(dtype=np.int64)
+            )
+
+        seconds = np.concatenate(
+            (
+                session_seconds("2026-01-05", "16:00"),
+                session_seconds("2026-01-06", "13:00"),
+                session_seconds("2026-01-07", "16:00"),
+            )
+        )
+        bars = np.column_stack((seconds, np.full(len(seconds), 100_000, dtype=np.int64)))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "SPY.npy"
+            np.save(path, bars)
+            dates, context_sod = reference_session_calendar(path)
+
+        self.assertEqual(dates.strftime("%Y-%m-%d").tolist(), ["2026-01-05", "2026-01-07"])
+        context_times = pd.to_datetime(
+            context_sod, unit="s", origin="2010-01-01", utc=True
+        ).tz_convert("America/New_York")
+        self.assertEqual(context_times.strftime("%H:%M").tolist(), ["04:00", "04:00"])
 
     def test_scheme_comparison_reports_stability_kpis(self):
         metrics = strategy_metrics(np.array([0.01, -0.005]))
@@ -420,14 +506,14 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             "dollar_ema": pd.DataFrame(
                 {
                     "entry_date": ["2026-08-20", "2026-08-21", "2026-08-21"],
-                    "sample_id": ["ST-AAPL", "ST-AAPL", "ST-MSFT"],
+                    "sample_id": ["AAPL", "AAPL", "MSFT"],
                     "net_return": [0.01, 0.02, -0.01],
                 }
             ),
             "alpaca_volume": pd.DataFrame(
                 {
                     "entry_date": ["2026-08-20", "2026-08-21"],
-                    "sample_id": ["ST-MSFT", "ST-MSFT"],
+                    "sample_id": ["MSFT", "MSFT"],
                     "net_return": [0.03, 0.01],
                 }
             ),
@@ -445,7 +531,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertIn("-1.000%", rendered)
 
     def test_company_mask_keeps_spy_only_as_reference_and_excludes_unknowns(self):
-        symbols = np.array(["ST-SPY", "ST-AAPL", "ST-ETHA", "ST-UNKNOWN"])
+        symbols = np.array(["SPY", "AAPL", "ETHA", "UNKNOWN"])
         security_master = {
             "SPY": {"name": "SPDR S&P 500 ETF Trust", "etf": "Y"},
             "AAPL": {"name": "Apple Inc. - Common Stock", "etf": "N"},
@@ -463,7 +549,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
 
     def test_company_mask_keeps_historical_unclassified_symbols_by_default(self):
         mask, reasons, unclassified = company_universe_mask(
-            np.array(["ST-DELISTED"]), security_master={}
+            np.array(["DELISTED"]), security_master={}
         )
 
         self.assertEqual(mask.tolist(), [True])
@@ -471,7 +557,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertEqual(unclassified, 1)
 
     def test_exchange_mask_reranks_nasdaq_candidates_and_keeps_spy_benchmark(self):
-        symbols = np.array(["ST-SPY", "ST-AAPL", "ST-JPM", "ST-UNKNOWN"])
+        symbols = np.array(["SPY", "AAPL", "JPM", "UNKNOWN"])
         security_master = {
             "AAPL": {"exchange": "Q"},
             "JPM": {"exchange": "N"},

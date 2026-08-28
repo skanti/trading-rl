@@ -36,7 +36,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trading-url", default=os.environ.get("ALPACA_URL", PAPER_TRADING_URL))
     parser.add_argument("--security-master-cache", default=DEFAULT_SECURITY_MASTER_CACHE)
     parser.add_argument("--refresh-security-master", action="store_true")
+    parser.add_argument(
+        "--merge-existing",
+        action="store_true",
+        help="add the current universe to an existing output without removing historical symbols",
+    )
     return parser
+
+
+def merge_existing_symbols(
+    current_symbols: list[str], output: Path, enabled: bool
+) -> tuple[list[str], int]:
+    current = set(current_symbols)
+    if not enabled or not output.exists():
+        return sorted(current), len(current)
+    existing = {
+        line.strip().upper()
+        for line in output.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    return sorted(existing | current), len(current - existing)
 
 
 def main() -> None:
@@ -64,6 +83,7 @@ def main() -> None:
         if str(asset.get("symbol", "")).upper() in selected
     )
     output = Path(args.output)
+    symbols, added = merge_existing_symbols(symbols, output, args.merge_existing)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -80,6 +100,8 @@ def main() -> None:
         f"{exchange}={count:,}" for exchange, count in sorted(exchange_counts.items())
     )
     print(f"wrote {len(symbols):,} symbols to {output.resolve()}")
+    if args.merge_existing:
+        print(f"added {added:,} newly available symbols; retained historical symbols")
     print(f"exchanges: {breakdown}")
 
 

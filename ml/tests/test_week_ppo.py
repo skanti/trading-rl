@@ -303,8 +303,8 @@ class WeekDatasetTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.directory = Path(self.tmp.name)
         self.sessions = weekday_sessions(date(2026, 3, 2), 5)
-        self.days = build_day_frame(("ST-AAA", "ST-SPY"), self.sessions)
-        for seed, sample_id in enumerate(("ST-AAA", "ST-SPY")):
+        self.days = build_day_frame(("AAA", "SPY"), self.sessions)
+        for seed, sample_id in enumerate(("AAA", "SPY")):
             write_minute_npy(self.directory, sample_id, self.sessions, seed)
 
     def tearDown(self):
@@ -312,7 +312,7 @@ class WeekDatasetTest(unittest.TestCase):
 
     def test_only_weeks_with_ten_preceding_sessions_are_offered(self):
         dataset = MarketWeekDataset(
-            self.days[self.days.sample_id.eq("ST-AAA")], str(self.directory)
+            self.days[self.days.sample_id.eq("AAA")], str(self.directory)
         )
         # Five weeks are present; the first two supply context for the rest.
         self.assertEqual(len(dataset), 3)
@@ -323,7 +323,7 @@ class WeekDatasetTest(unittest.TestCase):
 
     def test_sample_grid_covers_monday_open_through_friday_close(self):
         dataset = MarketWeekDataset(
-            self.days[self.days.sample_id.eq("ST-AAA")], str(self.directory)
+            self.days[self.days.sample_id.eq("AAA")], str(self.directory)
         )
         sample = dataset[0]
         self.assertEqual(sample["prices"].shape, (dataset.context_ticks + dataset.rollout_size + 1,))
@@ -343,19 +343,19 @@ class WeekDatasetTest(unittest.TestCase):
 
     def test_incomplete_week_is_dropped(self):
         days = self.days[~self.days.date.eq("2026-03-18")]
-        dataset = MarketWeekDataset(days[days.sample_id.eq("ST-AAA")], str(self.directory))
+        dataset = MarketWeekDataset(days[days.sample_id.eq("AAA")], str(self.directory))
         self.assertNotIn(pd.Timestamp("2026-03-16"), set(dataset.weeks.week_start))
 
     def test_untradable_session_drops_its_week(self):
         days = self.days.copy()
         days.loc[days.date.eq("2026-03-25"), "is_tradable"] = False
-        dataset = MarketWeekDataset(days[days.sample_id.eq("ST-AAA")], str(self.directory))
+        dataset = MarketWeekDataset(days[days.sample_id.eq("AAA")], str(self.directory))
         self.assertNotIn(pd.Timestamp("2026-03-23"), set(dataset.weeks.week_start))
 
     def test_reference_is_time_matched_and_never_tradable(self):
-        dataset = WeekReferenceDataset(self.days, str(self.directory), "ST-SPY")
+        dataset = WeekReferenceDataset(self.days, str(self.directory), "SPY")
         sample = dataset[0]
-        self.assertEqual(set(dataset.assets.weeks.sample_id), {"ST-AAA"})
+        self.assertEqual(set(dataset.assets.weeks.sample_id), {"AAA"})
         self.assertEqual(sample["prices"].shape, sample["reference_prices"].shape)
         self.assertFalse(np.array_equal(sample["prices"], sample["reference_prices"]))
 

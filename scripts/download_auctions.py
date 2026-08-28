@@ -44,6 +44,17 @@ def symbols_from_trade_csv(path: Path) -> list[str]:
     return sorted({_security_symbol(symbol) for symbol in trades.sample_id})
 
 
+def symbols_from_file(path: Path) -> list[str]:
+    """Read one symbol per line, ignoring blanks and comment lines."""
+    return sorted(
+        {
+            _security_symbol(line.strip())
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+    )
+
+
 def flatten_auctions(payload: dict[str, object]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     auctions = payload.get("auctions", {})
@@ -569,6 +580,12 @@ def main() -> None:
         default=[],
         help="CSV containing the simulator's sample_id column; may be repeated",
     )
+    parser.add_argument(
+        "--symbols-file",
+        action="append",
+        default=[],
+        help="text file containing one symbol per line; may be repeated",
+    )
     parser.add_argument("--symbols", default="", help="additional comma-separated symbols")
     parser.add_argument("--batch-size", type=int, default=50)
     args = parser.parse_args()
@@ -581,6 +598,8 @@ def main() -> None:
     symbols = {_security_symbol(symbol) for symbol in args.symbols.split(",") if symbol.strip()}
     for path in args.symbols_from_trades:
         symbols.update(symbols_from_trade_csv(Path(path)))
+    for path in args.symbols_file:
+        symbols.update(symbols_from_file(Path(path)))
     output_path = Path(args.output)
     if output_path.suffix.lower() != ".npz":
         parser.error("--output must end in .npz")

@@ -7,6 +7,7 @@ import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 from rich.console import Console
 
 from baseline.live_overnight_liquidity import (
@@ -18,8 +19,10 @@ from baseline.live_overnight_liquidity import (
     DailyLogHandler,
     StateStore,
     StrategyConfig,
+    _daily_bars_to_array,
     _completed_session_end,
     _exit_order_time_in_force,
+    _merge_daily_arrays,
     _print_entry_plan,
     _select_unconflicted_candidates,
     _validate_args,
@@ -27,10 +30,12 @@ from baseline.live_overnight_liquidity import (
     available_budget,
     build_parser,
     completed_liquidity_ranking,
+    dollar_volume_shortlist,
     eligible_assets,
     enter_for_day,
     exit_position,
-    fast_activity_candidates,
+    refresh_daily_cache,
+    seed_missing_daily_cache,
     whole_share_order_plan,
 )
 
@@ -42,7 +47,11 @@ def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
         min_history_days=2,
         minimum_trading_days=2,
         lookback_calendar_days=90,
-        activity_candidates=100,
+        daily_bars_dir=Path("/unused/daily-bars"),
+        liquidity_shortlist=Path("/unused/most-liquid.txt"),
+        shortlist_since=date(2022, 1, 1),
+        shortlist_daily_top=50,
+        daily_overlap_days=30,
         feed="iex",
         quote_feed="iex",
         exchanges=DEFAULT_EXCHANGES,
@@ -62,6 +71,16 @@ def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
 
 def bar(day, volume, vwap=100.0):
     return {"t": f"{day}T04:00:00Z", "v": volume, "vw": vwap, "c": vwap}
+
+
+def full_bar(day, volume, vwap=100.0):
+    return {
+        **bar(day, volume, vwap),
+        "o": vwap,
+        "h": vwap,
+        "l": vwap,
+        "n": 100,
+    }
 
 
 class FakeBroker:
@@ -134,12 +153,6 @@ class FakeBroker:
         raise AssertionError("filled fake orders must not be canceled")
 
 
-class FakeActivityClient:
-    def most_active_stocks(self, by, top=100):
-        symbols = ["AAPL", "QQQ"] if by == "volume" else ["MSFT", "QQQ"]
-        return {"most_actives": [{"symbol": symbol} for symbol in symbols]}
-
-
 class FakeQueuedBroker(FakeBroker):
     def submit_order(self, payload):
         if payload["side"] != "sell":
@@ -170,7 +183,9 @@ class FakeWorkingExitBroker(FakeQueuedBroker):
 
     def cancel_order(self, order_id):
         self.cancellations.append(order_id)
-        raise AssertionError("a working exit order must not be canceled on the fill timeout")
+        raise AssertionError(
+            "a working exit order must not be canceled on the fill timeout"
+        )
 
 
 class FakeConcurrentBroker(FakeBroker):
@@ -203,6 +218,16 @@ class FakeClockBroker:
 
     def clock(self):
         return {"timestamp": self.timestamp, "is_open": self.is_open}
+
+
+class FakeDailyBarsClient:
+    def __init__(self, bars):
+        self.bars = bars
+        self.adjustments = []
+
+    def historical_daily_bars(self, symbols, start, end, feed, adjustment="raw"):
+        self.adjustments.append(adjustment)
+        return {symbol: list(self.bars.get(symbol, [])) for symbol in symbols}
 
 
 class LiveOvernightLiquidityTest(unittest.TestCase):
@@ -268,12 +293,18 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(args.quote_max_age_seconds, 120.0)
         self.assertEqual(args.entry_preflight_seconds, 10.0)
         self.assertEqual(args.order_submit_workers, 8)
+        self.assertEqual(args.shortlist_since, date(2022, 1, 1))
+        self.assertEqual(args.shortlist_daily_top, 50)
+        self.assertEqual(args.daily_overlap_days, 30)
         self.assertEqual(parsed.capital_fraction, 1.0)
         self.assertEqual(parsed.feed, "sip")
         self.assertEqual(parsed.quote_feed, "iex")
         self.assertEqual(parsed.quote_max_age_seconds, 120.0)
         self.assertEqual(parsed.entry_preflight_seconds, 10.0)
         self.assertEqual(parsed.order_submit_workers, 8)
+        self.assertEqual(parsed.shortlist_since, date(2022, 1, 1))
+        self.assertEqual(parsed.shortlist_daily_top, 50)
+        self.assertEqual(parsed.daily_overlap_days, 30)
         self.assertEqual(parsed.poll_seconds, 1.0)
 
         preview_args = parser.parse_args(["preview"])
@@ -308,7 +339,9 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
             handler = DailyLogHandler(root, fixed_day=day)
             handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
-            record = logging.LogRecord("test", logging.INFO, __file__, 1, "rank complete", (), None)
+            record = logging.LogRecord(
+                "test", logging.INFO, __file__, 1, "rank complete", (), None
+            )
             handler.emit(record)
 
             daily = root / day.isoformat()
@@ -363,8 +396,128 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertEqual([symbol for symbol, _, _ in ranking], ["ESTABLISHED"])
 
+    def test_daily_cache_refresh_uses_split_adjustment_and_appends_exact_overlap(self):
+        base_bars = [full_bar("2026-08-20", 100), full_bar("2026-08-21", 110)]
+        update_bars = [full_bar("2026-08-21", 110), full_bar("2026-08-24", 120)]
+        client = FakeDailyBarsClient({"AAPL": update_bars})
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            np.save(bars_dir / "AAPL.npy", _daily_bars_to_array(base_bars, "AAPL"))
+
+            diagnostics = refresh_daily_cache(
+                client,
+                bars_dir,
+                ["AAPL"],
+                date(2026, 8, 24),
+                _completed_session_end(date(2026, 8, 24)),
+                "sip",
+                batch_size=100,
+                workers=1,
+                overlap_days=30,
+            )
+            saved = np.load(bars_dir / "AAPL.npy")
+
+        self.assertEqual(len(saved), 3)
+        self.assertEqual(client.adjustments, ["split"])
+        self.assertEqual(diagnostics["updated_files"], 1)
+        self.assertEqual(diagnostics["full_refreshes"], 0)
+
+    def test_newly_eligible_company_is_seeded_with_split_adjusted_history(self):
+        client = FakeDailyBarsClient(
+            {"NEW": [full_bar("2026-08-21", 100), full_bar("2026-08-24", 110)]}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            diagnostics = seed_missing_daily_cache(
+                client,
+                bars_dir,
+                ["NEW"],
+                date(2022, 1, 1),
+                _completed_session_end(date(2026, 8, 24)),
+                "sip",
+                batch_size=100,
+                workers=1,
+            )
+            saved = np.load(bars_dir / "NEW.npy")
+
+        self.assertEqual(saved.shape, (2, 8))
+        self.assertEqual(client.adjustments, ["split"])
+        self.assertEqual(diagnostics["new_symbols_requested"], 1)
+        self.assertEqual(diagnostics["new_symbols_added"], 1)
+
+    def test_daily_cache_refresh_fails_closed_when_previous_session_is_missing(self):
+        client = FakeDailyBarsClient({"AAPL": [full_bar("2026-08-21", 110)]})
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            np.save(
+                bars_dir / "AAPL.npy",
+                _daily_bars_to_array([full_bar("2026-08-21", 110)], "AAPL"),
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "expected completed session 2026-08-24"
+            ):
+                refresh_daily_cache(
+                    client,
+                    bars_dir,
+                    ["AAPL"],
+                    date(2026, 8, 24),
+                    _completed_session_end(date(2026, 8, 24)),
+                    "sip",
+                    batch_size=100,
+                    workers=1,
+                    overlap_days=30,
+                )
+
+    def test_dollar_volume_shortlist_uses_daily_union_and_excludes_int32_prices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            np.save(
+                bars_dir / "A.npy",
+                _daily_bars_to_array(
+                    [full_bar("2026-08-20", 1_000), full_bar("2026-08-21", 10)],
+                    "A",
+                ),
+            )
+            np.save(
+                bars_dir / "B.npy",
+                _daily_bars_to_array(
+                    [full_bar("2026-08-20", 10), full_bar("2026-08-21", 2_000)],
+                    "B",
+                ),
+            )
+            np.save(
+                bars_dir / "OVERFLOW.npy",
+                _daily_bars_to_array(
+                    [full_bar("2026-08-20", 1_000_000, 3_000_000.0)],
+                    "OVERFLOW",
+                ),
+            )
+
+            symbols, sessions, excluded = dollar_volume_shortlist(
+                bars_dir, date(2022, 1, 1), top=1
+            )
+
+        self.assertEqual(symbols, ["A", "B"])
+        self.assertEqual(sessions, 2)
+        self.assertEqual(excluded, ["OVERFLOW"])
+
+    def test_daily_array_merge_detects_historical_revision(self):
+        base = _daily_bars_to_array(
+            [full_bar("2026-08-20", 100), full_bar("2026-08-21", 110)], "A"
+        )
+        revised = _daily_bars_to_array(
+            [full_bar("2026-08-21", 999), full_bar("2026-08-24", 120)], "A"
+        )
+
+        self.assertIsNone(_merge_daily_arrays(base, revised))
+
     def test_only_fractionable_exchange_listed_assets_are_eligible(self):
-        common = {"status": "active", "tradable": True, "fractionable": True, "class": "us_equity"}
+        common = {
+            "status": "active",
+            "tradable": True,
+            "fractionable": True,
+            "class": "us_equity",
+        }
         assets = [
             {**common, "symbol": "GOOD", "exchange": "NASDAQ"},
             {**common, "symbol": "OTC", "exchange": "OTC"},
@@ -395,53 +548,6 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(
             eligible_assets(assets, DEFAULT_EXCHANGES, security_master), ["AAPL"]
         )
-
-    def test_fast_activity_candidates_union_both_screens_and_previous_day(self):
-        common = {
-            "status": "active",
-            "tradable": True,
-            "fractionable": True,
-            "class": "us_equity",
-            "exchange": "NASDAQ",
-        }
-        assets = [
-            {**common, "symbol": symbol}
-            for symbol in ("AAPL", "MSFT", "NVDA", "QQQ")
-        ]
-        security_master = {
-            symbol: {"name": f"{symbol} Company - Common Stock", "etf": "N"}
-            for symbol in ("AAPL", "MSFT", "NVDA")
-        }
-        security_master["QQQ"] = {"name": "Invesco QQQ Trust ETF", "etf": "Y"}
-
-        symbols, diagnostics = fast_activity_candidates(
-            FakeActivityClient(),
-            assets,
-            DEFAULT_EXCHANGES,
-            security_master,
-            {"screened_candidate_symbols": ["NVDA"]},
-        )
-
-        self.assertEqual(symbols, ["AAPL", "MSFT", "NVDA"])
-        self.assertEqual(diagnostics["raw_candidate_symbols"], 4)
-        self.assertEqual(diagnostics["excluded_or_unavailable_candidates"], 1)
-
-    def test_most_actives_uses_v1beta1_screener_endpoint(self):
-        client = AlpacaClient("key", "secret")
-        calls = []
-
-        def request(method, base, path, **kwargs):
-            calls.append((method, base, path, kwargs))
-            return {"most_actives": [{"symbol": "AAPL"}]}
-
-        client._request = request
-        response = client.most_active_stocks("trades", 100)
-
-        self.assertEqual(response["most_actives"][0]["symbol"], "AAPL")
-        self.assertEqual(calls[0][1], "https://data.alpaca.markets/v1beta1")
-        self.assertEqual(calls[0][2], "screener/stocks/most-actives")
-        self.assertEqual(calls[0][3]["params"], {"by": "trades", "top": 100})
-        self.assertTrue(calls[0][3]["data_credentials"])
 
     def test_latest_quotes_uses_market_data_credentials_and_requested_feed(self):
         client = AlpacaClient("key", "secret")
@@ -482,9 +588,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         client._request = request
         completed_end = _completed_session_end(date(2026, 8, 24))
-        client.historical_daily_bars(
-            ["AAPL"], date(2026, 2, 25), completed_end, "sip"
-        )
+        client.historical_daily_bars(["AAPL"], date(2026, 2, 25), completed_end, "sip")
 
         self.assertEqual(completed_end.isoformat(), "2026-08-24T23:59:59-04:00")
         self.assertEqual(calls[0][3]["params"]["end"], completed_end.isoformat())
@@ -498,14 +602,22 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
     def test_budget_does_not_treat_non_marginable_power_as_stock_cash(self):
         budget = available_budget(
-            {"cash": "1000", "buying_power": "4000", "non_marginable_buying_power": "600"},
+            {
+                "cash": "1000",
+                "buying_power": "4000",
+                "non_marginable_buying_power": "600",
+            },
             config(top=10),
         )
         self.assertEqual(budget, 950.0)
 
     def test_budget_respects_regular_stock_buying_power(self):
         budget = available_budget(
-            {"cash": "1000", "buying_power": "600", "non_marginable_buying_power": "1000"},
+            {
+                "cash": "1000",
+                "buying_power": "600",
+                "non_marginable_buying_power": "1000",
+            },
             config(top=10),
         )
         self.assertEqual(budget, 600.0)
@@ -589,16 +701,13 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             second["entry_orders"]["A"]["dispatch_started_at"],
             first["entry_orders"]["A"]["dispatch_started_at"],
         )
-        self.assertTrue(
-            second["entry_orders"]["A"]["recovered_by_client_order_id"]
-        )
+        self.assertTrue(second["entry_orders"]["A"]["recovered_by_client_order_id"])
 
     def test_preflight_persists_sizing_then_dispatches_orders_concurrently(self):
         broker = FakeConcurrentBroker()
         symbols = [f"S{index}" for index in range(8)]
         broker.latest_quote_rows = {
-            symbol: {"ap": 10.0, "t": "2026-08-24T19:58:50Z"}
-            for symbol in symbols
+            symbol: {"ap": 10.0, "t": "2026-08-24T19:58:50Z"} for symbol in symbols
         }
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.json")
@@ -667,8 +776,12 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             }
             store.save(state)
 
-            first = enter_for_day(broker, store, config(), date(2026, 8, 24), submit=True)
-            second = enter_for_day(broker, store, config(), date(2026, 8, 24), submit=True)
+            first = enter_for_day(
+                broker, store, config(), date(2026, 8, 24), submit=True
+            )
+            second = enter_for_day(
+                broker, store, config(), date(2026, 8, 24), submit=True
+            )
 
         self.assertEqual(first["symbols"], ["A", "B"])
         self.assertEqual(second["status"], "open")
@@ -917,7 +1030,12 @@ def _ranking(*pairs):
     """Build a ranking payload from (symbol, issuer) pairs in rank order."""
     return {
         "candidates": [
-            {"rank": index + 1, "symbol": symbol, "issuer": issuer, "score": 100.0 - index}
+            {
+                "rank": index + 1,
+                "symbol": symbol,
+                "issuer": issuer,
+                "score": 100.0 - index,
+            }
             for index, (symbol, issuer) in enumerate(pairs)
         ]
     }
@@ -943,7 +1061,9 @@ class ShareClassDedupeTest(unittest.TestCase):
             ("GOOGL", "alphabet inc."),
             ("NVDA", "nvidia corporation"),
         )
-        self.assertEqual(_select_unconflicted_candidates(ranking, set(), set(), 2), ["GOOG", "NVDA"])
+        self.assertEqual(
+            _select_unconflicted_candidates(ranking, set(), set(), 2), ["GOOG", "NVDA"]
+        )
 
     def test_deduping_can_be_switched_off(self):
         ranking = _ranking(("GOOGL", "alphabet inc."), ("GOOG", "alphabet inc."))
@@ -954,8 +1074,15 @@ class ShareClassDedupeTest(unittest.TestCase):
 
     def test_a_ranking_without_issuers_still_selects(self):
         # State written before issuers were recorded must not break entry.
-        legacy = {"candidates": [{"rank": 1, "symbol": "GOOGL"}, {"rank": 2, "symbol": "GOOG"}]}
-        self.assertEqual(_select_unconflicted_candidates(legacy, set(), set(), 2), ["GOOGL", "GOOG"])
+        legacy = {
+            "candidates": [
+                {"rank": 1, "symbol": "GOOGL"},
+                {"rank": 2, "symbol": "GOOG"},
+            ]
+        }
+        self.assertEqual(
+            _select_unconflicted_candidates(legacy, set(), set(), 2), ["GOOGL", "GOOG"]
+        )
 
     def test_conflicts_and_duplicates_are_skipped_together(self):
         ranking = _ranking(

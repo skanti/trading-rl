@@ -21,6 +21,27 @@ def bars(*rows: tuple[int, int, int, int]) -> np.ndarray:
 
 
 class BarUpdateTests(unittest.TestCase):
+    def test_storage_names_drop_legacy_asset_prefix(self):
+        self.assertEqual(download_bars.storage_ticker("ST-BRK-B"), "BRK.B")
+        self.assertEqual(download_bars.storage_ticker("BRK.B"), "BRK.B")
+        self.assertEqual(download_bars.clean_ticker("ST-BRK-B"), "BRK.B")
+
+    def test_minute_schema_skips_split_adjusted_price_overflow(self):
+        frame = download_bars.pd.DataFrame(
+            [
+                {
+                    "t": "2026-08-27T19:59:00Z",
+                    "o": 2_500_000.0,
+                    "v": 1_000,
+                    "n": 100,
+                }
+            ]
+        )
+
+        array = download_bars.dataframe_to_array(frame, "ABTC.npy", "1Min")
+
+        self.assertIsNone(array)
+
     def test_daily_schema_retains_ohlcv_trades_and_vwap(self):
         frame = download_bars.pd.DataFrame(
             [
@@ -71,9 +92,7 @@ class BarUpdateTests(unittest.TestCase):
             (4, 52, 26, 4),
         )
 
-        self.assertIsNone(
-            download_bars.merge_bar_arrays(base, split_adjusted_update)
-        )
+        self.assertIsNone(download_bars.merge_bar_arrays(base, split_adjusted_update))
 
     def test_missing_or_nonoverlapping_rows_require_full_refresh(self):
         base = bars((1, 100, 10, 1), (2, 101, 11, 2), (3, 102, 12, 3))
@@ -84,9 +103,7 @@ class BarUpdateTests(unittest.TestCase):
                 bars((2, 101, 11, 2), (4, 103, 13, 4)),
             )
         )
-        self.assertIsNone(
-            download_bars.merge_bar_arrays(base, bars((4, 103, 13, 4)))
-        )
+        self.assertIsNone(download_bars.merge_bar_arrays(base, bars((4, 103, 13, 4))))
 
     def test_ticker_update_escalates_to_full_download_on_difference(self):
         day = 24 * 60 * 60

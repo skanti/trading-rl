@@ -227,8 +227,8 @@ class ClassifyDatasetTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.directory = Path(self.tmp.name)
         self.sessions = weekday_sessions(date(2026, 3, 2), 4)
-        self.days = build_day_frame(("ST-AAA", "ST-SPY"), self.sessions)
-        for seed, sample_id in enumerate(("ST-AAA", "ST-SPY")):
+        self.days = build_day_frame(("AAA", "SPY"), self.sessions)
+        for seed, sample_id in enumerate(("AAA", "SPY")):
             write_minute_npy(self.directory, sample_id, self.sessions, seed)
 
     def tearDown(self):
@@ -236,7 +236,7 @@ class ClassifyDatasetTest(unittest.TestCase):
 
     def dataset(self, **kwargs):
         options = dict(
-            days=self.days, data_dir=str(self.directory), reference_symbol="ST-SPY",
+            days=self.days, data_dir=str(self.directory), reference_symbol="SPY",
             context_days=2, tick_minutes=10, window_size=100, horizon_days=2,
         )
         options.update(kwargs)
@@ -250,7 +250,7 @@ class ClassifyDatasetTest(unittest.TestCase):
         dataset = self.dataset()
         # 20 sessions; 2 are consumed by context and 2 by the horizon.
         self.assertEqual(len(dataset), 20 - 2 - 2)
-        self.assertNotIn("ST-SPY", set(dataset.samples.sample_id))
+        self.assertNotIn("SPY", set(dataset.samples.sample_id))
 
     def test_two_session_labels_are_purged_before_validation(self):
         dates = pd.Series(pd.to_datetime(self.sessions))

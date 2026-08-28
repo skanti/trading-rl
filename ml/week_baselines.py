@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 from week_dataset import forward_filled_prices
 
 
-MAG7 = ("ST-AAPL", "ST-MSFT", "ST-GOOGL", "ST-AMZN", "ST-NVDA", "ST-META", "ST-TSLA")
+MAG7 = ("AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA")
 WEEKS_PER_YEAR = 52.0
 
 
@@ -192,7 +192,7 @@ def run(
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", required=True)
 parser.add_argument("--symbols", default=",".join(MAG7))
-parser.add_argument("--reference_symbol", default="ST-SPY")
+parser.add_argument("--reference_symbol", default="SPY")
 parser.add_argument("--months", type=int, default=12)
 parser.add_argument("--transaction_cost", type=float, default=None)
 parser.add_argument("--complete_weeks_only", action="store_true")

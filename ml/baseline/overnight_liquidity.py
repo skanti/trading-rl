@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 import io
 import json
 import os
@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -28,13 +29,17 @@ from rich.table import Table
 from tqdm import tqdm
 import requests
 
-from classify_evaluate import parse_anchor_time
-from week_dataset import forward_fill_positions
+from price_utils import forward_fill_positions
 
 
-REFERENCE_SYMBOL = "ST-SPY"
+REFERENCE_SYMBOL = "SPY"
 DEFAULT_TRANSACTION_COST_BPS = 1.0
 EXTENDED_OPEN_MINUTE = 4 * 60
+REGULAR_OPEN_MINUTE = 9 * 60 + 30
+REGULAR_CLOSE_MINUTE = 16 * 60
+MIN_USABLE_SESSION_BARS = 120
+BAR_ORIGIN = datetime(2010, 1, 1, tzinfo=timezone.utc)
+EASTERN = ZoneInfo("America/New_York")
 
 # Reg T governs anything held past the close, so an overnight strategy cannot reach the
 # 4x day-trading buying power Alpaca reports as `multiplier`.
@@ -44,8 +49,8 @@ MAX_OVERNIGHT_LEVERAGE = 2.0
 MAINTENANCE_MARGIN = 0.30
 # Alpaca accrues margin interest on a 360-day year, per calendar day.
 MARGIN_INTEREST_DIVISOR = 360.0
-DEFAULT_DAYS_PATH = "/data/ppv1/updates/full_2026-08-22_10d.csv"
-DEFAULT_DATA_DIR = "/data/ppv1/updates/full_2026-08-22"
+DEFAULT_DATA_DIR = "/data/ppv1/updates/bars_1min_2016-01-01"
+DEFAULT_DAILY_DATA_DIR = "/data/ppv1/updates/bars_1day_2016-01-01"
 DEFAULT_AUCTIONS_PATH = "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
 DEFAULT_SECURITY_MASTER_CACHE = "/tmp/trading/baseline_cache/nasdaq_security_master.json"
 NASDAQ_SYMBOL_DIRECTORY_URLS = (
@@ -71,47 +76,78 @@ def _security_symbol(sample_id: str) -> str:
     return symbol.replace("-", ".").upper()
 
 
-def _load_auction_records(path: Path) -> pd.DataFrame:
+def _official_opening_auctions(
+    path: Path,
+    dates: pd.DatetimeIndex | None = None,
+    symbols: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Select requested official opens without expanding every print into pandas."""
     if path.suffix.lower() != ".npz":
         raise ValueError(f"auction data must use the split-adjusted NPZ format: {path}")
     with np.load(path, allow_pickle=False) as data:
-        required = {"symbol", "date", "session", "condition", "price", "size", "exchange"}
+        required = {
+            "symbol",
+            "date",
+            "session",
+            "condition",
+            "price",
+            "size",
+            "exchange",
+        }
         missing = required.difference(data.files)
         if missing:
             raise ValueError(f"{path} is missing auction arrays: {sorted(missing)}")
-        if "split_adjusted" not in data.files or not bool(data["split_adjusted"].item()):
+        if "split_adjusted" not in data.files or not bool(
+            data["split_adjusted"].item()
+        ):
             raise ValueError(f"{path} does not contain pre-adjusted auction prices")
         session_codes = np.asarray(data["session"], dtype=np.uint8)
-        records = pd.DataFrame(
+        conditions = np.asarray(data["condition"]).astype(str, copy=False)
+        price_values = np.asarray(data["price"], dtype=np.float64)
+        selected = np.flatnonzero(
+            (session_codes == 0)
+            & (conditions == "O")
+            & np.isfinite(price_values)
+            & (price_values > 0.0)
+        )
+        if not len(selected):
+            raise ValueError(f"{path} contains no condition-O opening auctions")
+
+        date_values = np.asarray(data["date"], dtype="datetime64[D]")
+        if dates is not None:
+            wanted_dates = np.asarray(pd.DatetimeIndex(dates), dtype="datetime64[D]")
+            selected = selected[np.isin(date_values[selected], wanted_dates)]
+
+        symbol_values = np.asarray(data["symbol"]).astype(str, copy=False)
+        selected_symbols = np.char.upper(symbol_values[selected])
+        if symbols is not None:
+            wanted_symbols = np.asarray(
+                [_security_symbol(sample_id) for sample_id in symbols], dtype=str
+            )
+            keep = np.isin(selected_symbols, wanted_symbols)
+            selected = selected[keep]
+            selected_symbols = selected_symbols[keep]
+
+        official = pd.DataFrame(
             {
-                "symbol": data["symbol"].astype(str),
-                "date": pd.to_datetime(data["date"]),
-                "session": np.where(session_codes == 0, "open", "close"),
-                "condition": data["condition"].astype(str),
-                "price": np.asarray(data["price"], dtype=np.float64),
-                "size": np.asarray(data["size"], dtype=np.float64),
-                "exchange": data["exchange"].astype(str),
+                "symbol": selected_symbols,
+                "date": pd.to_datetime(date_values[selected]),
+                "price": price_values[selected],
+                "size": np.asarray(data["size"], dtype=np.float64)[selected],
+                "exchange": np.asarray(data["exchange"]).astype(str, copy=False)[
+                    selected
+                ],
             }
         )
-    return records
-
-
-def _official_opening_auctions(path: Path) -> pd.DataFrame:
-    """Select the largest condition-O print from pre-adjusted NPZ data."""
-    records = _load_auction_records(path)
-    official = records[
-        records.session.eq("open")
-        & records.condition.eq("O")
-        & np.isfinite(records.price)
-        & records.price.gt(0.0)
-    ].copy()
     if official.empty:
-        raise ValueError(f"{path} contains no condition-O opening auctions")
+        return official
     primary_venue_priority = {"N": 0, "Q": 0, "P": 0, "A": 0, "T": 1, "V": 2}
     official["venue_priority"] = (
         official.exchange.map(primary_venue_priority).fillna(3).astype(np.int8)
     )
-    official.sort_values(["size", "venue_priority"], ascending=[False, True], inplace=True)
+    official.sort_values(
+        ["size", "venue_priority"], ascending=[False, True], inplace=True
+    )
     official.drop_duplicates(["symbol", "date"], inplace=True)
     return official
 
@@ -121,6 +157,8 @@ def load_primary_auction_exchange_mask(
     dates: pd.DatetimeIndex,
     symbols: np.ndarray,
     exchange: str,
+    *,
+    official: pd.DataFrame | None = None,
 ) -> tuple[np.ndarray, int]:
     """Use historical primary auctions to refine a current-exchange universe.
 
@@ -133,40 +171,36 @@ def load_primary_auction_exchange_mask(
     if exchange not in exchange_codes:
         raise ValueError(f"unsupported exchange filter: {exchange}")
     wanted = exchange_codes[exchange]
-    official = _official_opening_auctions(path)
-    date_positions = {pd.Timestamp(day): index for index, day in enumerate(dates)}
-    symbol_positions = {
-        _security_symbol(sample_id): index for index, sample_id in enumerate(symbols)
-    }
+    if official is None:
+        official = _official_opening_auctions(path, dates, symbols)
     mask = np.ones((len(dates), len(symbols)), dtype=bool)
-    known = 0
-    for record in official.itertuples(index=False):
-        row = date_positions.get(pd.Timestamp(record.date))
-        column = symbol_positions.get(str(record.symbol).upper())
-        if row is not None and column is not None:
-            mask[row, column] = str(record.exchange) == wanted
-            known += 1
-    return mask, known
+    rows = pd.Index(dates).get_indexer(pd.DatetimeIndex(official["date"]))
+    symbol_index = pd.Index([_security_symbol(sample_id) for sample_id in symbols])
+    columns = symbol_index.get_indexer(official["symbol"].astype(str).str.upper())
+    valid = (rows >= 0) & (columns >= 0)
+    matching_exchange = official["exchange"].astype(str).to_numpy() == wanted
+    mask[rows[valid], columns[valid]] = matching_exchange[valid]
+    return mask, int(valid.sum())
 
 
 def load_opening_auction_prices(
     path: Path,
     dates: pd.DatetimeIndex,
     symbols: np.ndarray,
+    *,
+    official: pd.DataFrame | None = None,
 ) -> np.ndarray:
     """Build a date-by-symbol primary-opening matrix from adjusted NPZ prices."""
-    official = _official_opening_auctions(path)
-
-    date_positions = {pd.Timestamp(day): index for index, day in enumerate(dates)}
-    symbol_positions = {
-        _security_symbol(sample_id): index for index, sample_id in enumerate(symbols)
-    }
+    if official is None:
+        official = _official_opening_auctions(path, dates, symbols)
     prices = np.full((len(dates), len(symbols)), np.nan, dtype=np.float64)
-    for record in official.itertuples(index=False):
-        row = date_positions.get(pd.Timestamp(record.date))
-        column = symbol_positions.get(str(record.symbol).upper())
-        if row is not None and column is not None:
-            prices[row, column] = float(record.price)
+    rows = pd.Index(dates).get_indexer(pd.DatetimeIndex(official["date"]))
+    symbol_index = pd.Index([_security_symbol(sample_id) for sample_id in symbols])
+    columns = symbol_index.get_indexer(official["symbol"].astype(str).str.upper())
+    valid = (rows >= 0) & (columns >= 0)
+    prices[rows[valid], columns[valid]] = official["price"].to_numpy(dtype=np.float64)[
+        valid
+    ]
     return prices
 
 
@@ -477,7 +511,18 @@ def activity_union_candidate_mask(
 
 
 def _parse_clock(value: str) -> int:
-    return parse_anchor_time(value)
+    """Parse a regular-session Eastern ``HH:MM`` clock."""
+    try:
+        hour_text, minute_text = value.split(":", maxsplit=1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("time must use HH:MM") from error
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise argparse.ArgumentTypeError("time must use a valid 24-hour clock")
+    result = hour * 60 + minute
+    if not REGULAR_OPEN_MINUTE <= result <= REGULAR_CLOSE_MINUTE:
+        raise argparse.ArgumentTypeError("time must be inside 09:30..16:00 Eastern")
+    return result
 
 
 def _parse_percentage(value: str) -> float:
@@ -509,29 +554,128 @@ def _parse_percentage(value: str) -> float:
     return percent / 100.0
 
 
-def _calendar(days: pd.DataFrame) -> pd.DataFrame:
-    calendar = days.loc[:, ["date", "context_sod_sec"]].drop_duplicates()
-    if calendar.date.duplicated().any():
-        raise ValueError("symbols disagree about session start timestamps")
-    return calendar.sort_values("date").reset_index(drop=True)
+def reference_session_calendar(reference_path: Path) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """Derive complete New York sessions directly from the reference minute bars."""
+    if not reference_path.exists():
+        raise FileNotFoundError(f"reference minute bars do not exist: {reference_path}")
+    source = np.load(reference_path, mmap_mode="r")
+    if source.ndim != 2 or source.shape[1] < 2 or not len(source):
+        raise ValueError(f"invalid reference minute bars: {reference_path}")
+    seconds = np.asarray(source[:, 0], dtype=np.int64)
+    if (seconds < 0).any() or not np.all(seconds[:-1] < seconds[1:]):
+        raise ValueError(f"reference timestamps must be non-negative and sorted: {reference_path}")
+
+    dates: list[pd.Timestamp] = []
+    context_starts: list[int] = []
+    first_day = int(seconds[0] // 86_400)
+    last_day = int(seconds[-1] // 86_400)
+    for day_offset in range(first_day, last_day + 1):
+        session_date = (BAR_ORIGIN + timedelta(days=day_offset)).date()
+        regular_open = datetime.combine(session_date, time(9, 30), tzinfo=EASTERN)
+        regular_close = datetime.combine(session_date, time(16), tzinfo=EASTERN)
+        open_second = int((regular_open.astimezone(timezone.utc) - BAR_ORIGIN).total_seconds())
+        close_second = int(
+            (regular_close.astimezone(timezone.utc) - BAR_ORIGIN).total_seconds()
+        )
+        start = int(np.searchsorted(seconds, open_second, side="left"))
+        stop = int(np.searchsorted(seconds, close_second, side="right"))
+        if stop - start < MIN_USABLE_SESSION_BARS:
+            continue
+        observed = seconds[start:stop]
+        aligned = observed[observed % 60 == 0]
+        if (
+            aligned.size < MIN_USABLE_SESSION_BARS
+            or int(aligned[0]) > open_second + 30 * 60
+            or int(aligned[-1]) < close_second - 30 * 60
+        ):
+            # Holidays, half-days, and materially incomplete sessions do not
+            # provide the full 15:59 entry window modeled by this strategy.
+            continue
+        context_open = datetime.combine(session_date, time(4), tzinfo=EASTERN)
+        context_second = int(
+            (context_open.astimezone(timezone.utc) - BAR_ORIGIN).total_seconds()
+        )
+        dates.append(pd.Timestamp(session_date))
+        context_starts.append(context_second)
+    if len(dates) < 2:
+        raise ValueError(f"{reference_path} contains fewer than two complete sessions")
+    return pd.DatetimeIndex(dates), np.asarray(context_starts, dtype=np.int64)
+
+
+def simulation_symbols(minute_data_dir: Path, daily_data_dir: Path) -> np.ndarray:
+    """Use symbols supported by both stores, plus the minute-only SPY benchmark."""
+    minute_symbols = {path.stem for path in minute_data_dir.glob("*.npy")}
+    daily_symbols = {path.stem for path in daily_data_dir.glob("*.npy")}
+    if REFERENCE_SYMBOL not in minute_symbols:
+        raise FileNotFoundError(
+            f"reference minute bars do not exist: {minute_data_dir / f'{REFERENCE_SYMBOL}.npy'}"
+        )
+    symbols = (minute_symbols & daily_symbols) | {REFERENCE_SYMBOL}
+    if len(symbols) < 2:
+        raise ValueError("the minute and daily bar stores have no common tradable symbols")
+    return np.asarray(sorted(symbols), dtype=str)
+
+
+def _dataset_manifest(data_dir: Path, timeframe: str) -> dict[str, object]:
+    """Validate the downloader manifest for one split-adjusted bar store."""
+    expected_columns = {
+        "1Min": ["seconds", "open_mills", "volume", "trades"],
+        "1Day": [
+            "seconds",
+            "open_mills",
+            "high_mills",
+            "low_mills",
+            "close_mills",
+            "volume",
+            "trades",
+            "vwap_mills",
+        ],
+    }
+    manifest_path = data_dir / "_download_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"bar dataset manifest does not exist: {manifest_path}")
+    with manifest_path.open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if manifest.get("timeframe") != timeframe:
+        raise ValueError(
+            f"{manifest_path} has timeframe {manifest.get('timeframe')!r}; expected {timeframe!r}"
+        )
+    if manifest.get("adjustment") != "split":
+        raise ValueError(f"{manifest_path} must contain split-adjusted bars")
+    if manifest.get("columns") != expected_columns[timeframe]:
+        raise ValueError(
+            f"{manifest_path} has incompatible columns: {manifest.get('columns')!r}"
+        )
+    return manifest
+
+
+def _manifest_fingerprint(data_dir: Path, timeframe: str) -> dict[str, object]:
+    manifest = _dataset_manifest(data_dir, timeframe)
+    manifest_path = data_dir / "_download_manifest.json"
+    stat = manifest_path.stat()
+    return {
+        "path": str(data_dir.resolve()),
+        "directory_mtime_ns": int(data_dir.stat().st_mtime_ns),
+        "manifest_size": int(stat.st_size),
+        "manifest_mtime_ns": int(stat.st_mtime_ns),
+        "completed_through": manifest.get("completed_through"),
+        "updated_at": manifest.get("updated_at"),
+    }
 
 
 def _cache_metadata(
-    days_path: Path,
-    data_dir: Path,
+    minute_data_dir: Path,
+    daily_data_dir: Path,
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
     entry_minute: int,
     exit_minute: int,
     ranking_minute: int,
 ) -> dict[str, object]:
-    stat = days_path.stat()
     return {
-        "version": 3,
-        "days_path": str(days_path.resolve()),
-        "days_size": int(stat.st_size),
-        "days_mtime_ns": int(stat.st_mtime_ns),
-        "data_dir": str(data_dir.resolve()),
+        "version": 5,
+        "minute_data": _manifest_fingerprint(minute_data_dir, "1Min"),
+        "daily_data": _manifest_fingerprint(daily_data_dir, "1Day"),
         "start_date": str(start_date.date()),
         "end_date": str(end_date.date()),
         "entry_minute": int(entry_minute),
@@ -542,10 +686,10 @@ def _cache_metadata(
 
 def _symbol_daily_arrays(
     sample_id: str,
-    rows: pd.DataFrame,
     date_positions: dict[pd.Timestamp, int],
     context_sod: np.ndarray,
-    data_dir: Path,
+    minute_data_dir: Path,
+    daily_data_dir: Path,
     entry_minute: int,
     exit_minute: int,
     ranking_minute: int,
@@ -567,7 +711,54 @@ def _symbol_daily_arrays(
     morning_prices = np.full(date_count, np.nan, dtype=np.float64)
     entry_staleness = np.full(date_count, np.inf, dtype=np.float64)
     morning_staleness = np.full(date_count, np.inf, dtype=np.float64)
-    source_path = data_dir / f"{sample_id}.npy"
+    storage_symbol = _security_symbol(sample_id)
+    daily_path = daily_data_dir / f"{storage_symbol}.npy"
+    if daily_path.exists():
+        daily = np.load(daily_path, mmap_mode="r")
+        if daily.ndim != 2 or daily.shape[1] != 8:
+            raise ValueError(
+                f"{daily_path} must contain seconds, OHLC mills, volume, trades, and VWAP mills"
+            )
+        if len(daily) and not np.all(daily[:-1, 0] < daily[1:, 0]):
+            raise ValueError(f"{daily_path} timestamps must be strictly increasing")
+
+        # Alpaca timestamps daily bars at midnight New York time. Convert through
+        # UTC so both EST and EDT sessions map to the simulator's naive session date.
+        daily_dates = (
+            pd.to_datetime(
+                np.asarray(daily[:, 0], dtype=np.int64),
+                unit="s",
+                origin="2010-01-01",
+                utc=True,
+            )
+            .tz_convert("America/New_York")
+            .normalize()
+            .tz_localize(None)
+        )
+        if daily_dates.duplicated().any():
+            raise ValueError(f"{daily_path} contains duplicate New York session dates")
+        daily_positions = np.asarray(
+            [date_positions.get(pd.Timestamp(date), -1) for date in daily_dates],
+            dtype=np.int64,
+        )
+        volume = np.asarray(daily[:, 5], dtype=np.float64)
+        vwap_mills = np.asarray(daily[:, 7], dtype=np.float64)
+        close_mills = np.asarray(daily[:, 4], dtype=np.float64)
+        price_mills = np.where(
+            np.isfinite(vwap_mills) & (vwap_mills > 0.0), vwap_mills, close_mills
+        )
+        valid_daily = (
+            (daily_positions >= 0)
+            & np.isfinite(price_mills)
+            & (price_mills > 0.0)
+            & np.isfinite(volume)
+            & (volume > 0.0)
+        )
+        dollar_liquidity[daily_positions[valid_daily]] = (
+            price_mills[valid_daily] * volume[valid_daily] / 1000.0
+        )
+
+    source_path = minute_data_dir / f"{storage_symbol}.npy"
     if not source_path.exists():
         return (
             sample_id,
@@ -580,25 +771,32 @@ def _symbol_daily_arrays(
             morning_staleness,
         )
 
-    ordered = rows.sort_values("date")
-    positions = np.array([date_positions[pd.Timestamp(date)] for date in ordered.date], dtype=np.int64)
-    starts = ordered.sod_idx.to_numpy(dtype=np.int64)
-    ends = ordered.eod_idx.to_numpy(dtype=np.int64)
-    valid_ranges = (starts >= 0) & (ends >= starts)
     source = np.load(source_path, mmap_mode="r")
     if source.ndim != 2 or source.shape[1] < 3:
         raise ValueError(f"{sample_id} must contain seconds, price_mills, and volume")
-    valid_ranges &= ends < len(source)
+    source_seconds = np.asarray(source[:, 0], dtype=np.int64)
+    if len(source) and not np.all(source_seconds[:-1] < source_seconds[1:]):
+        raise ValueError(f"{source_path} timestamps must be strictly increasing")
+
+    regular_starts = context_sod + (REGULAR_OPEN_MINUTE - EXTENDED_OPEN_MINUTE) * 60
+    regular_ends = context_sod + (REGULAR_CLOSE_MINUTE - EXTENDED_OPEN_MINUTE) * 60
+    starts = np.searchsorted(source_seconds, regular_starts, side="left")
+    stops = np.searchsorted(source_seconds, regular_ends, side="right")
+    valid_ranges = (starts < len(source)) & (stops > starts)
+    candidates = np.flatnonzero(valid_ranges)
+    if candidates.size:
+        first_observed = source_seconds[starts[candidates]]
+        last_observed = source_seconds[stops[candidates] - 1]
+        valid_ranges[candidates] &= (
+            (stops[candidates] - starts[candidates] >= MIN_USABLE_SESSION_BARS)
+            & (first_observed <= regular_starts[candidates] + 30 * 60)
+            & (last_observed >= regular_ends[candidates] - 30 * 60)
+        )
     if valid_ranges.any():
         low = int(starts[valid_ranges].min())
-        high = int(ends[valid_ranges].max())
+        high = int((stops[valid_ranges] - 1).max())
         block = np.asarray(source[low : high + 1, 1:3], dtype=np.float64)
         valid_volume = np.isfinite(block[:, 1]) & (block[:, 1] > 0.0)
-        dollar_volume = np.where(
-            np.isfinite(block[:, 0]) & (block[:, 0] > 0.0) & valid_volume,
-            block[:, 0] * block[:, 1] / 1000.0,
-            0.0,
-        )
         share_volume = np.where(valid_volume, block[:, 1], 0.0)
         trade_count = None
         if source.shape[1] >= 4:
@@ -606,7 +804,6 @@ def _symbol_daily_arrays(
             trade_count = np.where(
                 np.isfinite(raw_trade_count) & (raw_trade_count > 0.0), raw_trade_count, 0.0
             )
-        dollar_prefix = np.concatenate(([0.0], np.cumsum(dollar_volume, dtype=np.float64)))
         share_prefix = np.concatenate(([0.0], np.cumsum(share_volume, dtype=np.float64)))
         trade_prefix = (
             np.concatenate(([0.0], np.cumsum(trade_count, dtype=np.float64)))
@@ -614,27 +811,21 @@ def _symbol_daily_arrays(
             else None
         )
         local_start = starts[valid_ranges] - low
-        local_end = ends[valid_ranges] - low + 1
-        dollar_liquidity[positions[valid_ranges]] = (
-            dollar_prefix[local_end] - dollar_prefix[local_start]
-        )
-
         # Alpaca's real-time most-actives endpoint ranks cumulative activity in
         # the current session. Use bars strictly before the ranking minute so
         # a 15:15 decision cannot see the completed 15:15--15:16 bar.
         ranking_secs = (
-            context_sod[positions[valid_ranges]]
+            context_sod[valid_ranges]
             + (int(ranking_minute) - EXTENDED_OPEN_MINUTE) * 60
         )
-        source_seconds = np.asarray(source[:, 0], dtype=np.int64)
         activity_end = np.searchsorted(source_seconds, ranking_secs, side="left")
-        activity_end = np.minimum(activity_end, ends[valid_ranges] + 1)
+        activity_end = np.minimum(activity_end, stops[valid_ranges])
         activity_end = np.maximum(activity_end, starts[valid_ranges]) - low
-        alpaca_share_volume[positions[valid_ranges]] = (
+        alpaca_share_volume[valid_ranges] = (
             share_prefix[activity_end] - share_prefix[local_start]
         )
         if trade_prefix is not None:
-            alpaca_trade_count[positions[valid_ranges]] = (
+            alpaca_trade_count[valid_ranges] = (
                 trade_prefix[activity_end] - trade_prefix[local_start]
             )
 
@@ -645,7 +836,6 @@ def _symbol_daily_arrays(
     entry_secs = session_starts + (int(entry_minute) - EXTENDED_OPEN_MINUTE) * 60
     morning_secs = session_starts + (int(exit_minute) - EXTENDED_OPEN_MINUTE) * 60
     requested = np.concatenate((entry_secs, morning_secs))
-    source_seconds = np.asarray(source[:, 0])
     available = np.searchsorted(source_seconds, requested, side="right") > 0
     prices = np.full(len(requested), np.nan, dtype=np.float64)
     staleness = np.full(len(requested), np.inf, dtype=np.float64)
@@ -679,9 +869,10 @@ def _symbol_daily_arrays(
 
 
 def build_daily_cache(
-    days: pd.DataFrame,
-    data_dir: Path,
+    minute_data_dir: Path,
+    daily_data_dir: Path,
     dates: pd.DatetimeIndex,
+    context_sod: np.ndarray,
     entry_minute: int,
     exit_minute: int,
     ranking_minute: int,
@@ -697,14 +888,11 @@ def build_daily_cache(
     np.ndarray,
 ]:
     """Scan each symbol once and build dense date-by-symbol arrays."""
-    selected_days = days[days.date.isin(dates)].copy()
-    symbols = np.array(sorted(selected_days.sample_id.unique()), dtype=str)
+    symbols = simulation_symbols(minute_data_dir, daily_data_dir)
     date_positions = {pd.Timestamp(date): index for index, date in enumerate(dates)}
-    context = _calendar(selected_days).set_index("date").reindex(dates).context_sod_sec
-    if context.isna().any():
-        raise ValueError("one or more cache dates are missing session timestamps")
-    context_sod = context.to_numpy(dtype=np.int64)
-    grouped = {str(symbol): group for symbol, group in selected_days.groupby("sample_id", sort=False)}
+    context_sod = np.asarray(context_sod, dtype=np.int64)
+    if context_sod.shape != (len(dates),):
+        raise ValueError("context session timestamps must match cache dates")
     dollar_liquidity = np.full((len(dates), len(symbols)), np.nan, dtype=np.float64)
     alpaca_share_volume = np.full_like(dollar_liquidity, np.nan)
     alpaca_trade_count = np.full_like(dollar_liquidity, np.nan)
@@ -716,10 +904,10 @@ def build_daily_cache(
     def submit(symbol: str):
         return _symbol_daily_arrays(
             symbol,
-            grouped[symbol],
             date_positions,
             context_sod,
-            data_dir,
+            minute_data_dir,
+            daily_data_dir,
             entry_minute,
             exit_minute,
             ranking_minute,
@@ -729,7 +917,7 @@ def build_daily_cache(
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
         futures = {executor.submit(submit, str(symbol)): index for index, symbol in enumerate(symbols)}
         for future in tqdm(
-            as_completed(futures), total=len(futures), desc="building daily liquidity cache", unit="symbol"
+            as_completed(futures), total=len(futures), desc="building simulation cache", unit="symbol"
         ):
             column = futures[future]
             (
@@ -764,9 +952,10 @@ def build_daily_cache(
 def load_or_build_cache(
     cache_path: Path,
     metadata: dict[str, object],
-    days: pd.DataFrame,
-    data_dir: Path,
+    minute_data_dir: Path,
+    daily_data_dir: Path,
     dates: pd.DatetimeIndex,
+    context_sod: np.ndarray,
     entry_minute: int,
     exit_minute: int,
     ranking_minute: int,
@@ -800,9 +989,10 @@ def load_or_build_cache(
                 )
 
     arrays = build_daily_cache(
-        days,
-        data_dir,
+        minute_data_dir,
+        daily_data_dir,
         dates,
+        context_sod,
         entry_minute,
         exit_minute,
         ranking_minute,
@@ -1716,8 +1906,16 @@ def main() -> None:
         default=24 * 60,
         help="maximum age of the causal exit mark; avoids dropping a selected name with lookahead",
     )
-    parser.add_argument("--days-path", default=DEFAULT_DAYS_PATH)
-    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        help="split-adjusted 1-minute bars used for execution prices and intraday activity",
+    )
+    parser.add_argument(
+        "--daily-bars-dir",
+        default=DEFAULT_DAILY_DATA_DIR,
+        help="split-adjusted 1-day bars used for completed-session dollar-volume ranking",
+    )
     parser.add_argument("--cache-dir", default="/tmp/trading/baseline_cache")
     parser.add_argument(
         "--asset-filter",
@@ -1820,15 +2018,11 @@ def main() -> None:
     ):
         parser.error("workers must be positive and staleness must be non-negative")
 
-    days_path = Path(args.days_path)
     data_dir = Path(args.data_dir)
-    days = pd.read_csv(
-        days_path,
-        usecols=["sample_id", "date", "sod_idx", "eod_idx", "context_sod_sec"],
+    daily_data_dir = Path(args.daily_bars_dir)
+    all_dates, all_context_sod = reference_session_calendar(
+        data_dir / f"{REFERENCE_SYMBOL}.npy"
     )
-    days.date = pd.to_datetime(days.date, format="%Y-%m-%d")
-    calendar = _calendar(days)
-    all_dates = pd.DatetimeIndex(calendar.date)
     requested_end = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp(all_dates[-1])
     eligible_end = all_dates[all_dates <= requested_end]
     if eligible_end.empty:
@@ -1853,11 +2047,11 @@ def main() -> None:
     )
     scan_start_index = max(0, first_entry_index - warmup)
     cache_dates = all_dates[scan_start_index : end_index + 1]
-    cache_days = days[days.date.between(cache_dates[0], cache_dates[-1])]
+    cache_context_sod = all_context_sod[scan_start_index : end_index + 1]
 
     metadata = _cache_metadata(
-        days_path,
         data_dir,
+        daily_data_dir,
         pd.Timestamp(cache_dates[0]),
         pd.Timestamp(cache_dates[-1]),
         args.entry_time,
@@ -1866,7 +2060,7 @@ def main() -> None:
     )
     cache_name = (
         f"liquidity_{cache_dates[0]:%Y%m%d}_{cache_dates[-1]:%Y%m%d}_"
-        f"r{args.ranking_time:04d}_e{args.entry_time:04d}_x{args.exit_time:04d}_v3.npz"
+        f"r{args.ranking_time:04d}_e{args.entry_time:04d}_x{args.exit_time:04d}_v5.npz"
     )
     cache_path = Path(args.cache_dir) / cache_name
     (
@@ -1881,9 +2075,10 @@ def main() -> None:
     ) = load_or_build_cache(
         cache_path,
         metadata,
-        cache_days,
         data_dir,
+        daily_data_dir,
         cache_dates,
+        cache_context_sod,
         args.entry_time,
         args.exit_time,
         args.ranking_time,
@@ -1934,7 +2129,8 @@ def main() -> None:
         )
         if excluded_asset_reasons:
             reason_text = ", ".join(
-                f"{reason}={count}" for reason, count in sorted(excluded_asset_reasons.items())
+                f"{reason}={count}"
+                for reason, count in sorted(excluded_asset_reasons.items())
             )
             print(f"exclusions: {reason_text}")
         if unclassified_asset_symbols:
@@ -1943,8 +2139,12 @@ def main() -> None:
                 f"(policy={args.unclassified_asset_policy})"
             )
     if args.exchange_filter != "all":
-        exchange_mask = exchange_universe_mask(symbols, security_master, args.exchange_filter)
-        before_exchange_filter = int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum()))
+        exchange_mask = exchange_universe_mask(
+            symbols, security_master, args.exchange_filter
+        )
+        before_exchange_filter = int(
+            len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())
+        )
         symbols = symbols[exchange_mask]
         dollar_volume = dollar_volume[:, exchange_mask]
         alpaca_share_volume = alpaca_share_volume[:, exchange_mask]
@@ -1962,20 +2162,36 @@ def main() -> None:
             f"{args.exchange_filter} universe: retained {retained_exchange_candidates:,}/"
             f"{before_exchange_filter:,} candidate symbols before ranking"
         )
+    auction_path = Path(args.auctions_path)
+    if args.exit_price_source == "opening-auction" and not auction_path.exists():
+        parser.error(f"auction data does not exist: {auction_path}")
+    official_auctions = None
+    if auction_path.exists() and (
+        args.exchange_filter != "all" or args.exit_price_source == "opening-auction"
+    ):
+        official_auctions = _official_opening_auctions(
+            auction_path, cache_dates, symbols
+        )
+
     execution_exchange_mask = None
-    if args.exchange_filter != "all" and Path(args.auctions_path).exists():
-        execution_exchange_mask, known_exchange_sessions = load_primary_auction_exchange_mask(
-            Path(args.auctions_path), cache_dates, symbols, args.exchange_filter
+    if args.exchange_filter != "all" and official_auctions is not None:
+        execution_exchange_mask, known_exchange_sessions = (
+            load_primary_auction_exchange_mask(
+                auction_path,
+                cache_dates,
+                symbols,
+                args.exchange_filter,
+                official=official_auctions,
+            )
         )
         print(
             f"historical exchange check: matched {known_exchange_sessions:,} "
             "symbol-sessions from primary auctions"
         )
     if args.exit_price_source == "opening-auction":
-        auction_path = Path(args.auctions_path)
-        if not auction_path.exists():
-            parser.error(f"auction data does not exist: {auction_path}")
-        morning_prices = load_opening_auction_prices(auction_path, cache_dates, symbols)
+        morning_prices = load_opening_auction_prices(
+            auction_path, cache_dates, symbols, official=official_auctions
+        )
         morning_staleness = np.where(np.isfinite(morning_prices), 0.0, np.inf)
         official_opens = int(np.isfinite(morning_prices).sum())
         print(

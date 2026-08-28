@@ -6,7 +6,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -19,11 +18,9 @@ from week import (
     WEEK_FEATURE_NAMES,
     WEEK_SCALAR_NAMES,
     collect_week_rollout,
-    overnight_metrics,
     validate_week_hours,
 )
 from week_dataset import (
-    SESSIONS_PER_WEEK,
     WeekReferenceDataset,
     read_universe,
     ticks_per_session,
@@ -31,7 +28,7 @@ from week_dataset import (
 )
 
 
-MAG7 = ("ST-AAPL", "ST-MSFT", "ST-GOOGL", "ST-AMZN", "ST-NVDA", "ST-META", "ST-TSLA")
+MAG7 = ("AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA")
 
 
 def hold_rewards(

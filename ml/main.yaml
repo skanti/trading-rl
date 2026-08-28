@@ -21,7 +21,7 @@ model:
     # Anchor progress plus a five-way Monday--Friday one-hot encoding.
     scalar_dim: 6
 data:
-  reference_symbol: "ST-SPY"
+  reference_symbol: "SPY"
   feature_mode: "dual_normalized"
   target_mode: "stock_direction"
   tick_minutes: 1
@@ -34,7 +34,7 @@ data:
   horizon_days: 1
   anno: "2010-01-01"
   days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_10d.csv"
-  data_dir: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22"
+  data_dir: "${oc.env:DATA_DIR}/ppv1/updates/bars_1min_2016-01-01"
   validation_weeks: 12
   date_val: "2026-06-01"
   price_feature_scale: 100.0

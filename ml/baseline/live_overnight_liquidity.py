@@ -13,7 +13,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 import fcntl
 import json
 import logging
@@ -48,6 +48,13 @@ PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_DATA_URL = "https://data.alpaca.markets/v2"
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_STATE_PATH = str(DEFAULT_WORK_DIR / "state.json")
+DEFAULT_DAILY_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2016-01-01")
+DEFAULT_LIQUIDITY_SHORTLIST = (
+    Path(__file__).resolve().parents[2] / "data" / "most_liquid.txt"
+)
+DEFAULT_SHORTLIST_SINCE = date(2022, 1, 1)
+DAILY_BAR_ANNO = datetime(2010, 1, 1, tzinfo=UTC)
+DAILY_BAR_COLUMNS = 8
 DEFAULT_EXCHANGES = frozenset({"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE"})
 OPENING_AUCTION_CUTOFF = time(9, 28)
 REGULAR_MARKET_OPEN = time(9, 30)
@@ -56,7 +63,7 @@ TERMINAL_ORDER_STATUSES = frozenset(
 )
 LOGGER = logging.getLogger("overnight-liquidity-live")
 CONSOLE = Console()
-RANKING_PIPELINE_VERSION = 3
+RANKING_PIPELINE_VERSION = 4
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -196,7 +203,11 @@ class DailyArtifacts:
                 "ema_span": config.ema_span,
                 "minimum_trading_days": config.minimum_trading_days,
                 "liquidity_lookback_calendar_days": config.lookback_calendar_days,
-                "activity_candidates": config.activity_candidates,
+                "daily_bars_dir": str(config.daily_bars_dir),
+                "liquidity_shortlist": str(config.liquidity_shortlist),
+                "shortlist_since": config.shortlist_since.isoformat(),
+                "shortlist_daily_top": config.shortlist_daily_top,
+                "daily_overlap_days": config.daily_overlap_days,
                 "feed": config.feed,
                 "ranking_feed": config.feed,
                 "quote_feed": config.quote_feed,
@@ -232,7 +243,9 @@ class AlpacaAPIError(RuntimeError):
     """An Alpaca REST request failed without exposing request credentials."""
 
     def __init__(self, method: str, url: str, status_code: int, message: str):
-        super().__init__(f"Alpaca {method} {url} returned {status_code}: {message[:500]}")
+        super().__init__(
+            f"Alpaca {method} {url} returned {status_code}: {message[:500]}"
+        )
         self.status_code = int(status_code)
 
 
@@ -240,7 +253,9 @@ def parse_clock(value: str) -> time:
     try:
         parsed = datetime.strptime(value, "%H:%M").time()
     except ValueError as error:
-        raise argparse.ArgumentTypeError("time must use 24-hour HH:MM format") from error
+        raise argparse.ArgumentTypeError(
+            "time must use 24-hour HH:MM format"
+        ) from error
     return parsed.replace(second=0, microsecond=0)
 
 
@@ -300,7 +315,9 @@ def load_data_credentials(trading_key: str, trading_secret: str) -> tuple[str, s
     if not key and not secret:
         return trading_key, trading_secret
     if not key or not secret:
-        raise RuntimeError("set both ALPACA_DATA_KEY and ALPACA_DATA_SECRET, or neither")
+        raise RuntimeError(
+            "set both ALPACA_DATA_KEY and ALPACA_DATA_SECRET, or neither"
+        )
     return key, secret
 
 
@@ -348,7 +365,9 @@ class AlpacaClient:
         session = getattr(self._local, attribute, None)
         if session is None:
             session = requests.Session()
-            session.headers.update(self._data_headers if data_credentials else self._headers)
+            session.headers.update(
+                self._data_headers if data_credentials else self._headers
+            )
             setattr(self._local, attribute, session)
         return session
 
@@ -387,12 +406,20 @@ class AlpacaClient:
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < self.max_retries:
                     retry_after = response.headers.get("Retry-After")
-                    delay = float(retry_after) if retry_after and retry_after.isdigit() else min(2**attempt, 8)
+                    delay = (
+                        float(retry_after)
+                        if retry_after and retry_after.isdigit()
+                        else min(2**attempt, 8)
+                    )
                     time_module.sleep(delay)
                     continue
             try:
                 body = response.json()
-                message = str(body.get("message", body)) if isinstance(body, dict) else str(body)
+                message = (
+                    str(body.get("message", body))
+                    if isinstance(body, dict)
+                    else str(body)
+                )
             except (ValueError, TypeError):
                 message = response.text
             raise AlpacaAPIError(method, url, response.status_code, message)
@@ -406,22 +433,6 @@ class AlpacaClient:
             params={"status": "active", "asset_class": "us_equity"},
         )
         return list(result)
-
-    def most_active_stocks(self, by: str, top: int = 100) -> dict[str, Any]:
-        if by not in ("volume", "trades"):
-            raise ValueError("most-actives metric must be volume or trades")
-        if not 1 <= int(top) <= 100:
-            raise ValueError("most-actives top must be in [1, 100]")
-        data_root = self.data_url.rsplit("/", 1)[0]
-        return dict(
-            self._request(
-                "GET",
-                f"{data_root}/v1beta1",
-                "screener/stocks/most-actives",
-                params={"by": by, "top": int(top)},
-                data_credentials=True,
-            )
-        )
 
     def calendar(self, start: date, end: date) -> list[dict[str, Any]]:
         result = self._request(
@@ -471,7 +482,9 @@ class AlpacaClient:
         return dict(result) if result is not None else None
 
     def order(self, order_id: str) -> dict[str, Any]:
-        return dict(self._request("GET", self.trading_url, f"orders/{quote(order_id, safe='')}"))
+        return dict(
+            self._request("GET", self.trading_url, f"orders/{quote(order_id, safe='')}")
+        )
 
     def submit_order(self, payload: Mapping[str, object]) -> dict[str, Any]:
         return dict(self._request("POST", self.trading_url, "orders", payload=payload))
@@ -518,7 +531,9 @@ class AlpacaClient:
                 break
         return output
 
-    def latest_quotes(self, symbols: Sequence[str], feed: str) -> dict[str, dict[str, Any]]:
+    def latest_quotes(
+        self, symbols: Sequence[str], feed: str
+    ) -> dict[str, dict[str, Any]]:
         """Return the latest NBBO quote used to estimate whole-share buy quantities."""
         if not symbols:
             return {}
@@ -544,7 +559,11 @@ class StrategyConfig:
     min_history_days: int
     minimum_trading_days: int
     lookback_calendar_days: int
-    activity_candidates: int
+    daily_bars_dir: Path
+    liquidity_shortlist: Path
+    shortlist_since: date
+    shortlist_daily_top: int
+    daily_overlap_days: int
     feed: str
     quote_feed: str
     exchanges: frozenset[str]
@@ -612,50 +631,334 @@ def eligible_assets(
     return sorted(symbols)
 
 
-def _most_active_symbols(response: Mapping[str, object]) -> set[str]:
-    rows = response.get("most_actives") or []
-    return {
-        str(row["symbol"]).upper()
-        for row in rows
-        if isinstance(row, Mapping) and row.get("symbol")
-    }
+def _daily_bars_to_array(
+    bars: Sequence[Mapping[str, object]], symbol: str
+) -> np.ndarray:
+    """Encode split-adjusted Alpaca daily bars in the shared int64 cache schema."""
+    rows: list[list[int]] = []
+    for bar in bars:
+        timestamp = bar.get("t")
+        if not timestamp:
+            continue
+        parsed = _parse_timestamp(str(timestamp)).astimezone(UTC)
+        seconds = int((parsed - DAILY_BAR_ANNO).total_seconds())
+        close = _float(bar.get("c"), f"{symbol}.c")
+        vwap_value = bar.get("vw")
+        vwap = close if vwap_value is None else _float(vwap_value, f"{symbol}.vw")
+        values = [
+            seconds,
+            int(np.rint(_float(bar.get("o"), f"{symbol}.o") * 1000.0)),
+            int(np.rint(_float(bar.get("h"), f"{symbol}.h") * 1000.0)),
+            int(np.rint(_float(bar.get("l"), f"{symbol}.l") * 1000.0)),
+            int(np.rint(close * 1000.0)),
+            int(np.rint(_float(bar.get("v"), f"{symbol}.v"))),
+            int(np.rint(_float(bar.get("n") or 0, f"{symbol}.n"))),
+            int(np.rint(vwap * 1000.0)),
+        ]
+        if any(value < 0 for value in values):
+            raise ValueError(f"negative daily-bar value for {symbol} at {timestamp}")
+        rows.append(values)
+    if not rows:
+        return np.empty((0, DAILY_BAR_COLUMNS), dtype=np.int64)
+    array = np.asarray(rows, dtype=np.int64)
+    order = np.argsort(array[:, 0], kind="stable")
+    array = array[order]
+    if not (array[:-1, 0] < array[1:, 0]).all():
+        raise ValueError(f"duplicate or unsorted daily timestamps for {symbol}")
+    return array
 
 
-def fast_activity_candidates(
+def _merge_daily_arrays(base: np.ndarray, update: np.ndarray) -> np.ndarray | None:
+    """Merge an identical overlap, returning ``None`` when history was revised."""
+    for label, array in (("base", base), ("update", update)):
+        if array.ndim != 2 or array.shape[1] != DAILY_BAR_COLUMNS or len(array) == 0:
+            raise ValueError(f"invalid {label} daily-bar shape: {array.shape}")
+        if not (array[:-1, 0] < array[1:, 0]).all():
+            raise ValueError(f"{label} daily timestamps are not strictly increasing")
+    first = int(update[0, 0])
+    last = int(base[-1, 0])
+    if first > last:
+        return None
+    overlap_end = min(last, int(update[-1, 0]))
+    base_start = int(np.searchsorted(base[:, 0], first, side="left"))
+    base_end = int(np.searchsorted(base[:, 0], overlap_end, side="right"))
+    update_end = int(np.searchsorted(update[:, 0], overlap_end, side="right"))
+    if not np.array_equal(base[base_start:base_end], update[:update_end]):
+        return None
+    if int(update[-1, 0]) <= last:
+        return base
+    return np.vstack((base[:base_start], update))
+
+
+def _atomic_save_array(path: Path, array: np.ndarray) -> None:
+    if array.ndim != 2 or array.shape[1] != DAILY_BAR_COLUMNS or len(array) == 0:
+        raise ValueError(f"invalid daily-bar array for {path}: {array.shape}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w+b", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False
+    ) as temporary:
+        np.save(temporary, array)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def _array_session_date(seconds: int) -> date:
+    return (DAILY_BAR_ANNO + timedelta(seconds=int(seconds))).astimezone(EASTERN).date()
+
+
+def seed_missing_daily_cache(
     client: AlpacaClient,
-    assets: Iterable[Mapping[str, object]],
-    exchanges: frozenset[str],
-    security_master: Mapping[str, Mapping[str, object]],
-    prior_ranking: Mapping[str, object],
-    activity_top: int = 100,
-) -> tuple[list[str], dict[str, int]]:
-    """Build a small company universe from current activity plus the prior screen."""
-    volume_symbols = _most_active_symbols(client.most_active_stocks("volume", activity_top))
-    trade_symbols = _most_active_symbols(client.most_active_stocks("trades", activity_top))
-    prior_symbols = {
-        str(symbol).upper()
-        for symbol in (prior_ranking.get("screened_candidate_symbols") or [])
-    }
-    if not prior_symbols:
-        prior_symbols = {
-            str(candidate["symbol"]).upper()
-            for candidate in (prior_ranking.get("candidates") or [])
-            if isinstance(candidate, Mapping) and candidate.get("symbol")
-        }
+    bars_dir: Path,
+    symbols: Sequence[str],
+    start: date,
+    end: datetime,
+    feed: str,
+    batch_size: int,
+    workers: int,
+) -> dict[str, int]:
+    """Add newly eligible companies to the broad cache from the shortlist epoch."""
+    missing = sorted(
+        symbol for symbol in symbols if not (bars_dir / f"{symbol}.npy").exists()
+    )
+    if not missing:
+        return {"new_symbols_requested": 0, "new_symbols_added": 0}
+    LOGGER.info(
+        "downloading retained daily history for %d newly eligible companies",
+        len(missing),
+    )
+    downloaded = _download_bars(
+        client,
+        missing,
+        start,
+        end,
+        feed,
+        batch_size,
+        workers,
+        adjustment="split",
+    )
+    added = 0
+    for symbol in missing:
+        array = _daily_bars_to_array(downloaded.get(symbol) or [], symbol)
+        if len(array) == 0:
+            LOGGER.warning(
+                "no retained daily bars for newly eligible symbol %s", symbol
+            )
+            continue
+        _atomic_save_array(bars_dir / f"{symbol}.npy", array)
+        added += 1
+    return {"new_symbols_requested": len(missing), "new_symbols_added": added}
 
-    raw_candidates = volume_symbols | trade_symbols | prior_symbols
-    company_assets = set(eligible_assets(assets, exchanges, security_master))
-    candidates = sorted(raw_candidates & company_assets)
-    diagnostics = {
-        "activity_volume_symbols": len(volume_symbols),
-        "activity_trade_symbols": len(trade_symbols),
-        "previous_screen_symbols": len(prior_symbols),
-        "raw_candidate_symbols": len(raw_candidates),
-        "eligible_company_assets": len(company_assets),
-        "filtered_candidate_symbols": len(candidates),
-        "excluded_or_unavailable_candidates": len(raw_candidates) - len(candidates),
+
+def refresh_daily_cache(
+    client: AlpacaClient,
+    bars_dir: Path,
+    symbols: Sequence[str],
+    expected_session: date,
+    end: datetime,
+    feed: str,
+    batch_size: int,
+    workers: int,
+    overlap_days: int,
+) -> dict[str, int]:
+    """Batch-refresh the broad split-adjusted cache and fail closed if it is stale."""
+    if not symbols:
+        raise RuntimeError(f"daily cache contains no symbols: {bars_dir}")
+    start = expected_session - timedelta(days=overlap_days)
+    downloaded = _download_bars(
+        client,
+        symbols,
+        start,
+        end,
+        feed,
+        batch_size,
+        workers,
+        adjustment="split",
+    )
+    downloaded_dates = {
+        _bar_session_date(str(bar["t"]))
+        for rows in downloaded.values()
+        for bar in rows
+        if bar.get("t")
     }
-    return candidates, diagnostics
+    if expected_session not in downloaded_dates:
+        latest = max(downloaded_dates).isoformat() if downloaded_dates else "none"
+        raise RuntimeError(
+            f"daily SIP refresh is stale: expected completed session {expected_session}, "
+            f"latest response session is {latest}"
+        )
+    if any(day > expected_session for day in downloaded_dates):
+        raise RuntimeError(
+            "daily SIP refresh unexpectedly included an incomplete future session"
+        )
+
+    revised: list[str] = []
+    pending: dict[Path, np.ndarray] = {}
+    for symbol in symbols:
+        rows = downloaded.get(symbol) or []
+        if not rows:
+            continue
+        cache_path = bars_dir / f"{symbol}.npy"
+        if not cache_path.exists():
+            raise RuntimeError(
+                f"broad daily cache member disappeared during refresh: {cache_path}"
+            )
+        base = np.load(cache_path, allow_pickle=False)
+        update = _daily_bars_to_array(rows, symbol)
+        merged = _merge_daily_arrays(base, update)
+        if merged is None:
+            revised.append(symbol)
+        else:
+            pending[cache_path] = merged
+
+    if revised:
+        manifest_path = bars_dir / "_download_manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"cannot repair revised split-adjusted history without {manifest_path}"
+            )
+        manifest = json.loads(manifest_path.read_text())
+        full_start = date.fromisoformat(str(manifest["since"])[:10])
+        LOGGER.warning(
+            "daily history changed for %d symbol(s); fully refreshing: %s",
+            len(revised),
+            ", ".join(revised),
+        )
+        replacements = _download_bars(
+            client,
+            revised,
+            full_start,
+            end,
+            feed,
+            batch_size,
+            workers,
+            adjustment="split",
+        )
+        for symbol in revised:
+            replacement = _daily_bars_to_array(replacements.get(symbol) or [], symbol)
+            if (
+                len(replacement) == 0
+                or _array_session_date(replacement[-1, 0]) < expected_session
+            ):
+                raise RuntimeError(f"full daily-history refresh is stale for {symbol}")
+            pending[bars_dir / f"{symbol}.npy"] = replacement
+
+    for cache_path, array in pending.items():
+        _atomic_save_array(cache_path, array)
+    manifest_path = bars_dir / "_download_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        ticker_count = len(list(bars_dir.glob("*.npy")))
+        manifest.update(
+            {
+                "updated_at": _iso_now(),
+                "completed_through": expected_session.isoformat(),
+                "ticker_count": ticker_count,
+                "success_count": ticker_count,
+                "failed_count": 0,
+                "update_existing": True,
+                "overlap_days": overlap_days,
+            }
+        )
+        _atomic_write_json(manifest_path, manifest)
+    return {
+        "cache_symbols": len(symbols),
+        "symbols_with_recent_bars": sum(
+            bool(downloaded.get(symbol)) for symbol in symbols
+        ),
+        "updated_files": len(pending),
+        "full_refreshes": len(revised),
+    }
+
+
+def dollar_volume_shortlist(
+    bars_dir: Path, since: date, top: int
+) -> tuple[list[str], int, list[str]]:
+    """Return the union of each session's top-N stocks by split-adjusted dollar volume."""
+    if top < 1:
+        raise ValueError("shortlist daily top must be positive")
+    since_seconds = int(
+        (datetime.combine(since, time.min, tzinfo=UTC) - DAILY_BAR_ANNO).total_seconds()
+    )
+    paths: list[Path] = []
+    excluded: list[str] = []
+    int32_max = np.iinfo(np.int32).max
+    for cache_path in sorted(bars_dir.glob("*.npy")):
+        array = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+        if array.ndim != 2 or array.shape[1] != DAILY_BAR_COLUMNS:
+            raise ValueError(f"invalid daily cache file {cache_path}: {array.shape}")
+        if any(
+            np.max(array[:, index], initial=0) > int32_max for index in (1, 2, 3, 4, 7)
+        ):
+            excluded.append(cache_path.stem)
+            continue
+        paths.append(cache_path)
+    timestamps: set[int] = set()
+    for cache_path in paths:
+        array = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+        timestamps.update(
+            int(value) for value in array[array[:, 0] >= since_seconds, 0]
+        )
+    if not timestamps:
+        raise RuntimeError(f"daily cache has no bars on or after {since}")
+    ordered = np.asarray(sorted(timestamps), dtype=np.int64)
+    index = {int(value): row for row, value in enumerate(ordered)}
+    values = np.zeros((len(ordered), len(paths)), dtype=np.float64)
+    for column, cache_path in enumerate(paths):
+        array = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+        rows = array[array[:, 0] >= since_seconds]
+        row_indices = np.fromiter(
+            (index[int(value)] for value in rows[:, 0]), dtype=np.int64, count=len(rows)
+        )
+        values[row_indices, column] = (
+            rows[:, 5].astype(np.float64) * rows[:, 7].astype(np.float64) / 1000.0
+        )
+    daily_count = min(top, len(paths))
+    partition = len(paths) - daily_count
+    daily_top = np.argpartition(values, partition, axis=1)[:, partition:]
+    selected = {
+        int(column)
+        for row, columns in enumerate(daily_top)
+        for column in columns
+        if values[row, column] > 0.0
+    }
+    return sorted(paths[column].stem for column in selected), len(ordered), excluded
+
+
+def _atomic_write_symbols(path: Path, symbols: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False
+    ) as temporary:
+        temporary.write("".join(f"{symbol}\n" for symbol in symbols))
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def load_cached_daily_bars(
+    bars_dir: Path, symbols: Sequence[str], start: date
+) -> dict[str, list[dict[str, object]]]:
+    start_seconds = int(
+        (datetime.combine(start, time.min, tzinfo=UTC) - DAILY_BAR_ANNO).total_seconds()
+    )
+    output: dict[str, list[dict[str, object]]] = {}
+    for symbol in symbols:
+        array = np.load(bars_dir / f"{symbol}.npy", mmap_mode="r", allow_pickle=False)
+        rows = array[array[:, 0] >= start_seconds]
+        output[symbol] = [
+            {
+                "t": (DAILY_BAR_ANNO + timedelta(seconds=int(row[0]))).isoformat(),
+                "c": float(row[4]) / 1000.0,
+                "v": int(row[5]),
+                "n": int(row[6]),
+                "vw": float(row[7]) / 1000.0,
+            }
+            for row in rows
+        ]
+    return output
 
 
 def completed_liquidity_ranking(
@@ -707,7 +1010,8 @@ def completed_liquidity_ranking(
     ranked = [
         (symbol, float(latest_scores[index]), int(observations[index]))
         for index, symbol in enumerate(symbols)
-        if np.isfinite(latest_scores[index]) and observations[index] >= required_sessions
+        if np.isfinite(latest_scores[index])
+        and observations[index] >= required_sessions
     ]
     ranked.sort(key=lambda item: (-item[1], item[0]))
     return ranked
@@ -721,20 +1025,36 @@ def _download_bars(
     feed: str,
     batch_size: int,
     workers: int,
+    adjustment: str = "raw",
 ) -> dict[str, list[dict[str, Any]]]:
     batches = list(_chunks(symbols, batch_size))
     output: dict[str, list[dict[str, Any]]] = {}
     completed_count = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(client.historical_daily_bars, batch, start, end, feed): batch
+            executor.submit(
+                client.historical_daily_bars,
+                batch,
+                start,
+                end,
+                feed,
+                adjustment,
+            ): batch
             for batch in batches
         }
         for future in as_completed(futures):
             output.update(future.result())
             completed_count += 1
-            if completed_count == 1 or completed_count % 10 == 0 or completed_count == len(batches):
-                LOGGER.info("downloaded daily bars for %d/%d symbol batches", completed_count, len(batches))
+            if (
+                completed_count == 1
+                or completed_count % 10 == 0
+                or completed_count == len(batches)
+            ):
+                LOGGER.info(
+                    "downloaded daily bars for %d/%d symbol batches",
+                    completed_count,
+                    len(batches),
+                )
     return output
 
 
@@ -743,7 +1063,9 @@ def _calendar_dates(calendar: Sequence[Mapping[str, object]]) -> list[date]:
 
 
 def _next_session(client: AlpacaClient, current: date) -> date:
-    sessions = _calendar_dates(client.calendar(current + timedelta(days=1), current + timedelta(days=10)))
+    sessions = _calendar_dates(
+        client.calendar(current + timedelta(days=1), current + timedelta(days=10))
+    )
     if not sessions:
         raise RuntimeError(f"Alpaca calendar has no next session after {current}")
     return sessions[0]
@@ -780,6 +1102,17 @@ def rank_for_day(
                 "increase --liquidity-lookback-days"
             )
 
+        bars_dir = config.daily_bars_dir
+        manifest_path = bars_dir / "_download_manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError(f"daily-bar manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("timeframe") != "1Day" or manifest.get("adjustment") != "split":
+            raise RuntimeError(
+                "live ranking requires a split-adjusted 1Day cache; "
+                f"found timeframe={manifest.get('timeframe')!r}, "
+                f"adjustment={manifest.get('adjustment')!r}"
+            )
         assets = client.list_assets()
         alpaca_eligible = eligible_assets(assets, config.exchanges)
         security_master_path = (
@@ -788,40 +1121,74 @@ def rank_for_day(
             else Path(DEFAULT_SECURITY_MASTER_CACHE)
         )
         security_master = load_nasdaq_security_master(security_master_path)
-        symbols, candidate_diagnostics = fast_activity_candidates(
-            client,
-            assets,
-            config.exchanges,
-            security_master,
-            prior,
-            config.activity_candidates,
+        eligible_companies = set(
+            eligible_assets(assets, config.exchanges, security_master)
         )
-        if len(symbols) < config.top:
-            raise RuntimeError(
-                f"only {len(symbols)} company candidates remain after the activity screen "
-                f"for top={config.top}"
-            )
-        LOGGER.info(
-            "ranking %d fast-screened company stocks from %s through completed session %s "
-            "(volume=%d, trades=%d, previous=%d, filtered=%d)",
-            len(symbols),
-            lookback_start,
-            completed[-1],
-            candidate_diagnostics["activity_volume_symbols"],
-            candidate_diagnostics["activity_trade_symbols"],
-            candidate_diagnostics["previous_screen_symbols"],
-            candidate_diagnostics["excluded_or_unavailable_candidates"],
-        )
+
         bars_end = _completed_session_end(completed[-1])
-        bars = _download_bars(
+        cache_seed = seed_missing_daily_cache(
             client,
-            symbols,
-            lookback_start,
+            bars_dir,
+            sorted(eligible_companies),
+            config.shortlist_since,
             bars_end,
             config.feed,
             config.data_batch_size,
             config.data_workers,
         )
+        cache_symbols = sorted(cache_path.stem for cache_path in bars_dir.glob("*.npy"))
+        if not cache_symbols:
+            raise RuntimeError(f"daily cache contains no .npy files: {bars_dir}")
+
+        LOGGER.info(
+            "refreshing %d split-adjusted daily-cache symbols through %s in batches",
+            len(cache_symbols),
+            completed[-1],
+        )
+        cache_refresh = refresh_daily_cache(
+            client,
+            bars_dir,
+            cache_symbols,
+            completed[-1],
+            bars_end,
+            config.feed,
+            config.data_batch_size,
+            config.data_workers,
+            config.daily_overlap_days,
+        )
+        shortlist, shortlist_sessions, incompatible_symbols = dollar_volume_shortlist(
+            bars_dir,
+            config.shortlist_since,
+            config.shortlist_daily_top,
+        )
+        _atomic_write_symbols(config.liquidity_shortlist, shortlist)
+
+        symbols = sorted(set(shortlist) & eligible_companies)
+        candidate_diagnostics = {
+            **cache_seed,
+            **cache_refresh,
+            "shortlist_daily_top": config.shortlist_daily_top,
+            "shortlist_trading_days": shortlist_sessions,
+            "shortlist_symbols": len(shortlist),
+            "eligible_company_assets": len(eligible_companies),
+            "filtered_candidate_symbols": len(symbols),
+            "inactive_or_ineligible_shortlist_symbols": len(shortlist) - len(symbols),
+            "int32_incompatible_symbols": len(incompatible_symbols),
+        }
+        if len(symbols) < config.top:
+            raise RuntimeError(
+                f"only {len(symbols)} eligible companies remain in the dollar-volume shortlist "
+                f"for top={config.top}"
+            )
+        LOGGER.info(
+            "ranking %d eligible companies from the %d-symbol historical dollar-volume "
+            "shortlist, using %s through completed session %s",
+            len(symbols),
+            len(shortlist),
+            lookback_start,
+            completed[-1],
+        )
+        bars = load_cached_daily_bars(bars_dir, symbols, lookback_start)
         ticks_metadata = None
         if artifacts is not None:
             ticks_metadata = artifacts.write_ticks(
@@ -855,8 +1222,13 @@ def rank_for_day(
             "minimum_completed_trading_days": config.minimum_trading_days,
             "feed": config.feed,
             "ranking_pipeline_version": RANKING_PIPELINE_VERSION,
-            "candidate_method": "top activity by volume + trades + previous screen, then dollar EMA",
-            "activity_candidates_per_metric": config.activity_candidates,
+            "candidate_method": (
+                "daily top-N dollar-volume union from split-adjusted cache, "
+                "then causal dollar-volume EMA"
+            ),
+            "daily_bars_dir": str(bars_dir),
+            "liquidity_shortlist": str(config.liquidity_shortlist),
+            "shortlist_since": config.shortlist_since.isoformat(),
             "candidate_diagnostics": candidate_diagnostics,
             "market_data_dump": ticks_metadata,
             "screened_candidate_symbols": symbols,
@@ -874,7 +1246,9 @@ def rank_for_day(
                     "observations": observations,
                     "issuer": issuer_key(symbol, security_master),
                 }
-                for index, (symbol, score, observations) in enumerate(ranking[:reserve_count])
+                for index, (symbol, score, observations) in enumerate(
+                    ranking[:reserve_count]
+                )
             ],
         }
         state["ranking"] = result
@@ -909,14 +1283,16 @@ def _print_ranking(ranking: Mapping[str, object], top: int) -> None:
         f"minimum history={ranking['minimum_completed_trading_days']} sessions"
     )
     CONSOLE.print(
-        f"Fast activity screen: {ranking['eligible_asset_count']} company candidates; "
-        f"{ranking['candidate_diagnostics']['raw_candidate_symbols']} raw symbols; "
-        f"{ranking['candidate_diagnostics']['excluded_or_unavailable_candidates']} filtered"
+        f"Dollar-volume shortlist: {ranking['candidate_diagnostics']['shortlist_symbols']} "
+        f"historical members; {ranking['eligible_asset_count']} currently eligible companies; "
+        f"{ranking['candidate_diagnostics']['cache_symbols']} broad-cache symbols refreshed"
     )
 
 
 def _client_order_id(entry_date: date, side: str, symbol: str, attempt: int = 1) -> str:
-    clean_symbol = "".join(character for character in symbol.upper() if character.isalnum())
+    clean_symbol = "".join(
+        character for character in symbol.upper() if character.isalnum()
+    )
     marker = "e" if side == "buy" else "x"
     suffix = "" if attempt == 1 else f"-{attempt}"
     return f"olq-{entry_date:%Y%m%d}-{marker}-{clean_symbol}{suffix}"[:128]
@@ -936,12 +1312,16 @@ def available_budget(account: Mapping[str, object], config: StrategyConfig) -> f
     # equities immediately. Cap at cash to avoid borrowing, and at regular buying
     # power so account restrictions or other open orders are still respected.
     usable_cash = cash * (1.0 - config.cash_buffer_fraction)
-    requested = config.capital if config.capital is not None else cash * config.capital_fraction
+    requested = (
+        config.capital if config.capital is not None else cash * config.capital_fraction
+    )
     budget = min(float(requested), usable_cash, stock_buying_power)
     if budget <= 0.0:
         raise RuntimeError("account has no cash available for the basket")
     if budget / config.top < 1.0:
-        raise RuntimeError("per-symbol notional would be below Alpaca's $1 fractional minimum")
+        raise RuntimeError(
+            "per-symbol notional would be below Alpaca's $1 fractional minimum"
+        )
     return math.floor(budget * 100.0) / 100.0
 
 
@@ -1102,7 +1482,9 @@ def _wait_for_orders(
                 active.append((symbol, str(order["id"])))
         if not active or time_module.monotonic() >= deadline:
             break
-        time_module.sleep(min(poll_seconds, max(0.0, deadline - time_module.monotonic())))
+        time_module.sleep(
+            min(poll_seconds, max(0.0, deadline - time_module.monotonic()))
+        )
         for symbol, order_id in active:
             latest[symbol] = client.order(order_id)
     for symbol, order in list(latest.items()):
@@ -1190,7 +1572,9 @@ def enter_for_day(
             ranking.get("trade_date") != trade_date.isoformat()
             or ranking.get("ranking_pipeline_version") != RANKING_PIPELINE_VERSION
         ):
-            raise RuntimeError(f"no current ranking for {trade_date}; run the rank action first")
+            raise RuntimeError(
+                f"no current ranking for {trade_date}; run the rank action first"
+            )
         if resuming:
             if preflight_only:
                 return dict(previous)
@@ -1216,7 +1600,9 @@ def enter_for_day(
                 )
             preflight_started_at = now or datetime.now(tz=EASTERN)
             held_symbols = {str(item["symbol"]) for item in client.positions()}
-            open_order_symbols = {str(item["symbol"]) for item in client.list_orders("open")}
+            open_order_symbols = {
+                str(item["symbol"]) for item in client.list_orders("open")
+            }
             selected = _select_unconflicted_candidates(
                 ranking, held_symbols, open_order_symbols, config.top
             )
@@ -1300,7 +1686,9 @@ def enter_for_day(
             target_quantities = {
                 symbol: int(raw_targets.get(symbol, 0)) for symbol in selected
             }
-            order_symbols = [symbol for symbol in selected if target_quantities[symbol] > 0]
+            order_symbols = [
+                symbol for symbol in selected if target_quantities[symbol] > 0
+            ]
         else:
             target_quantities = {}
             order_symbols = selected
@@ -1340,7 +1728,9 @@ def enter_for_day(
         workers = max(
             1,
             min(
-                int(position.get("order_submit_workers") or config.order_submit_workers),
+                int(
+                    position.get("order_submit_workers") or config.order_submit_workers
+                ),
                 len(order_symbols),
             ),
         )
@@ -1392,7 +1782,9 @@ def enter_for_day(
         if failures:
             failed = ", ".join(sorted(failures))
             first_error = failures[next(iter(failures))]
-            raise RuntimeError(f"entry submission failed for: {failed}") from first_error
+            raise RuntimeError(
+                f"entry submission failed for: {failed}"
+            ) from first_error
 
         final_orders = _wait_for_orders(
             client, submitted, config.fill_timeout_seconds, config.poll_seconds
@@ -1451,19 +1843,26 @@ def exit_position(
         # while never broadening the exit to unrelated account positions.
         entry_orders = position.setdefault("entry_orders", {})
         owned_symbols = list(
-            dict.fromkeys(list(entry_orders.keys()) + list(position.get("filled_symbols") or []))
+            dict.fromkeys(
+                list(entry_orders.keys()) + list(position.get("filled_symbols") or [])
+            )
         )
         for symbol in position.get("symbols") or []:
             if symbol in owned_symbols:
                 continue
-            recovered = client.order_by_client_id(_client_order_id(entry_date, "buy", symbol))
+            recovered = client.order_by_client_id(
+                _client_order_id(entry_date, "buy", symbol)
+            )
             if recovered is not None:
                 entry_orders[symbol] = _order_summary(recovered)
                 owned_symbols.append(symbol)
         current_positions: dict[str, dict[str, Any]] = {}
         for symbol in owned_symbols:
             current = client.position(symbol)
-            if current is not None and _float(current.get("qty", 0), "position.qty") > 0.0:
+            if (
+                current is not None
+                and _float(current.get("qty", 0), "position.qty") > 0.0
+            ):
                 current_positions[symbol] = current
 
         if not submit:
@@ -1471,7 +1870,8 @@ def exit_position(
                 **position,
                 "status": "exit_plan",
                 "exit_quantities": {
-                    symbol: str(current["qty"]) for symbol, current in current_positions.items()
+                    symbol: str(current["qty"])
+                    for symbol, current in current_positions.items()
                 },
             }
         position["status"] = "exiting"
@@ -1488,7 +1888,11 @@ def exit_position(
                 client_id = _client_order_id(entry_date, "sell", symbol, attempt)
                 order = client.order_by_client_id(client_id)
                 status = str(order.get("status", "")) if order is not None else ""
-                if order is None or status not in TERMINAL_ORDER_STATUSES or status == "filled":
+                if (
+                    order is None
+                    or status not in TERMINAL_ORDER_STATUSES
+                    or status == "filled"
+                ):
                     break
                 attempt += 1
             if attempt > 20:
@@ -1523,7 +1927,11 @@ def exit_position(
                 position.setdefault("exit_orders", {})[symbol] = _order_summary(order)
 
         if not wait_for_fill:
-            remaining = [symbol for symbol in owned_symbols if client.position(symbol) is not None]
+            remaining = [
+                symbol
+                for symbol in owned_symbols
+                if client.position(symbol) is not None
+            ]
             position["remaining_symbols"] = remaining
             position["status"] = "exit_queued" if remaining else "closed"
             position["exit_queued_at"] = _iso_now(now)
@@ -1549,7 +1957,9 @@ def exit_position(
         )
         for symbol, order in final_orders.items():
             position["exit_orders"][symbol] = _order_summary(order)
-        remaining = [symbol for symbol in owned_symbols if client.position(symbol) is not None]
+        remaining = [
+            symbol for symbol in owned_symbols if client.position(symbol) is not None
+        ]
         position["remaining_symbols"] = remaining
         remaining_set = set(remaining)
         active_orders = [
@@ -1559,7 +1969,11 @@ def exit_position(
             if str(order.get("status", "")) not in TERMINAL_ORDER_STATUSES
         ]
         position["status"] = (
-            "closed" if not remaining else "exiting" if active_orders else "exit_incomplete"
+            "closed"
+            if not remaining
+            else "exiting"
+            if active_orders
+            else "exit_incomplete"
         )
         if not remaining:
             position["exit_completed_at"] = _iso_now()
@@ -1582,7 +1996,9 @@ def exit_position(
                 len(remaining),
             )
         if remaining and not active_orders:
-            raise RuntimeError("positions remain after exit attempt: " + ", ".join(remaining))
+            raise RuntimeError(
+                "positions remain after exit attempt: " + ", ".join(remaining)
+            )
         return position
 
 
@@ -1594,11 +2010,15 @@ def _print_entry_plan(
     if submit and position.get("status") == "planned":
         title = "PREPARED — overnight basket entry"
     else:
-        title = "Overnight basket entry" if submit else "DRY RUN — overnight basket entry"
+        title = (
+            "Overnight basket entry" if submit else "DRY RUN — overnight basket entry"
+        )
     table = Table(title=title)
     table.add_column("Symbol")
     share_mode = str(position.get("share_mode") or "fractional")
-    table.add_column("Quantity" if share_mode == "whole" else "Notional", justify="right")
+    table.add_column(
+        "Quantity" if share_mode == "whole" else "Notional", justify="right"
+    )
     if share_mode == "whole":
         table.add_column("Est. value", justify="right")
     table.add_column("Order status")
@@ -1625,7 +2045,9 @@ def _print_entry_plan(
                 str(
                     order.get(
                         "status",
-                        "skipped — below one share" if quantity == 0 else "not submitted",
+                        "skipped — below one share"
+                        if quantity == 0
+                        else "not submitted",
                     )
                 ),
             )
@@ -1659,7 +2081,9 @@ def _print_entry_plan(
         )
     console.print(table)
     budget = float(position["budget"])
-    deployment_percentage = (estimated_deployed / budget * 100.0) if budget > 0.0 else 0.0
+    deployment_percentage = (
+        (estimated_deployed / budget * 100.0) if budget > 0.0 else 0.0
+    )
     console.print(
         f"Budget ${budget:,.2f}; estimated basket ${estimated_deployed:,.2f} "
         f"({deployment_percentage:.1f}% of budget); exit session {position['exit_date']}; "
@@ -1668,7 +2092,9 @@ def _print_entry_plan(
 
 
 def _print_exit(position: Mapping[str, object], submit: bool) -> None:
-    table = Table(title="Overnight basket exit" if submit else "DRY RUN — overnight basket exit")
+    table = Table(
+        title="Overnight basket exit" if submit else "DRY RUN — overnight basket exit"
+    )
     table.add_column("Symbol")
     table.add_column("Quantity", justify="right")
     table.add_column("Order status")
@@ -1764,6 +2190,7 @@ def run_daemon(
     )
     last_error_key: tuple[str, str] | None = None
     last_attempts: dict[str, datetime] = {}
+
     def may_attempt(key: str, current: datetime) -> bool:
         previous = last_attempts.get(key)
         if previous is not None and (current - previous).total_seconds() < 60.0:
@@ -1780,10 +2207,9 @@ def run_daemon(
             state = store.load()
             position = state.get("position") or {}
             exit_date_value = position.get("exit_date")
-            queued_before_open = (
-                position.get("status") == "exit_queued"
-                and now < _combine(today, time(9, 30))
-            )
+            queued_before_open = position.get(
+                "status"
+            ) == "exit_queued" and now < _combine(today, time(9, 30))
             if (
                 exit_date_value
                 and position.get("status") != "closed"
@@ -1811,12 +2237,15 @@ def run_daemon(
             ranking = state.get("ranking") or {}
             rank_start = _combine(today, ranking_time)
             entry_at = _combine(today, entry_time)
-            ranking_deadline = entry_at - timedelta(minutes=minimum_ranking_lead_minutes)
+            ranking_deadline = entry_at - timedelta(
+                minutes=minimum_ranking_lead_minutes
+            )
             if (
                 rank_start <= now <= ranking_deadline
                 and (
                     ranking.get("trade_date") != today.isoformat()
-                    or ranking.get("ranking_pipeline_version") != RANKING_PIPELINE_VERSION
+                    or ranking.get("ranking_pipeline_version")
+                    != RANKING_PIPELINE_VERSION
                 )
                 and may_attempt("rank", now)
             ):
@@ -1828,12 +2257,12 @@ def run_daemon(
             position = state.get("position") or {}
             entry_deadline = entry_at + timedelta(seconds=entry_grace_seconds)
             same_day_status = (
-                position.get("status") if position.get("entry_date") == today.isoformat() else None
+                position.get("status")
+                if position.get("entry_date") == today.isoformat()
+                else None
             )
             preflight_at = entry_at - timedelta(seconds=config.entry_preflight_seconds)
-            preflight_due = (
-                preflight_at <= now < entry_at and same_day_status is None
-            )
+            preflight_due = preflight_at <= now < entry_at and same_day_status is None
             ranking_ready = (
                 ranking.get("trade_date") == today.isoformat()
                 and ranking.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
@@ -1863,13 +2292,17 @@ def run_daemon(
             state = store.load()
             position = state.get("position") or {}
             same_day_status = (
-                position.get("status") if position.get("entry_date") == today.isoformat() else None
+                position.get("status")
+                if position.get("entry_date") == today.isoformat()
+                else None
             )
-            new_entry_due = (
-                entry_at <= now <= entry_deadline
-                and same_day_status in (None, "planned")
+            new_entry_due = entry_at <= now <= entry_deadline and same_day_status in (
+                None,
+                "planned",
             )
-            restart_due = same_day_status == "entering" and now < _combine(today, time(16, 0))
+            restart_due = same_day_status == "entering" and now < _combine(
+                today, time(16, 0)
+            )
             if (
                 (new_entry_due or restart_due)
                 and ranking_early
@@ -1890,7 +2323,11 @@ def run_daemon(
                 )
                 _print_entry_plan(result, True)
                 artifacts.write_summary(today, "enter", store, config)
-            elif new_entry_due and not ranking_early and may_attempt("missing-ranking", now):
+            elif (
+                new_entry_due
+                and not ranking_early
+                and may_attempt("missing-ranking", now)
+            ):
                 LOGGER.error(
                     "entry skipped: no ranking completed at least %d minutes before %s",
                     minimum_ranking_lead_minutes,
@@ -1909,7 +2346,9 @@ def run_daemon(
         except Exception as error:
             key = (today.isoformat(), str(error))
             if key != last_error_key:
-                LOGGER.exception("scheduled action failed; the daemon will retry: %s", error)
+                LOGGER.exception(
+                    "scheduled action failed; the daemon will retry: %s", error
+                )
                 last_error_key = key
             artifacts.write_summary(today, "error", store, config, error=str(error))
         time_module.sleep(sleep_seconds)
@@ -1917,7 +2356,7 @@ def run_daemon(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rank and trade Alpaca's most-liquid fractionable company stocks overnight."
+        description="Rank and trade the most-liquid fractionable company stocks overnight."
     )
     parser.add_argument(
         "action", choices=("run", "preview", "rank", "enter", "exit", "status")
@@ -1948,16 +2387,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="bounded recent calendar-day window of completed daily bars",
     )
     parser.add_argument(
-        "--activity-candidates",
+        "--daily-bars-dir",
+        type=Path,
+        default=DEFAULT_DAILY_BARS_DIR,
+        help="broad split-adjusted 1Day cache refreshed before ranking",
+    )
+    parser.add_argument(
+        "--liquidity-shortlist",
+        type=Path,
+        default=DEFAULT_LIQUIDITY_SHORTLIST,
+        help="output file for the rebuilt historical dollar-volume shortlist",
+    )
+    parser.add_argument(
+        "--shortlist-since",
+        type=date.fromisoformat,
+        default=DEFAULT_SHORTLIST_SINCE,
+        metavar="YYYY-MM-DD",
+        help="first session considered when rebuilding the shortlist (default: 2022-01-01)",
+    )
+    parser.add_argument(
+        "--shortlist-daily-top",
         type=int,
-        default=100,
-        help="top SIP symbols requested from each of Alpaca's volume and trade-count screens",
+        default=50,
+        help="union each session's top-N stocks by dollar volume (default: 50)",
+    )
+    parser.add_argument(
+        "--daily-overlap-days",
+        type=int,
+        default=30,
+        help="overlap used to detect corrections and splits in daily bars (default: 30)",
     )
     parser.add_argument(
         "--feed",
         choices=("iex", "sip"),
         default="sip",
-        help="feed used for activity screening and historical liquidity ranking (default: sip)",
+        help="feed used to refresh split-adjusted daily ranking bars (default: sip)",
     )
     parser.add_argument(
         "--quote-feed",
@@ -1975,7 +2439,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum concurrent entry-order submissions (default: 8)",
     )
     capital = parser.add_mutually_exclusive_group()
-    capital.add_argument("--capital", type=float, default=None, help="maximum dollars deployed")
+    capital.add_argument(
+        "--capital", type=float, default=None, help="maximum dollars deployed"
+    )
     capital.add_argument(
         "--capital-fraction",
         type=float,
@@ -2013,9 +2479,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="durable restart state; default: WORK_DIR/state.json",
     )
-    parser.add_argument("--trade-date", default=None, help="rank/enter date; default: today ET")
-    parser.add_argument("--trading-url", default=os.environ.get("ALPACA_URL", PAPER_TRADING_URL))
-    parser.add_argument("--data-url", default=os.environ.get("ALPACA_DATA_URL", DEFAULT_DATA_URL))
+    parser.add_argument(
+        "--trade-date", default=None, help="rank/enter date; default: today ET"
+    )
+    parser.add_argument(
+        "--trading-url", default=os.environ.get("ALPACA_URL", PAPER_TRADING_URL)
+    )
+    parser.add_argument(
+        "--data-url", default=os.environ.get("ALPACA_DATA_URL", DEFAULT_DATA_URL)
+    )
     parser.add_argument("--request-timeout-seconds", type=float, default=30.0)
     parser.add_argument(
         "--submit",
@@ -2027,11 +2499,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly allow an endpoint other than paper-api.alpaca.markets",
     )
-    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    parser.add_argument(
+        "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO"
+    )
     return parser
 
 
-def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> StrategyConfig:
+def _validate_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> StrategyConfig:
     if (
         args.top < 1
         or args.ema_span < 1
@@ -2043,8 +2519,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         )
     if args.liquidity_lookback_days < 30:
         parser.error("liquidity-lookback-days must be at least 30")
-    if not 1 <= args.activity_candidates <= 100:
-        parser.error("activity-candidates must be in [1, 100]")
+    if args.shortlist_daily_top < 1 or args.daily_overlap_days < 1:
+        parser.error("shortlist-daily-top and daily-overlap-days must be positive")
     if not 1 <= args.data_batch_size <= 200 or not 1 <= args.data_workers <= 16:
         parser.error("data-batch-size must be 1..200 and data-workers must be 1..16")
     if not 1 <= args.order_submit_workers <= 32:
@@ -2079,21 +2555,37 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if not regular_open <= args.entry_time < regular_close:
         parser.error("entry-time must be within regular US equity hours [09:30, 16:00)")
     if not time(9, 0) <= args.exit_time < regular_close:
-        parser.error("exit-time must be within the exit submission window [09:00, 16:00)")
+        parser.error(
+            "exit-time must be within the exit submission window [09:00, 16:00)"
+        )
     if args.share_mode == "whole" and args.exit_time >= OPENING_AUCTION_CUTOFF:
-        parser.error("--share-mode whole requires --exit-time before 09:28 for OPG exits")
-    lead = datetime.combine(date.min, args.entry_time) - datetime.combine(date.min, args.ranking_time)
+        parser.error(
+            "--share-mode whole requires --exit-time before 09:28 for OPG exits"
+        )
+    lead = datetime.combine(date.min, args.entry_time) - datetime.combine(
+        date.min, args.ranking_time
+    )
     if lead < timedelta(minutes=args.minimum_ranking_lead_minutes):
         parser.error(
             "ranking-time must be at least minimum-ranking-lead-minutes before entry-time"
         )
     if args.action == "run" and not args.submit:
-        parser.error("the run action requires --submit; use enter/exit without it to preview orders")
+        parser.error(
+            "the run action requires --submit; use enter/exit without it to preview orders"
+        )
     if args.action == "preview" and args.submit:
         parser.error("the preview action never accepts --submit")
-    if args.submit and not _is_paper_endpoint(args.trading_url) and not args.allow_live_endpoint:
-        parser.error("refusing non-paper order submission without --allow-live-endpoint")
-    exchanges = frozenset(value.strip().upper() for value in args.exchanges.split(",") if value.strip())
+    if (
+        args.submit
+        and not _is_paper_endpoint(args.trading_url)
+        and not args.allow_live_endpoint
+    ):
+        parser.error(
+            "refusing non-paper order submission without --allow-live-endpoint"
+        )
+    exchanges = frozenset(
+        value.strip().upper() for value in args.exchanges.split(",") if value.strip()
+    )
     if not exchanges:
         parser.error("exchanges cannot be empty")
     return StrategyConfig(
@@ -2102,7 +2594,11 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         min_history_days=args.min_history_days,
         minimum_trading_days=args.minimum_trading_days,
         lookback_calendar_days=args.liquidity_lookback_days,
-        activity_candidates=args.activity_candidates,
+        daily_bars_dir=args.daily_bars_dir,
+        liquidity_shortlist=args.liquidity_shortlist,
+        shortlist_since=args.shortlist_since,
+        shortlist_daily_top=args.shortlist_daily_top,
+        daily_overlap_days=args.daily_overlap_days,
         feed=args.feed,
         quote_feed=args.quote_feed,
         exchanges=exchanges,
@@ -2134,7 +2630,11 @@ def main() -> None:
         if preview_workspace is not None
         else Path(args.work_dir).expanduser()
     )
-    trade_date = date.fromisoformat(args.trade_date) if args.trade_date else datetime.now(EASTERN).date()
+    trade_date = (
+        date.fromisoformat(args.trade_date)
+        if args.trade_date
+        else datetime.now(EASTERN).date()
+    )
     log_format = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     daily_log = DailyLogHandler(
         work_dir,

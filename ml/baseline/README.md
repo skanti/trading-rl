@@ -2,7 +2,8 @@
 
 `overnight_liquidity.py` implements a point-in-time overnight baseline:
 
-1. Sum each stock's regular-session dollar volume for every completed day.
+1. Read each stock's completed daily dollar volume as split-adjusted daily
+   `VWAP * volume` (falling back to the daily close when VWAP is unavailable).
 2. Smooth `log1p(dollar_volume)` with a causal EMA.
 3. Before each 15:55 entry, rank using the EMA state through the previous
    session only. The current session never contributes to its own rank.
@@ -23,9 +24,20 @@ The log transform and default 20-session EMA keep earnings, index-rebalance,
 and news-related volume spikes from dominating the ranking. Use `--ema-span 1`
 to rank strictly by the previous completed session without smoothing.
 
-The first run scans the necessary minute-file slices in parallel and writes a
-date-by-symbol cache under `/tmp/trading/baseline_cache`. Subsequent top-50 and
-top-100 runs with the same date range reuse that cache.
+The first run combines split-adjusted daily bars from
+`/data/ppv1/updates/bars_1day_2016-01-01` with execution prices and intraday
+activity from `/data/ppv1/updates/bars_1min_2016-01-01`, then writes a
+date-by-symbol cache under `/tmp/trading/baseline_cache`. The daily bars drive
+the causal liquidity ranking; minute bars are used only for entry/exit prices
+and the optional Alpaca-style same-session activity schemes. Override the two
+stores with `--daily-bars-dir` and `--data-dir`, respectively. Subsequent runs
+with the same inputs and date range reuse the cache.
+
+The simulator does not require a generated day-index CSV. It derives complete
+New York sessions from `SPY.npy`, discovers the tradable universe from symbols
+present in both bar stores, and locates activity and execution timestamps
+directly in each minute array. Updating the bar directories therefore makes new
+symbols and sessions available without rebuilding separate metadata.
 
 To compare the original stable dollar-liquidity ranking with Alpaca's
 real-time most-actives definitions in one run:
@@ -98,7 +110,22 @@ such a stale mark is not evidence that a live order could have filled at 09:45.
 ### Incremental minute-bar updates
 
 Existing `.npy` bar files can be extended without redownloading every ticker's full
-history:
+history. Filenames use plain symbols such as `AAPL.npy` and `BRK.B.npy`; legacy
+asset-class prefixes such as `ST-` are stripped when old input lists are encountered:
+
+To refresh the broad daily store, rebuild the dollar-volume shortlist, update
+the shortlist's minute bars, and extend auction data in one pass, run:
+
+```bash
+../scripts/download_latest_bars_and_auctions.sh
+```
+
+The script first merges Alpaca's currently available company stocks into
+`data/master.txt`; it never removes historical or delisted symbols. It then loads
+`ml/.env` by default and accepts environment overrides such as `PYTHON_BIN`,
+`UPDATES_DIR`, `WORKERS`, and the overlap/shortlist settings shown by `--help`.
+It obtains the auction end date from the refreshed daily bars, so a still-forming
+market session is not requested.
 
 ```bash
 .venv/bin/python ../scripts/download_bars.py \
@@ -128,7 +155,7 @@ Future updates can reuse the manifest's start date:
   --source alpaca \
   --timeframe 1Day \
   --tickers_path /home/aavetisyan/dev/trading-rl/data/master.txt \
-  --out_dir /data/ppv1/updates/daily_bars_2016-01-01 \
+  --out_dir /data/ppv1/updates/bars_1day_2016-01-01 \
   --update_existing
 ```
 
@@ -169,9 +196,11 @@ redownloads and replaces only a seven-calendar-day overlap plus the new tail, wh
 captures late corrections without downloading years again. Split actions are small,
 so their full retained history is refreshed and reapplied to every raw auction record
 before the NPZ is atomically replaced. Pass `--overlap-days` to change the
-overlap, or `--symbols`/`--symbols-from-trades` to add symbols; only a newly added
-symbol receives a full-history download. Use the last completed trading date for
-`--end` when the Alpaca plan does not permit querying the most recent SIP data.
+overlap, or `--symbols`, `--symbols-file`, or `--symbols-from-trades` to add
+symbols; only a newly added symbol receives a full-history download. Use
+`--symbols-file data/most_liquid.txt` to align the auction universe with the
+complete liquidity shortlist. Use the last completed trading date for `--end`
+when the Alpaca plan does not permit querying the most recent SIP data.
 
 Then run the comparison:
 
@@ -257,17 +286,27 @@ python -m baseline.overnight_liquidity \
 `live_overnight_liquidity.py` applies the same causal liquidity idea to an
 Alpaca account. By default it starts ranking at 15:00 ET, opens an equal-notional top-10
 basket at 15:55, and submits its exit at 09:00 on the next trading session.
-The fast candidate screen unions Alpaca's current top 100 SIP symbols by share
-volume, current top 100 by trade count, and the previous day's screened
-universe. It then downloads only those candidates' completed daily bars from
-the most recent 180 calendar days and reranks them by lagged EMA dollar volume.
-It never downloads history back to 2016 and never uses the unfinished
-entry-day bar. `--activity-candidates` can reduce the per-screen request below
-100, at the cost of a less complete candidate funnel.
+Before ranking, it refreshes every symbol already present in the broad
+split-adjusted daily cache at `/data/ppv1/updates/bars_1day_2016-01-01` using
+batched SIP requests with 30 days of overlap. An exact overlap is appended;
+any changed bar (including a newly reflected split) triggers a full retained-history
+refresh for that symbol. The rank step fails closed unless Alpaca returns the
+immediately preceding completed session, and it never uses the unfinished entry-day bar.
+Active eligible companies missing from the cache are first seeded with split-adjusted
+history from the shortlist epoch, so new listings can enter later shortlist rebuilds.
+
+The refreshed cache rebuilds `data/most_liquid.txt` as the union of every
+session's top 50 stocks by `volume * VWAP` since 2022-01-01. Symbols whose
+split-adjusted prices cannot fit the compact `int32` minute schema are excluded.
+The live rank then considers every currently eligible company in this shortlist,
+instead of relying on Alpaca's top-share-volume or top-trade-count activity feed.
+Configure these locations and bounds with `--daily-bars-dir`,
+`--liquidity-shortlist`, `--shortlist-since`, `--shortlist-daily-top`, and
+`--daily-overlap-days`.
 
 As in the simulator, a company must have at least 100 completed daily bars
 strictly before the entry date. Configure this with `--minimum-trading-days`;
-the 20-session EMA span remains separately configurable with `--ema-span`.
+the 10-session EMA span remains separately configurable with `--ema-span`.
 
 The default ranking `--feed sip` provides whole-market liquidity measurements.
 Whole-share sizing separately defaults to real-time `--quote-feed iex`, so it does
@@ -276,8 +315,8 @@ real-time SIP subscription. Candidates are restricted to active, tradable, fract
 company stocks on the major exchanges. The same Nasdaq security-master filter
 used by the simulator strictly removes ETFs (including SPY and QQQ), funds,
 units, preferreds, debt, SPAC shells, and unclassified current assets before
-historical bars are downloaded. Dollar liquidity is `daily VWAP * volume`,
-smoothed as an EMA of `log1p(dollar volume)`.
+shortlist members are ranked. Dollar liquidity is `daily VWAP * volume`,
+smoothed as a causal EMA of `log1p(dollar volume)`.
 
 Credentials remain in environment variables and are never stored in the state
 file. For the paper endpoint:
@@ -337,9 +376,10 @@ only sizing and the submitted order payload.
 When both data variables are set, all market-data requests use those credentials while
 account, position, calendar, and order requests keep
 using the trading credentials. If neither data variable is set, market-data
-requests fall back to the trading credentials. Daily-bar requests end at an
-explicit timestamp on the last completed session and never include the
-unfinished ranking day.
+requests fall back to the trading credentials. Batched daily-bar refreshes use
+`adjustment=split`, end at an explicit timestamp on the last completed session,
+and never include the unfinished ranking day. Current IEX quotes are used only
+for whole-share sizing, never for liquidity ranking.
 
 `run` is persistent and must stay running across the overnight holding period.
 It requires `--submit`; one-shot `enter` and `exit` are dry runs unless that

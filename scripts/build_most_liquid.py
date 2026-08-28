@@ -12,7 +12,10 @@ import numpy as np
 
 ANNO = np.datetime64("2010-01-01T00:00:00")
 COLUMN_INDEX = {"volume": 5, "trades": 6}
-DEFAULT_BARS_DIR = Path("/data/ppv1/updates/daily_bars_2016-01-01")
+VWAP_INDEX = 7
+PRICE_INDICES = (1, 2, 3, 4, 7)
+MINUTE_INT32_MAX = np.iinfo(np.int32).max
+DEFAULT_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2016-01-01")
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "data" / "most_liquid.txt"
 
 
@@ -25,8 +28,12 @@ def _validate_dataset(bars_dir: Path) -> None:
         raise ValueError(
             f"expected a 1Day dataset, found {manifest.get('timeframe')!r}"
         )
+    if manifest.get("adjustment") != "split":
+        raise ValueError(
+            f"expected split-adjusted bars, found {manifest.get('adjustment')!r}"
+        )
     columns = tuple(manifest.get("columns", ()))
-    expected = ("volume", "trades")
+    expected = ("volume", "trades", "vwap_mills")
     if not all(column in columns for column in expected):
         raise ValueError(f"daily bars do not contain {expected}: {columns}")
 
@@ -41,19 +48,36 @@ def historical_top_symbols(
     bars_dir: Path,
     since: str,
     top: int = 50,
-    metrics: tuple[str, ...] = ("volume", "trades"),
+    metrics: tuple[str, ...] = ("dollar_volume",),
 ) -> tuple[list[str], int]:
     """Return symbols appearing in a daily top-N for any requested metric."""
     if top < 1:
         raise ValueError("top must be positive")
-    unknown_metrics = set(metrics).difference(COLUMN_INDEX)
+    unknown_metrics = set(metrics).difference((*COLUMN_INDEX, "dollar_volume"))
     if unknown_metrics:
         raise ValueError(f"unknown metrics: {sorted(unknown_metrics)}")
 
     _validate_dataset(bars_dir)
-    paths = sorted(bars_dir.glob("*.npy"))
+    paths = []
+    excluded_incompatible = []
+    for path in sorted(bars_dir.glob("*.npy")):
+        array = np.load(path, mmap_mode="r")
+        if array.ndim != 2 or array.shape[1] < 8:
+            raise ValueError(f"invalid daily-bar shape in {path}: {array.shape}")
+        if any(
+            np.max(array[:, index], initial=0) > MINUTE_INT32_MAX
+            for index in PRICE_INDICES
+        ):
+            excluded_incompatible.append(path.stem)
+            continue
+        paths.append(path)
     if not paths:
         raise ValueError(f"no .npy bars found in {bars_dir}")
+    if excluded_incompatible:
+        print(
+            "excluded symbols incompatible with int32 minute prices: "
+            + ", ".join(excluded_incompatible)
+        )
 
     since_day = np.datetime64(since, "D")
     since_seconds = int((since_day - ANNO) / np.timedelta64(1, "s"))
@@ -70,7 +94,7 @@ def historical_top_symbols(
         int(timestamp): row for row, timestamp in enumerate(ordered_timestamps)
     }
     metric_values = {
-        metric: np.zeros((len(ordered_timestamps), len(paths)), dtype=np.int64)
+        metric: np.zeros((len(ordered_timestamps), len(paths)), dtype=np.float64)
         for metric in metrics
     }
 
@@ -83,7 +107,14 @@ def historical_top_symbols(
             count=len(rows),
         )
         for metric, values in metric_values.items():
-            values[row_indices, symbol_index] = rows[:, COLUMN_INDEX[metric]]
+            if metric == "dollar_volume":
+                values[row_indices, symbol_index] = (
+                    rows[:, COLUMN_INDEX["volume"]].astype(np.float64)
+                    * rows[:, VWAP_INDEX].astype(np.float64)
+                    / 1000.0
+                )
+            else:
+                values[row_indices, symbol_index] = rows[:, COLUMN_INDEX[metric]]
 
     selected_indices: set[int] = set()
     daily_count = min(top, len(paths))
@@ -120,9 +151,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=50)
     parser.add_argument(
         "--metric",
-        choices=("both", "volume", "trades"),
-        default="both",
-        help="rank by share volume, trade count, or the union of both",
+        choices=("dollar-volume", "volume", "trades"),
+        default="dollar-volume",
+        help="daily ranking metric (default: volume multiplied by VWAP)",
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     return parser.parse_args()
@@ -130,7 +161,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    metrics = ("volume", "trades") if args.metric == "both" else (args.metric,)
+    metrics = (args.metric.replace("-", "_"),)
     symbols, trading_days = historical_top_symbols(
         args.bars_dir, args.since, args.top, metrics
     )

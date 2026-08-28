@@ -301,8 +301,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot a completed context + trading-day asset/reference sequence."
     )
-    parser.add_argument("--sample_id", default="ST-NVDA")
-    parser.add_argument("--reference_sample_id", default="ST-SPY")
+    parser.add_argument("--sample_id", default="NVDA")
+    parser.add_argument("--reference_sample_id", default="SPY")
     parser.add_argument("--date", required=True, help="Trading date in YYYY-MM-DD format")
     parser.add_argument("--days_path", required=True)
     parser.add_argument("--data_dir", required=True)
