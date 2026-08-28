@@ -1,10 +1,10 @@
 """Live/paper Alpaca execution for the causal overnight-liquidity basket.
 
-The process ranks exchange-listed, fractionable US company stocks from a bounded
-window of *completed* daily bars, buys an equal-target basket late in the regular
-session, and closes only those strategy-owned positions on the next trading
-morning. State and deterministic client order IDs make the workflow restartable
-and idempotent.
+The process ranks exchange-listed US company stocks from a bounded window of
+*completed* daily bars, buys an equal-target basket late in the regular session,
+and closes only those strategy-owned positions on the next trading morning.
+Fractional mode additionally requires fractionable assets. State and deterministic
+client order IDs make the workflow restartable and idempotent.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ DEFAULT_LIQUIDITY_SHORTLIST = (
 DEFAULT_SHORTLIST_SINCE = date(2022, 1, 1)
 DAILY_BAR_ANNO = datetime(2010, 1, 1, tzinfo=UTC)
 DAILY_BAR_COLUMNS = 8
-DEFAULT_EXCHANGES = frozenset({"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE"})
+DEFAULT_EXCHANGES = frozenset({"NASDAQ"})
 OPENING_AUCTION_CUTOFF = time(9, 28)
 REGULAR_MARKET_OPEN = time(9, 30)
 TERMINAL_ORDER_STATUSES = frozenset(
@@ -63,7 +63,7 @@ TERMINAL_ORDER_STATUSES = frozenset(
 )
 LOGGER = logging.getLogger("overnight-liquidity-live")
 CONSOLE = Console()
-RANKING_PIPELINE_VERSION = 4
+RANKING_PIPELINE_VERSION = 6
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -611,13 +611,15 @@ def eligible_assets(
     assets: Iterable[Mapping[str, object]],
     exchanges: frozenset[str],
     security_master: Mapping[str, Mapping[str, object]] | None = None,
+    *,
+    require_fractionable: bool = True,
 ) -> list[str]:
     symbols = {
         str(asset["symbol"])
         for asset in assets
         if asset.get("status") == "active"
         and bool(asset.get("tradable"))
-        and bool(asset.get("fractionable"))
+        and (not require_fractionable or bool(asset.get("fractionable")))
         and asset.get("class") == "us_equity"
         and str(asset.get("exchange", "")).upper() in exchanges
     }
@@ -645,6 +647,8 @@ def _daily_bars_to_array(
         close = _float(bar.get("c"), f"{symbol}.c")
         vwap_value = bar.get("vw")
         vwap = close if vwap_value is None else _float(vwap_value, f"{symbol}.vw")
+        if vwap <= 0.0:
+            vwap = close
         values = [
             seconds,
             int(np.rint(_float(bar.get("o"), f"{symbol}.o") * 1000.0)),
@@ -835,8 +839,44 @@ def refresh_daily_cache(
             workers,
             adjustment="split",
         )
+        replacement_arrays = {
+            symbol: _daily_bars_to_array(replacements.get(symbol) or [], symbol)
+            for symbol in revised
+        }
+        retry_symbols = [
+            symbol
+            for symbol, replacement in replacement_arrays.items()
+            if len(replacement) == 0
+            or _array_session_date(replacement[-1, 0]) < expected_session
+        ]
+        if retry_symbols:
+            # Alpaca can omit an otherwise available symbol from a large,
+            # deeply paginated multi-symbol response. Retry only those symbols
+            # individually before treating the ranking data as stale.
+            LOGGER.warning(
+                "batch full-history response was stale for %d symbol(s); "
+                "retrying individually: %s",
+                len(retry_symbols),
+                ", ".join(retry_symbols),
+            )
+            retried = _download_bars(
+                client,
+                retry_symbols,
+                full_start,
+                end,
+                feed,
+                1,
+                workers,
+                adjustment="split",
+            )
+            replacement_arrays.update(
+                {
+                    symbol: _daily_bars_to_array(retried.get(symbol) or [], symbol)
+                    for symbol in retry_symbols
+                }
+            )
         for symbol in revised:
-            replacement = _daily_bars_to_array(replacements.get(symbol) or [], symbol)
+            replacement = replacement_arrays[symbol]
             if (
                 len(replacement) == 0
                 or _array_session_date(replacement[-1, 0]) < expected_session
@@ -911,8 +951,9 @@ def dollar_volume_shortlist(
         row_indices = np.fromiter(
             (index[int(value)] for value in rows[:, 0]), dtype=np.int64, count=len(rows)
         )
+        price_mills = np.where(rows[:, 7] > 0, rows[:, 7], rows[:, 4])
         values[row_indices, column] = (
-            rows[:, 5].astype(np.float64) * rows[:, 7].astype(np.float64) / 1000.0
+            rows[:, 5].astype(np.float64) * price_mills.astype(np.float64) / 1000.0
         )
     daily_count = min(top, len(paths))
     partition = len(paths) - daily_count
@@ -993,9 +1034,9 @@ def completed_liquidity_ranking(
                 continue
             volume = _float(bar.get("v"), "bar.v")
             price_value = bar.get("vw")
-            if price_value is None:
-                price_value = bar.get("c")
-            price = _float(price_value, "bar.vw/bar.c")
+            price = _float(price_value, "bar.vw") if price_value is not None else 0.0
+            if price <= 0.0:
+                price = _float(bar.get("c"), "bar.c")
             if volume > 0.0 and price > 0.0:
                 values[row, column] = price * volume
                 observations[column] += 1
@@ -1114,7 +1155,12 @@ def rank_for_day(
                 f"adjustment={manifest.get('adjustment')!r}"
             )
         assets = client.list_assets()
-        alpaca_eligible = eligible_assets(assets, config.exchanges)
+        require_fractionable = config.share_mode == "fractional"
+        alpaca_eligible = eligible_assets(
+            assets,
+            config.exchanges,
+            require_fractionable=require_fractionable,
+        )
         security_master_path = (
             artifacts.work_dir / "nasdaq_security_master.json"
             if artifacts is not None
@@ -1122,7 +1168,12 @@ def rank_for_day(
         )
         security_master = load_nasdaq_security_master(security_master_path)
         eligible_companies = set(
-            eligible_assets(assets, config.exchanges, security_master)
+            eligible_assets(
+                assets,
+                config.exchanges,
+                security_master,
+                require_fractionable=require_fractionable,
+            )
         )
 
         bars_end = _completed_session_end(completed[-1])
@@ -1223,9 +1274,10 @@ def rank_for_day(
             "feed": config.feed,
             "ranking_pipeline_version": RANKING_PIPELINE_VERSION,
             "candidate_method": (
-                "daily top-N dollar-volume union from split-adjusted cache, "
-                "then causal dollar-volume EMA"
+                "most_liquid.txt daily top-N dollar-volume union, then strictly "
+                "lagged causal EMA(log1p(dollar volume))"
             ),
+            "ranking_price": "split-adjusted daily VWAP, falling back to close",
             "daily_bars_dir": str(bars_dir),
             "liquidity_shortlist": str(config.liquidity_shortlist),
             "shortlist_since": config.shortlist_since.isoformat(),
@@ -2356,7 +2408,7 @@ def run_daemon(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rank and trade the most-liquid fractionable company stocks overnight."
+        description="Rank and trade the most-liquid company stocks overnight."
     )
     parser.add_argument(
         "action", choices=("run", "preview", "rank", "enter", "exit", "status")

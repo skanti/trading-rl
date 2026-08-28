@@ -108,9 +108,14 @@ def historical_top_symbols(
         )
         for metric, values in metric_values.items():
             if metric == "dollar_volume":
+                price_mills = np.where(
+                    rows[:, VWAP_INDEX] > 0,
+                    rows[:, VWAP_INDEX],
+                    rows[:, 4],
+                )
                 values[row_indices, symbol_index] = (
                     rows[:, COLUMN_INDEX["volume"]].astype(np.float64)
-                    * rows[:, VWAP_INDEX].astype(np.float64)
+                    * price_mills.astype(np.float64)
                     / 1000.0
                 )
             else:

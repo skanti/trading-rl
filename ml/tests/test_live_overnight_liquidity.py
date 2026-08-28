@@ -230,6 +230,27 @@ class FakeDailyBarsClient:
         return {symbol: list(self.bars.get(symbol, [])) for symbol in symbols}
 
 
+class FakeBatchOmissionDailyBarsClient(FakeDailyBarsClient):
+    def __init__(self, bars, omitted_symbol):
+        super().__init__(bars)
+        self.omitted_symbol = omitted_symbol
+        self.requests = []
+
+    def historical_daily_bars(self, symbols, start, end, feed, adjustment="raw"):
+        self.adjustments.append(adjustment)
+        self.requests.append((tuple(symbols), start))
+        return {
+            symbol: (
+                []
+                if len(symbols) > 1
+                and start == date(2016, 1, 1)
+                and symbol == self.omitted_symbol
+                else list(self.bars.get(symbol, []))
+            )
+            for symbol in symbols
+        }
+
+
 class LiveOvernightLiquidityTest(unittest.TestCase):
     def test_whole_share_preview_prints_per_symbol_and_total_sizing(self):
         console = Console(record=True, width=140, color_system=None)
@@ -296,6 +317,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(args.shortlist_since, date(2022, 1, 1))
         self.assertEqual(args.shortlist_daily_top, 50)
         self.assertEqual(args.daily_overlap_days, 30)
+        self.assertEqual(args.exchanges, "NASDAQ")
         self.assertEqual(parsed.capital_fraction, 1.0)
         self.assertEqual(parsed.feed, "sip")
         self.assertEqual(parsed.quote_feed, "iex")
@@ -305,6 +327,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(parsed.shortlist_since, date(2022, 1, 1))
         self.assertEqual(parsed.shortlist_daily_top, 50)
         self.assertEqual(parsed.daily_overlap_days, 30)
+        self.assertEqual(parsed.exchanges, frozenset({"NASDAQ"}))
         self.assertEqual(parsed.poll_seconds, 1.0)
 
         preview_args = parser.parse_args(["preview"])
@@ -396,6 +419,22 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertEqual([symbol for symbol, _, _ in ranking], ["ESTABLISHED"])
 
+    def test_ranking_falls_back_to_close_when_vwap_is_zero(self):
+        sessions = [date(2026, 8, 20), date(2026, 8, 21), date(2026, 8, 24)]
+        bars = {
+            "CLOSE": [
+                {**bar("2026-08-20", 100, 0.0), "c": 100.0},
+                {**bar("2026-08-21", 100, 0.0), "c": 100.0},
+            ],
+            "VWAP": [bar("2026-08-20", 100, 10.0), bar("2026-08-21", 100, 10.0)],
+        }
+
+        ranking = completed_liquidity_ranking(
+            bars, sessions, sessions[-1], ema_span=2, min_history_days=2
+        )
+
+        self.assertEqual([symbol for symbol, _, _ in ranking], ["CLOSE", "VWAP"])
+
     def test_daily_cache_refresh_uses_split_adjustment_and_appends_exact_overlap(self):
         base_bars = [full_bar("2026-08-20", 100), full_bar("2026-08-21", 110)]
         update_bars = [full_bar("2026-08-21", 110), full_bar("2026-08-24", 120)]
@@ -468,6 +507,41 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
                     overlap_days=30,
                 )
 
+    def test_full_refresh_retries_a_symbol_omitted_from_a_batch(self):
+        bars = {
+            symbol: [
+                full_bar("2026-08-21", 999),
+                full_bar("2026-08-24", 120),
+            ]
+            for symbol in ("AAPL", "APXT")
+        }
+        client = FakeBatchOmissionDailyBarsClient(bars, "APXT")
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            (bars_dir / "_download_manifest.json").write_text(
+                json.dumps({"since": "2016-01-01T00:00:00+00:00"})
+            )
+            for symbol in bars:
+                np.save(
+                    bars_dir / f"{symbol}.npy",
+                    _daily_bars_to_array([full_bar("2026-08-21", 100)], symbol),
+                )
+
+            diagnostics = refresh_daily_cache(
+                client,
+                bars_dir,
+                list(bars),
+                date(2026, 8, 24),
+                _completed_session_end(date(2026, 8, 24)),
+                "sip",
+                batch_size=100,
+                workers=1,
+                overlap_days=30,
+            )
+
+        self.assertEqual(diagnostics["full_refreshes"], 2)
+        self.assertIn((("APXT",), date(2016, 1, 1)), client.requests)
+
     def test_dollar_volume_shortlist_uses_daily_union_and_excludes_int32_prices(self):
         with tempfile.TemporaryDirectory() as directory:
             bars_dir = Path(directory)
@@ -500,6 +574,23 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(symbols, ["A", "B"])
         self.assertEqual(sessions, 2)
         self.assertEqual(excluded, ["OVERFLOW"])
+
+    def test_dollar_volume_shortlist_falls_back_to_close_for_zero_vwap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            fallback = _daily_bars_to_array(
+                [full_bar("2026-08-20", 1_000, 100.0)], "CLOSE"
+            )
+            fallback[:, 7] = 0
+            np.save(bars_dir / "CLOSE.npy", fallback)
+            np.save(
+                bars_dir / "VWAP.npy",
+                _daily_bars_to_array([full_bar("2026-08-20", 1_000, 10.0)], "VWAP"),
+            )
+
+            symbols, _, _ = dollar_volume_shortlist(bars_dir, date(2022, 1, 1), top=1)
+
+        self.assertEqual(symbols, ["CLOSE"])
 
     def test_daily_array_merge_detects_historical_revision(self):
         base = _daily_bars_to_array(
@@ -547,6 +638,23 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertEqual(
             eligible_assets(assets, DEFAULT_EXCHANGES, security_master), ["AAPL"]
+        )
+
+    def test_whole_share_universe_does_not_require_fractionable_assets(self):
+        assets = [
+            {
+                "symbol": "WHOLE",
+                "status": "active",
+                "tradable": True,
+                "fractionable": False,
+                "class": "us_equity",
+                "exchange": "NASDAQ",
+            }
+        ]
+
+        self.assertEqual(
+            eligible_assets(assets, DEFAULT_EXCHANGES, require_fractionable=False),
+            ["WHOLE"],
         )
 
     def test_latest_quotes_uses_market_data_credentials_and_requested_feed(self):

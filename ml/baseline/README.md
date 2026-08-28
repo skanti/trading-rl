@@ -311,12 +311,15 @@ the 10-session EMA span remains separately configurable with `--ema-span`.
 The default ranking `--feed sip` provides whole-market liquidity measurements.
 Whole-share sizing separately defaults to real-time `--quote-feed iex`, so it does
 not require recent SIP quote access. Use `--quote-feed sip` only with an Alpaca
-real-time SIP subscription. Candidates are restricted to active, tradable, fractionable
-company stocks on the major exchanges. The same Nasdaq security-master filter
+real-time SIP subscription. Candidates default to active, tradable Nasdaq company
+stocks; use `--exchanges` to explicitly select a different venue set. Fractional
+mode additionally requires Alpaca's `fractionable` flag, while whole-share mode
+does not. The same Nasdaq security-master filter
 used by the simulator strictly removes ETFs (including SPY and QQQ), funds,
 units, preferreds, debt, SPAC shells, and unclassified current assets before
-shortlist members are ranked. Dollar liquidity is `daily VWAP * volume`,
-smoothed as a causal EMA of `log1p(dollar volume)`.
+shortlist members are ranked. Dollar liquidity is `daily VWAP * volume`, falling
+back to `daily close * volume` when VWAP is unavailable or zero, and is smoothed
+as a causal EMA of `log1p(dollar volume)`.
 
 Credentials remain in environment variables and are never stored in the state
 file. For the paper endpoint:
@@ -370,8 +373,9 @@ Unused dollars and any allocation too small to buy one share remain cash; they a
 redistributed to cheaper names. The quote prices, timestamps, target quantities, skipped
 symbols, and estimated deployed notional are persisted in strategy state. Use
 `--share-mode fractional` to retain the earlier notional-order behavior. Both modes use
-the same fractionable-company universe and the same liquidity ranking; share mode affects
-only sizing and the submitted order payload.
+the same liquidity ranking. Fractional mode restricts the universe to Alpaca-fractionable
+companies; whole mode can also rank non-fractionable companies. Share mode otherwise
+affects sizing and the submitted order payload.
 
 When both data variables are set, all market-data requests use those credentials while
 account, position, calendar, and order requests keep
@@ -451,5 +455,6 @@ python -m baseline.export_alpaca_companies
 ```
 
 This writes one symbol per line to `data/nasdaq.txt` at the repository root.
-It includes active, tradable, fractionable company stocks on the configured
-major exchanges and excludes ETFs and other non-company securities.
+It exports the conservative fractional-order universe: active, tradable,
+fractionable Nasdaq company stocks by default, excluding ETFs and other
+non-company securities. Use `--exchanges` to override that venue default.
