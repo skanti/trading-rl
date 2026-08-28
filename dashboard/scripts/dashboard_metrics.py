@@ -210,13 +210,14 @@ def realized_equity_series(
     base_value: float,
     inception: date | None = None
 ) -> list[EquityPoint]:
-    """Build cumulative strategy equity from completed basket fill results.
+    """Build strategy equity from completed basket results.
 
-    The first point is the untraded baseline. Each later point applies one or more
-    baskets realized on that exit date. Open sessions are deliberately absent: live
-    mark-to-market account equity is displayed separately by the dashboard.
+    The first point is the untraded baseline. Each later point uses the authoritative
+    flat-account exit equity when available, otherwise applying gross fill P&L for a
+    legacy basket. Open sessions are deliberately absent: live mark-to-market account
+    equity is displayed separately by the dashboard.
     """
-    closed: list[tuple[date, float]] = []
+    closed: list[tuple[date, date, float, float]] = []
     entry_days: list[date] = []
     for session in sessions:
         if session.get("status") != "closed" or session.get("realized_pnl") is None:
@@ -229,25 +230,35 @@ def realized_equity_series(
             continue
         raw_entry_day = session.get("entry_date") or session.get("trading_day")
         try:
-            entry_days.append(date.fromisoformat(str(raw_entry_day)))
+            entry_day = date.fromisoformat(str(raw_entry_day))
+            entry_days.append(entry_day)
         except ValueError:
-            pass
-        closed.append((exit_day, _float(session["realized_pnl"])))
+            entry_day = exit_day
+        closed.append(
+            (
+                exit_day,
+                entry_day,
+                _float(session["realized_pnl"]),
+                _float(session.get("exit_equity")),
+            )
+        )
 
     baseline_day = inception or (min(entry_days) if entry_days else None)
     if baseline_day is None:
         return []
 
     balance = base_value
-    cumulative_pnl = 0.0
     points = [EquityPoint(baseline_day, balance, 0.0, 0.0)]
-    realized_by_day: dict[date, float] = {}
-    for exit_day, pnl in sorted(closed):
-        realized_by_day[exit_day] = realized_by_day.get(exit_day, 0.0) + pnl
+    realized_by_day: dict[date, list[tuple[date, float, float]]] = {}
+    for exit_day, entry_day, pnl, exit_equity in sorted(closed):
+        realized_by_day.setdefault(exit_day, []).append((entry_day, pnl, exit_equity))
 
     for exit_day in sorted(realized_by_day):
-        cumulative_pnl += realized_by_day[exit_day]
-        balance = base_value + cumulative_pnl
+        for _entry_day, pnl, exit_equity in sorted(realized_by_day[exit_day]):
+            # A flat-account snapshot includes fees and settlement rounding, making
+            # it authoritative. Legacy sessions fall back to gross fill arithmetic.
+            balance = exit_equity if exit_equity > 0.0 else balance + pnl
+        cumulative_pnl = balance - base_value
         point = EquityPoint(
             day=exit_day,
             equity=balance,
@@ -262,11 +273,46 @@ def realized_equity_series(
 
 
 def inception_equity(history: Mapping[str, Any], series: Sequence[EquityPoint]) -> float:
-    """Equity the account started from, preferring Alpaca's own base value."""
+    """Equity at the start of the requested series.
+
+    Alpaca's ``base_value`` belongs to the account-lifetime portfolio history. It can
+    predate a later deposit or this strategy's inception by months, so it is only a
+    fallback when the filtered series has no usable equity point.
+    """
+    if series and series[0].equity > 0.0:
+        return series[0].equity
     base = _float(history.get("base_value"))
     if base > 0.0:
         return base
-    return series[0].equity if series else 0.0
+    return 0.0
+
+
+def strategy_inception_equity(
+    sessions: Sequence[Mapping[str, Any]],
+    history: Mapping[str, Any],
+    series: Sequence[EquityPoint],
+) -> float:
+    """Return pre-entry equity for the earliest recorded strategy basket.
+
+    The trading daemon persists an account snapshot immediately before each entry.
+    That value is the precise baseline for a curve built by adding realized basket
+    P&L. Older artifacts may not contain it, in which case the filtered Alpaca series
+    is the best available fallback.
+    """
+    candidates: list[tuple[date, float]] = []
+    for session in sessions:
+        equity = _float(session.get("entry_equity"))
+        if equity <= 0.0:
+            continue
+        raw_day = session.get("entry_date") or session.get("trading_day")
+        try:
+            entry_day = date.fromisoformat(str(raw_day))
+        except ValueError:
+            continue
+        candidates.append((entry_day, equity))
+    if candidates:
+        return min(candidates, key=lambda item: item[0])[1]
+    return inception_equity(history, series)
 
 
 def _baseline_before(series: Sequence[EquityPoint], boundary: date) -> EquityPoint | None:

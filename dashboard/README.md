@@ -25,10 +25,12 @@ copies of the same audit summary are collapsed into that one record. `firestore.
 allows authenticated reads and no browser writes at all — the publisher writes through
 the Admin SDK, which bypasses rules.
 
-The chart is reconstructed from closed basket fills and dated by exit day. Open baskets
-affect the separately displayed live account equity but do not enter the realized curve
-until their exits complete. This keeps the chart consistent with Session History and
-independent of Alpaca's delayed daily portfolio-history rollover.
+The chart is dated by basket exit day. When the account is flat, its solid endpoint uses
+the Alpaca equity snapshot captured at exit, including fees and settlement rounding;
+older artifacts fall back to closed-basket fill arithmetic. Open baskets affect the
+separately displayed provisional equity but do not enter the realized curve until their
+exits complete. This keeps the chart consistent with Session History and independent of
+Alpaca's delayed daily portfolio-history rollover.
 
 ## Configuration
 

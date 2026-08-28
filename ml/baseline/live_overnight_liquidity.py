@@ -1508,6 +1508,47 @@ def _exit_order_time_in_force(
     return "day"
 
 
+def _capture_flat_exit_account_snapshot(
+    client: AlpacaClient,
+    position: dict[str, Any],
+    now: datetime | None = None,
+) -> bool:
+    """Persist authoritative net equity after the account is completely flat.
+
+    Fill arithmetic does not include every brokerage fee or cent-level settlement
+    adjustment. Account equity is therefore the final source of truth, but only when
+    no unrelated position can contaminate this strategy basket's result.
+    """
+    try:
+        if client.positions():
+            LOGGER.info(
+                "not recording exit account equity because the account still holds positions"
+            )
+            return False
+        account = client.account()
+    except Exception as error:  # noqa: BLE001 - a snapshot cannot hold up a completed exit
+        LOGGER.warning("could not record the flat exit account snapshot: %s", error)
+        return False
+
+    position["exit_account_snapshot"] = {
+        key: account.get(key)
+        for key in (
+            "cash",
+            "equity",
+            "buying_power",
+            "regt_buying_power",
+            "non_marginable_buying_power",
+            "long_market_value",
+            "short_market_value",
+            "initial_margin",
+            "maintenance_margin",
+            "multiplier",
+        )
+    }
+    position["exit_account_snapshot_at"] = _iso_now(now)
+    return True
+
+
 def _wait_for_orders(
     client: AlpacaClient,
     orders: Mapping[str, Mapping[str, object]],
@@ -1887,6 +1928,11 @@ def exit_position(
         if not position:
             raise RuntimeError("state contains no strategy position to close")
         if position.get("status") == "closed":
+            if submit and not position.get("exit_account_snapshot"):
+                if _capture_flat_exit_account_snapshot(client, position, now):
+                    state["position"] = position
+                    state["updated_at"] = _iso_now(now)
+                    store.save(state)
             LOGGER.info("strategy position is already closed")
             return position
         entry_date = date.fromisoformat(str(position["entry_date"]))
@@ -1989,6 +2035,7 @@ def exit_position(
             position["exit_queued_at"] = _iso_now(now)
             if not remaining:
                 position["exit_completed_at"] = _iso_now(now)
+                _capture_flat_exit_account_snapshot(client, position, now)
             state["position"] = position
             state["updated_at"] = _iso_now(now)
             store.save(state)
@@ -2028,7 +2075,9 @@ def exit_position(
             else "exit_incomplete"
         )
         if not remaining:
-            position["exit_completed_at"] = _iso_now()
+            completed_at = datetime.now(tz=EASTERN)
+            position["exit_completed_at"] = _iso_now(completed_at)
+            _capture_flat_exit_account_snapshot(client, position, completed_at)
         state["position"] = position
         state["updated_at"] = _iso_now()
         store.save(state)

@@ -158,8 +158,12 @@ function buildSessions(snapshot: Snapshot): SessionRecord[] {
         entry_date: point.day,
         exit_date: point.day,
         symbols: chosen,
+        entry_equity: null,
+        exit_equity: null,
         entry_notional: 38000,
         exit_notional: 38000 + point.profit_loss,
+        gross_realized_pnl: point.profit_loss,
+        gross_realized_return: point.profit_loss_pct,
         realized_pnl: point.profit_loss,
         realized_return: point.profit_loss_pct,
         trades: chosen.map((symbol, position) => {

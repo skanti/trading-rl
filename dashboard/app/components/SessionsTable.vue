@@ -64,7 +64,7 @@ const realizedTotal = computed(() =>
               Deployed
             </th>
             <th class="px-2 py-2 text-right font-medium sm:px-4">
-              Realized
+              Net P&amp;L
             </th>
             <th class="px-3 py-2 text-right font-medium sm:px-4">
               Return

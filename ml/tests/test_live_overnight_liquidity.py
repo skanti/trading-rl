@@ -926,6 +926,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
     def test_whole_share_opg_exit_stays_queued_and_is_reconciled_after_open(self):
         broker = FakeQueuedBroker()
+        broker.current_positions.clear()
         broker.current_positions["A"] = {"symbol": "A", "qty": "1"}
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.json")
@@ -971,6 +972,8 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertEqual(closed["status"], "closed")
         self.assertEqual(closed["exit_orders"]["A"]["status"], "filled")
+        self.assertEqual(closed["exit_account_snapshot"]["equity"], "1000")
+        self.assertIn("exit_account_snapshot_at", closed)
         self.assertEqual(len(broker.submissions), 1)
 
     def test_fractional_exit_remains_a_day_order(self):

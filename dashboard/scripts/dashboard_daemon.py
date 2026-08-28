@@ -236,7 +236,7 @@ def _strategy_view(state: Mapping[str, Any]) -> dict[str, Any]:
         "entry_completed_at": position.get("entry_completed_at"),
         "exit_completed_at": position.get("exit_completed_at"),
         "ranking_trade_date": ranking.get("trade_date"),
-        "ranking_completed_at": ranking.get("completed_at"),
+        "ranking_completed_at": ranking.get("created_at") or ranking.get("completed_at"),
         "updated_at": state.get("updated_at")
     }
 
@@ -324,6 +324,10 @@ def session_records(
         seen_baskets.add(basket_key)
 
         execution = summary.get("execution") or {}
+        entry_snapshot = position.get("entry_account_snapshot") or {}
+        exit_snapshot = position.get("exit_account_snapshot") or {}
+        entry_equity = performance._float(entry_snapshot.get("equity"))
+        exit_equity = performance._float(exit_snapshot.get("equity"))
         trades = (
             performance.closed_basket_from_order_history(position, order_history)
             if order_history is not None and position.get("status") == "closed"
@@ -340,10 +344,18 @@ def session_records(
             if totals
             else performance._float(execution.get("exit_filled_notional"))
         )
-        realized_pnl = totals.get("pnl") if totals else execution.get("realized_pnl_before_fees")
-        realized_return = (
+        gross_realized_pnl = (
+            totals.get("pnl") if totals else execution.get("realized_pnl_before_fees")
+        )
+        gross_realized_return = (
             totals.get("pnl_pct") if totals else execution.get("realized_return_before_fees")
         )
+        if entry_equity > 0.0 and exit_equity > 0.0:
+            realized_pnl = exit_equity - entry_equity
+            realized_return = realized_pnl / entry_equity
+        else:
+            realized_pnl = gross_realized_pnl
+            realized_return = gross_realized_return
         records.append(
             {
                 "trading_day": entry_date,
@@ -353,8 +365,12 @@ def session_records(
                 "entry_date": position.get("entry_date"),
                 "exit_date": position.get("exit_date"),
                 "symbols": list(position.get("symbols") or []),
+                "entry_equity": entry_equity if entry_equity > 0.0 else None,
+                "exit_equity": exit_equity if exit_equity > 0.0 else None,
                 "entry_notional": entry_notional,
                 "exit_notional": exit_notional,
+                "gross_realized_pnl": gross_realized_pnl,
+                "gross_realized_return": gross_realized_return,
                 "realized_pnl": realized_pnl,
                 "realized_return": realized_return,
                 "trades": [trade.as_dict() for trade in trades],
@@ -407,7 +423,9 @@ def build_snapshot(
     account_series = performance.equity_series(history, since=series_start)
     series = performance.realized_equity_series(
         session_history or [],
-        base_value=performance.inception_equity(history, account_series),
+        base_value=performance.strategy_inception_equity(
+            session_history or [], history, account_series
+        ),
         inception=inception,
     )
     buckets = performance.realized_performance_table(series, now=reference)

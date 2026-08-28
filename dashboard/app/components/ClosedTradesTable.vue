@@ -39,7 +39,7 @@ const summary = computed(() => {
             Exit
           </th>
           <th class="px-2 py-2 text-right font-medium sm:px-4">
-            P&amp;L
+            Gross P&amp;L
           </th>
           <th class="px-3 py-2 text-right font-medium sm:px-4">
             %

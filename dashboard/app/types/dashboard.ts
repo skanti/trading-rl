@@ -135,8 +135,12 @@ export interface SessionRecord {
   entry_date: string | null
   exit_date: string | null
   symbols: string[]
+  entry_equity: number | null
+  exit_equity: number | null
   entry_notional: number
   exit_notional: number
+  gross_realized_pnl: number | null
+  gross_realized_return: number | null
   realized_pnl: number | null
   realized_return: number | null
   trades: ClosedTrade[]

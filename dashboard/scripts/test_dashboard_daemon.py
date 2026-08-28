@@ -83,6 +83,30 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual([point.day for point in series], [date(2026, 3, 2), date(2026, 3, 3)])
         self.assertEqual(series[-1].equity, 102.0)
 
+    def test_inception_equity_prefers_the_filtered_strategy_period(self):
+        payload = history([(date(2026, 8, 27), 10002.56)])
+        payload["base_value"] = 100.0
+        series = metrics.equity_series(payload)
+
+        self.assertEqual(metrics.inception_equity(payload, series), 10002.56)
+
+    def test_strategy_inception_equity_prefers_pre_entry_snapshot(self):
+        payload = history([(date(2026, 8, 27), 10002.56)])
+        payload["base_value"] = 100.0
+        series = metrics.equity_series(payload)
+        sessions = [
+            {
+                "trading_day": "2026-08-27",
+                "entry_date": "2026-08-27",
+                "entry_equity": 10000.87,
+            }
+        ]
+
+        self.assertEqual(
+            metrics.strategy_inception_equity(sessions, payload, series),
+            10000.87,
+        )
+
     def test_performance_and_drawdown(self):
         payload = history(
             [
@@ -169,6 +193,25 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].equity, 100000.0)
 
+    def test_realized_equity_prefers_flat_account_exit_equity(self):
+        result = metrics.realized_equity_series(
+            [
+                {
+                    "trading_day": "2026-08-27",
+                    "entry_date": "2026-08-27",
+                    "exit_date": "2026-08-28",
+                    "status": "closed",
+                    "realized_pnl": 1.7087,
+                    "exit_equity": 10002.40,
+                }
+            ],
+            base_value=10000.87,
+            inception=date(2026, 8, 27),
+        )
+
+        self.assertEqual(result[-1].equity, 10002.40)
+        self.assertAlmostEqual(result[-1].profit_loss, 1.53)
+
     def test_closed_basket_totals(self):
         trades = metrics.closed_basket(
             {
@@ -229,7 +272,10 @@ class SnapshotTest(unittest.TestCase):
                 "entry_orders": {"NVDA": order(10, 100.0)},
                 "exit_orders": {"NVDA": order(10, 110.0)},
             },
-            "ranking": {"trade_date": "2026-08-24"},
+            "ranking": {
+                "trade_date": "2026-08-24",
+                "created_at": "2026-08-24T11:42:58Z",
+            },
         }
         snapshot = build_snapshot(
             FakeAlpacaClient(),
@@ -242,6 +288,8 @@ class SnapshotTest(unittest.TestCase):
                     "entry_date": "2026-08-24",
                     "exit_date": "2026-08-25",
                     "status": "closed",
+                    "entry_equity": 108900.0,
+                    "exit_equity": 109000.0,
                     "realized_pnl": 100.0,
                 }
             ],
@@ -270,6 +318,12 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["strategy"]["share_mode"], "whole")
         self.assertEqual(snapshot["strategy"]["target_quantities"], {"NVDA": 9})
         self.assertEqual(snapshot["strategy"]["estimated_deployed_notional"], 900.0)
+        self.assertEqual(
+            snapshot["strategy"]["ranking_completed_at"],
+            "2026-08-24T11:42:58Z",
+        )
+        self.assertEqual(snapshot["equity_curve"][0]["equity"], 108900.0)
+        self.assertEqual(snapshot["equity_curve"][-1]["equity"], 109000.0)
         self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-08-25")
         self.assertEqual(snapshot["equity_curve"][-1]["profit_loss"], 100.0)
 
@@ -329,6 +383,8 @@ class ArtifactTest(unittest.TestCase):
             "status": "closed",
             "entry_date": "2026-08-25",
             "exit_date": "2026-08-26",
+            "entry_account_snapshot": {"equity": "1000"},
+            "exit_account_snapshot": {"equity": "1101.5"},
             "entry_orders": {"NVDA": order(10, 100.0)},
             "exit_orders": {"NVDA": order(6, 111.0)},
         }
@@ -374,7 +430,9 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["trading_day"], "2026-08-25")
         self.assertEqual(records[0]["exit_notional"], 1102.0)
-        self.assertEqual(records[0]["realized_return"], 0.102)
+        self.assertEqual(records[0]["gross_realized_pnl"], 102.0)
+        self.assertEqual(records[0]["realized_pnl"], 101.5)
+        self.assertEqual(records[0]["realized_return"], 0.1015)
 
 
 class SafetyTest(unittest.TestCase):
