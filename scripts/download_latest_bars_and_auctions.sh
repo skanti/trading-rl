@@ -4,10 +4,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-ML_DIR="$REPO_DIR/ml"   # retained only for the credentials file
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-ENV_FILE="${ENV_FILE:-$ML_DIR/.env}"
+ENV_FILE="${ENV_FILE:-$REPO_DIR/overnight/.env}"
 UPDATES_DIR="${UPDATES_DIR:-/data/ppv1/updates}"
 DAILY_BARS_DIR="${DAILY_BARS_DIR:-$UPDATES_DIR/bars_1day_2016-01-01}"
 MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_2016-01-01}"

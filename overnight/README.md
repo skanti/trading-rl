@@ -123,18 +123,18 @@ To refresh the broad daily store, rebuild the dollar-volume shortlist, update
 the shortlist's minute bars, and extend auction data in one pass, run:
 
 ```bash
-../scripts/download_latest_bars_and_auctions.sh
+scripts/download_latest_bars_and_auctions.sh
 ```
 
 The script first merges Alpaca's currently available company stocks into
 `data/master.txt`; it never removes historical or delisted symbols. It then loads
-`ml/.env` by default and accepts environment overrides such as `PYTHON_BIN`,
+`overnight/.env` by default and accepts environment overrides such as `PYTHON_BIN`,
 `UPDATES_DIR`, `WORKERS`, and the overlap/shortlist settings shown by `--help`.
 It obtains the auction end date from the refreshed daily bars, so a still-forming
 market session is not requested.
 
 ```bash
-.venv/bin/python ../scripts/download_bars.py \
+.venv/bin/python scripts/download_bars.py \
   --source alpaca \
   --tickers_path /path/to/tickers.txt \
   --out_dir /data/ppv1/updates/bars \
@@ -157,7 +157,7 @@ not overflow. The downloader excludes a still-forming New York session.
 Future updates can reuse the manifest's start date:
 
 ```bash
-.venv/bin/python ../scripts/download_bars.py \
+.venv/bin/python scripts/download_bars.py \
   --source alpaca \
   --timeframe 1Day \
   --tickers_path /home/aavetisyan/dev/trading-rl/data/master.txt \
@@ -179,9 +179,9 @@ does not apply splits itself.
 
 ```bash
 set -a
-source .env
+source overnight/.env
 set +a
-.venv/bin/python ../scripts/download_auctions.py \
+.venv/bin/python scripts/download_auctions.py \
   --start 2022-01-01 \
   --end 2026-08-27 \
   --symbols-from-trades /tmp/overnight_liquidity_48m_minute.csv \
@@ -191,7 +191,7 @@ set +a
 For later updates, reuse the same output and provide only a new end date:
 
 ```bash
-.venv/bin/python ../scripts/download_auctions.py \
+.venv/bin/python scripts/download_auctions.py \
   --update \
   --end 2026-09-04 \
   --output /data/ppv1/updates/alpaca_auctions_2022-01-01.npz
