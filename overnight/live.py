@@ -60,6 +60,10 @@ DEFAULT_SHORTLIST_LOOKBACK_SESSIONS = 250
 DAILY_BAR_ANNO = datetime(2010, 1, 1, tzinfo=UTC)
 DAILY_BAR_COLUMNS = 8
 DEFAULT_EXCHANGES = frozenset({"NASDAQ"})
+# Nasdaq stops accepting market orders for the opening cross at 09:28, so an exit has
+# to reach Alpaca before then. Submission opens early enough to absorb Alpaca's own
+# queuing: sub-one-share orders are parked for a pre-open batch release around 09:15.
+EXIT_SUBMISSION_OPEN = time(8, 0)
 OPENING_AUCTION_CUTOFF = time(9, 28)
 REGULAR_MARKET_OPEN = time(9, 30)
 TERMINAL_ORDER_STATUSES = frozenset(
@@ -2295,8 +2299,10 @@ def _validate_exit_clock(client: AlpacaClient, expected_date: date) -> bool:
         raise RuntimeError(
             f"Alpaca clock date {market_now.date()} does not match requested date {expected_date}"
         )
-    if not time(9, 0) <= market_now.time().replace(tzinfo=None) < time(16, 0):
-        raise RuntimeError("exit submission must occur between 09:00 and 16:00 ET")
+    if not EXIT_SUBMISSION_OPEN <= market_now.time().replace(tzinfo=None) < time(16, 0):
+        raise RuntimeError(
+            f"exit submission must occur between {EXIT_SUBMISSION_OPEN:%H:%M} and 16:00 ET"
+        )
     market_open = bool(clock.get("is_open"))
     if market_now.time().replace(tzinfo=None) >= time(9, 30) and not market_open:
         raise RuntimeError("Alpaca reports the US equity market is closed")
@@ -2532,7 +2538,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--entry-time", type=parse_clock, default=parse_clock("15:55"))
-    parser.add_argument("--exit-time", type=parse_clock, default=parse_clock("09:00"))
+    parser.add_argument(
+        "--exit-time",
+        type=parse_clock,
+        default=parse_clock("08:00"),
+        help="ET time to submit the exit. Market orders reaching Alpaca before Nasdaq's "
+        "09:28 cutoff fill at the official opening cross, so the value only needs to be "
+        "early enough to absorb queuing delays -- sub-one-share orders are held for a "
+        "pre-open batch release around 09:15",
+    )
     parser.add_argument(
         "--ranking-time",
         type=parse_clock,
@@ -2736,9 +2750,10 @@ def _validate_args(
     regular_close = time(16, 0)
     if not regular_open <= args.entry_time < regular_close:
         parser.error("entry-time must be within regular US equity hours [09:30, 16:00)")
-    if not time(9, 0) <= args.exit_time < regular_close:
+    if not EXIT_SUBMISSION_OPEN <= args.exit_time < regular_close:
         parser.error(
-            "exit-time must be within the exit submission window [09:00, 16:00)"
+            "exit-time must be within the exit submission window "
+            f"[{EXIT_SUBMISSION_OPEN:%H:%M}, 16:00)"
         )
     if args.share_mode == "whole" and args.exit_time >= OPENING_AUCTION_CUTOFF:
         parser.error(

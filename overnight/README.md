@@ -7,8 +7,15 @@
 2. Smooth `log1p(dollar_volume)` with a causal EMA.
 3. Before each 15:55 entry, rank using the EMA state through the previous
    session only. The current session never contributes to its own rank.
-4. Equal-weight the selected stocks, then close them at 09:45 on the next
-   trading session.
+4. Equal-weight the selected stocks, then close them in the next session's
+   opening auction.
+
+Exits default to `--exit-price-source opening-auction` at `--exit-time 09:30`,
+because that is the price a live order actually receives: Nasdaq routes any
+market order reaching the broker before 09:28 into the opening cross. The
+`minute` source prices the first consolidated print instead, which no order type
+can target and which sits about 0.9 bps above the cross (36 months, t = -7.1),
+so it flatters a backtest by roughly three annualized points.
 
 Run the tests from this directory:
 
@@ -108,10 +115,12 @@ cached for seven days at
 
 Entry prices must have a print within 10 minutes of 15:55. A selected stock is
 never removed using knowledge of whether it trades the following morning. If
-no fresh print exists at 09:45, the backtest uses the latest causal mark up to
-24 hours old and reports its staleness in both the trade CSV and summary. This
-is preferable to silently replacing the stock with next-morning lookahead, but
-such a stale mark is not evidence that a live order could have filled at 09:45.
+no fresh print exists at the exit time, the backtest uses the latest causal mark
+up to 24 hours old and reports its staleness in both the trade CSV and summary.
+This is preferable to silently replacing the stock with next-morning lookahead,
+but such a stale mark is not evidence that a live order could have filled there.
+This fallback applies to `--exit-price-source minute`; the auction source has no
+stale path, since a session either produced a condition-O cross or did not.
 
 ### Incremental minute-bar updates
 
@@ -217,8 +226,6 @@ python backtest.py \
   --budget 10000 \
   --share-mode fractional \
   --entry-time 15:59 \
-  --exit-time 09:30 \
-  --exit-price-source opening-auction \
   --transaction-cost-bps 1
 ```
 
@@ -298,7 +305,7 @@ python backtest.py \
 
 `live.py` applies the same causal liquidity idea to an
 Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-10
-basket at 15:55, and submits its exit at 09:00 on the next trading session.
+basket at 15:55, and submits its exit at 08:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
 weekends and exchange holidays instead of attempting scheduled actions.
 Before ranking, it refreshes every symbol already present in the broad
@@ -374,7 +381,7 @@ python live.py run \
   --entry-time 15:55 \
   --entry-preflight-seconds 10 \
   --order-submit-workers 8 \
-  --exit-time 09:00 \
+  --exit-time 08:00 \
   --feed sip \
   --quote-feed iex \
   --capital-fraction 1.00 \
@@ -434,12 +441,16 @@ cannot replace or suppress the live daemon's scheduled ranking:
 python live.py preview \
   --top 10 \
   --entry-time 15:59 \
-  --exit-time 09:00 \
+  --exit-time 08:00 \
   --capital-fraction 0.95
 ```
 
 Whole-share exits submitted before Alpaca's 09:28 cutoff use `market` + `opg`
-and participate in the primary exchange's opening auction. The default 09:00
+and participate in the primary exchange's opening auction. Nasdaq applies the same
+09:28 cutoff to plain market orders, so a fractional `market` + `day` exit reaches
+the cross too and fills at the Nasdaq Official Opening Price -- measured across 22
+live fills on 2026-08-28 and 2026-08-31, every one matched the cross exactly, in
+both share modes. The default 08:00
 exit time leaves a safety margin before that cutoff. Fractional exits remain
 `day` market orders because Alpaca does not support OPG for fractional shares.
 The daemon records `exit_queued` without canceling working orders on the normal

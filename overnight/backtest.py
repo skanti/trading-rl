@@ -1877,12 +1877,15 @@ def main() -> None:
         help="causal cutoff for same-day Alpaca activity rankings",
     )
     parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:55"))
-    parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:45"))
+    parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:30"))
     parser.add_argument(
         "--exit-price-source",
         choices=("minute", "opening-auction"),
-        default="minute",
-        help="minute uses the configured minute-bar open; opening-auction uses Alpaca SIP condition O",
+        default="opening-auction",
+        help="opening-auction uses the Alpaca SIP condition-O cross, which is the price a "
+        "market order received before Nasdaq's 09:28 cutoff actually fills at; minute uses "
+        "the configured minute-bar open, which is the first consolidated print and is not "
+        "reachable by any order type",
     )
     parser.add_argument(
         "--auctions-path",
