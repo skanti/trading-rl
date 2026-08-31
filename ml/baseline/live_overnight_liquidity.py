@@ -53,6 +53,10 @@ DEFAULT_LIQUIDITY_SHORTLIST = (
     Path(__file__).resolve().parents[2] / "data" / "most_liquid.txt"
 )
 DEFAULT_SHORTLIST_SINCE = date(2022, 1, 1)
+# One session in the daily top-N used to buy permanent candidacy, so the shortlist
+# only ever grew. A trailing year keeps it tracking current liquidity; measured over
+# the last 500 sessions, no window down to 125 ever dropped a name from the reserve.
+DEFAULT_SHORTLIST_LOOKBACK_SESSIONS = 250
 DAILY_BAR_ANNO = datetime(2010, 1, 1, tzinfo=UTC)
 DAILY_BAR_COLUMNS = 8
 DEFAULT_EXCHANGES = frozenset({"NASDAQ"})
@@ -207,6 +211,7 @@ class DailyArtifacts:
                 "liquidity_shortlist": str(config.liquidity_shortlist),
                 "shortlist_since": config.shortlist_since.isoformat(),
                 "shortlist_daily_top": config.shortlist_daily_top,
+                "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
                 "daily_overlap_days": config.daily_overlap_days,
                 "feed": config.feed,
                 "ranking_feed": config.feed,
@@ -563,6 +568,7 @@ class StrategyConfig:
     liquidity_shortlist: Path
     shortlist_since: date
     shortlist_daily_top: int
+    shortlist_lookback_sessions: int | None
     daily_overlap_days: int
     feed: str
     quote_feed: str
@@ -636,7 +642,17 @@ def eligible_assets(
 def _daily_bars_to_array(
     bars: Sequence[Mapping[str, object]], symbol: str
 ) -> np.ndarray:
-    """Encode split-adjusted Alpaca daily bars in the shared int64 cache schema."""
+    """Encode split-adjusted Alpaca daily bars in the shared int64 cache schema.
+
+    An absent or non-positive VWAP is stored as ``0``, the schema's sentinel for
+    "not reported", exactly as ``scripts/download_bars.py`` writes it. Substituting
+    the close here instead would make the two writers disagree byte-for-byte on
+    every zero-volume session, and the overlap comparison in ``_merge_daily_arrays``
+    would then escalate those symbols to a full retained-history re-download on
+    every rank, forever. Readers already resolve the sentinel: both
+    ``dollar_volume_shortlist`` and ``completed_liquidity_ranking`` fall back to the
+    close when VWAP is not positive.
+    """
     rows: list[list[int]] = []
     for bar in bars:
         timestamp = bar.get("t")
@@ -646,9 +662,9 @@ def _daily_bars_to_array(
         seconds = int((parsed - DAILY_BAR_ANNO).total_seconds())
         close = _float(bar.get("c"), f"{symbol}.c")
         vwap_value = bar.get("vw")
-        vwap = close if vwap_value is None else _float(vwap_value, f"{symbol}.vw")
-        if vwap <= 0.0:
-            vwap = close
+        vwap = 0.0 if vwap_value is None else _float(vwap_value, f"{symbol}.vw")
+        if vwap < 0.0:
+            raise ValueError(f"negative daily VWAP for {symbol} at {timestamp}")
         values = [
             seconds,
             int(np.rint(_float(bar.get("o"), f"{symbol}.o") * 1000.0)),
@@ -913,11 +929,20 @@ def refresh_daily_cache(
 
 
 def dollar_volume_shortlist(
-    bars_dir: Path, since: date, top: int
+    bars_dir: Path, since: date, top: int, lookback_sessions: int | None = None
 ) -> tuple[list[str], int, list[str]]:
-    """Return the union of each session's top-N stocks by split-adjusted dollar volume."""
+    """Return the union of each session's top-N stocks by split-adjusted dollar volume.
+
+    ``since`` is the hard epoch floor. ``lookback_sessions`` additionally keeps only
+    the most recent N completed sessions, so the union tracks current liquidity
+    instead of ratcheting: without it, one session in the daily top-N in 2022 buys
+    permanent candidacy. Pass ``None`` to union every session on or after ``since``.
+    The cache holds only completed sessions, so the trailing slice stays causal.
+    """
     if top < 1:
         raise ValueError("shortlist daily top must be positive")
+    if lookback_sessions is not None and lookback_sessions < 1:
+        raise ValueError("shortlist lookback sessions must be positive")
     since_seconds = int(
         (datetime.combine(since, time.min, tzinfo=UTC) - DAILY_BAR_ANNO).total_seconds()
     )
@@ -943,11 +968,14 @@ def dollar_volume_shortlist(
     if not timestamps:
         raise RuntimeError(f"daily cache has no bars on or after {since}")
     ordered = np.asarray(sorted(timestamps), dtype=np.int64)
+    if lookback_sessions is not None:
+        ordered = ordered[-int(lookback_sessions) :]
+    window_seconds = int(ordered[0])
     index = {int(value): row for row, value in enumerate(ordered)}
     values = np.zeros((len(ordered), len(paths)), dtype=np.float64)
     for column, cache_path in enumerate(paths):
         array = np.load(cache_path, mmap_mode="r", allow_pickle=False)
-        rows = array[array[:, 0] >= since_seconds]
+        rows = array[array[:, 0] >= window_seconds]
         row_indices = np.fromiter(
             (index[int(value)] for value in rows[:, 0]), dtype=np.int64, count=len(rows)
         )
@@ -1221,6 +1249,7 @@ def rank_for_day(
             bars_dir,
             config.shortlist_since,
             config.shortlist_daily_top,
+            config.shortlist_lookback_sessions,
         )
         _atomic_write_symbols(config.liquidity_shortlist, shortlist)
 
@@ -1229,6 +1258,7 @@ def rank_for_day(
             **cache_seed,
             **cache_refresh,
             "shortlist_daily_top": config.shortlist_daily_top,
+            "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
             "shortlist_trading_days": shortlist_sessions,
             "shortlist_symbols": len(shortlist),
             "eligible_company_assets": len(eligible_companies),
@@ -1284,13 +1314,14 @@ def rank_for_day(
             "feed": config.feed,
             "ranking_pipeline_version": RANKING_PIPELINE_VERSION,
             "candidate_method": (
-                "most_liquid.txt daily top-N dollar-volume union, then strictly "
-                "lagged causal EMA(log1p(dollar volume))"
+                "most_liquid.txt daily top-N dollar-volume union over a trailing "
+                "session window, then strictly lagged causal EMA(log1p(dollar volume))"
             ),
             "ranking_price": "split-adjusted daily VWAP, falling back to close",
             "daily_bars_dir": str(bars_dir),
             "liquidity_shortlist": str(config.liquidity_shortlist),
             "shortlist_since": config.shortlist_since.isoformat(),
+            "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
             "candidate_diagnostics": candidate_diagnostics,
             "market_data_dump": ticks_metadata,
             "screened_candidate_symbols": symbols,
@@ -2505,8 +2536,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ranking-time",
         type=parse_clock,
-        default=parse_clock("15:00"),
-        help="ET time to start ranking, well before entry",
+        default=parse_clock("14:00"),
+        help="ET time to start ranking, well before entry. The rank reads only "
+        "completed sessions strictly before the entry date, so starting earlier "
+        "buys headroom for the daily-cache refresh without changing the result",
     )
     parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=20)
     parser.add_argument("--entry-grace-seconds", type=int, default=75)
@@ -2548,6 +2581,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="union each session's top-N stocks by dollar volume (default: 50)",
+    )
+    parser.add_argument(
+        "--shortlist-lookback-sessions",
+        type=int,
+        default=DEFAULT_SHORTLIST_LOOKBACK_SESSIONS,
+        help="union only the most recent N completed sessions, so the shortlist tracks "
+        "current liquidity instead of accumulating every past top-N member "
+        f"(default: {DEFAULT_SHORTLIST_LOOKBACK_SESSIONS}); 0 unions everything since "
+        "--shortlist-since",
     )
     parser.add_argument(
         "--daily-overlap-days",
@@ -2659,6 +2701,8 @@ def _validate_args(
         parser.error("liquidity-lookback-days must be at least 30")
     if args.shortlist_daily_top < 1 or args.daily_overlap_days < 1:
         parser.error("shortlist-daily-top and daily-overlap-days must be positive")
+    if args.shortlist_lookback_sessions < 0:
+        parser.error("shortlist-lookback-sessions must be zero or positive")
     if not 1 <= args.data_batch_size <= 200 or not 1 <= args.data_workers <= 16:
         parser.error("data-batch-size must be 1..200 and data-workers must be 1..16")
     if not 1 <= args.order_submit_workers <= 32:
@@ -2736,6 +2780,7 @@ def _validate_args(
         liquidity_shortlist=args.liquidity_shortlist,
         shortlist_since=args.shortlist_since,
         shortlist_daily_top=args.shortlist_daily_top,
+        shortlist_lookback_sessions=args.shortlist_lookback_sessions or None,
         daily_overlap_days=args.daily_overlap_days,
         feed=args.feed,
         quote_feed=args.quote_feed,

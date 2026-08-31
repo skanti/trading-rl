@@ -219,12 +219,19 @@ python -m baseline.overnight_liquidity \
 There is no 15:59 auction. The entry therefore remains the 15:59 SIP minute-bar
 open. Substituting the 16:00 closing auction would model a different entry time.
 
-Use `--exchange-filter nasdaq` to remove non-Nasdaq candidates before ranking.
-The top basket is then reranked from the remaining Nasdaq company universe; the
-filter does not merely discard NYSE names after selection. SPY remains available
-only as the benchmark. When the auction file is present, historical primary-auction
-venues override the current directory for known symbol-dates, so a listing transfer
-such as PLTR's 2024 NYSE-to-Nasdaq move is handled at the correct session.
+`--exchange-filter` defaults to `nasdaq`, matching live execution, and removes
+non-Nasdaq candidates before ranking. The top basket is then reranked from the
+remaining Nasdaq company universe; the filter does not merely discard NYSE names
+after selection. SPY remains available only as the benchmark. Pass
+`--exchange-filter all` for the unrestricted universe.
+
+When the auction file is present, historical primary-auction venues override the
+current directory for known symbol-dates, so a listing transfer such as PLTR's
+2024 NYSE-to-Nasdaq move is handled at the correct session. A venue is matched
+against every SIP code for one listing market: Alpaca publishes a single Nasdaq
+opening cross under both `Q` and `T`, and on sessions such as 2023-01-30 only the
+`T` copy is present, so matching `Q` alone would drop the entire Nasdaq universe
+for that date.
 
 ```bash
 python -m baseline.overnight_liquidity \
@@ -297,14 +304,36 @@ immediately preceding completed session, and it never uses the unfinished entry-
 Active eligible companies missing from the cache are first seeded with split-adjusted
 history from the shortlist epoch, so new listings can enter later shortlist rebuilds.
 
-The refreshed cache rebuilds `data/most_liquid.txt` as the union of every
-session's top 50 stocks by `volume * VWAP` since 2022-01-01. Symbols whose
-split-adjusted prices cannot fit the compact `int32` minute schema are excluded.
-The live rank then considers every currently eligible company in this shortlist,
+The refreshed cache rebuilds `data/most_liquid.txt` as the union of each
+session's top 50 stocks by `volume * VWAP`, over the most recent 250 completed
+sessions on or after 2022-01-01. Symbols whose split-adjusted prices cannot fit
+the compact `int32` minute schema are excluded. The live rank then recomputes
+this shortlist in memory and considers every currently eligible company in it,
 instead of relying on Alpaca's top-share-volume or top-trade-count activity feed.
+`most_liquid.txt` is an output of that rebuild, not an input: editing it by hand
+changes nothing, because the next rank overwrites it. The file exists so the
+minute-bar and auction downloads can follow the same universe.
+
+`--shortlist-lookback-sessions` bounds the union to a trailing window so the
+shortlist tracks current liquidity. Without it, one session in the daily top 50
+in 2022 bought permanent candidacy and the list only ever grew: unioning all
+1,168 sessions since 2022-01-01 yields 724 candidates, of which 386 had not been
+in a daily top 50 for a year. The trailing window is a candidate-set bound, not a
+ranking change -- over the last 500 sessions no window down to 125 ever dropped a
+name from the reserve the entry step draws on. Pass `0` to restore the
+union-everything behaviour.
+
+| `--shortlist-lookback-sessions` | shortlist size |
+| --- | --- |
+| `0` (all 1,168 sessions) | 724 |
+| 750 | 592 |
+| 500 | 500 |
+| 250 (default) | 338 |
+| 125 | 218 |
+
 Configure these locations and bounds with `--daily-bars-dir`,
-`--liquidity-shortlist`, `--shortlist-since`, `--shortlist-daily-top`, and
-`--daily-overlap-days`.
+`--liquidity-shortlist`, `--shortlist-since`, `--shortlist-daily-top`,
+`--shortlist-lookback-sessions`, and `--daily-overlap-days`.
 
 As in the simulator, a company must have at least 100 completed daily bars
 strictly before the entry date. Configure this with `--minimum-trading-days`;
@@ -335,7 +364,7 @@ export ALPACA_DATA_SECRET="..."
 
 python -m baseline.live_overnight_liquidity run \
   --top 10 \
-  --ranking-time 15:00 \
+  --ranking-time 14:00 \
   --entry-time 15:55 \
   --entry-preflight-seconds 10 \
   --order-submit-workers 8 \

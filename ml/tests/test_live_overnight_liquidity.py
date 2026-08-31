@@ -52,6 +52,7 @@ def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
         liquidity_shortlist=Path("/unused/most-liquid.txt"),
         shortlist_since=date(2022, 1, 1),
         shortlist_daily_top=50,
+        shortlist_lookback_sessions=250,
         daily_overlap_days=30,
         feed="iex",
         quote_feed="iex",
@@ -334,7 +335,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         parsed = _validate_args(parser, args)
 
         self.assertIsInstance(parsed, StrategyConfig)
-        self.assertEqual(args.ranking_time.strftime("%H:%M"), "15:00")
+        self.assertEqual(args.ranking_time.strftime("%H:%M"), "14:00")
         self.assertEqual(args.share_mode, "whole")
         self.assertEqual(args.feed, "sip")
         self.assertEqual(args.quote_feed, "iex")
@@ -619,6 +620,128 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             symbols, _, _ = dollar_volume_shortlist(bars_dir, date(2022, 1, 1), top=1)
 
         self.assertEqual(symbols, ["CLOSE"])
+
+    def test_daily_encoder_stores_the_missing_vwap_sentinel_not_the_close(self):
+        """A zero-volume session reports vw=0. Storing the close instead would make
+        this writer disagree with scripts/download_bars.py byte-for-byte, and the
+        overlap check would then re-download those symbols in full on every rank."""
+        no_trades = {
+            "t": "2026-08-20T04:00:00Z",
+            "o": 19.0,
+            "h": 19.0,
+            "l": 19.0,
+            "c": 19.0,
+            "v": 0,
+            "n": 0,
+            "vw": 0,
+        }
+        absent_vwap = {**no_trades, "t": "2026-08-21T04:00:00Z", "vw": None}
+
+        array = _daily_bars_to_array([no_trades, absent_vwap], "QUIET")
+
+        self.assertEqual(array[0, 4], 19_000)
+        self.assertEqual(array[0, 7], 0)
+        self.assertEqual(array[1, 7], 0)
+
+    def test_daily_encoder_matches_a_traded_sessions_reported_vwap(self):
+        array = _daily_bars_to_array([full_bar("2026-08-20", 1_000, 12.345)], "TRADED")
+
+        self.assertEqual(array[0, 7], 12_345)
+
+    def test_daily_encoder_rejects_a_negative_vwap(self):
+        with self.assertRaises(ValueError):
+            _daily_bars_to_array(
+                [{**full_bar("2026-08-20", 1_000, 10.0), "vw": -1.0}], "BAD"
+            )
+
+    def test_refresh_encoding_round_trips_without_a_spurious_full_refresh(self):
+        """The sentinel must survive encode -> merge, or the symbol is flagged as
+        revised and re-downloaded from the manifest epoch on every rank."""
+        bars = [
+            full_bar("2026-08-20", 1_000, 10.0),
+            {**full_bar("2026-08-21", 0, 10.0), "v": 0, "n": 0, "vw": 0},
+        ]
+        stored = _daily_bars_to_array(bars, "QUIET")
+
+        merged = _merge_daily_arrays(stored, _daily_bars_to_array(bars, "QUIET"))
+
+        self.assertIsNotNone(merged)
+        np.testing.assert_array_equal(merged, stored)
+
+    def test_dollar_volume_shortlist_lookback_drops_a_stale_past_leader(self):
+        """FADED led on the oldest session only. Unioning every session keeps it
+        forever; a trailing window retires it once it stops leading."""
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            np.save(
+                bars_dir / "FADED.npy",
+                _daily_bars_to_array(
+                    [
+                        full_bar("2026-08-19", 9_000),
+                        full_bar("2026-08-20", 1),
+                        full_bar("2026-08-21", 1),
+                    ],
+                    "FADED",
+                ),
+            )
+            np.save(
+                bars_dir / "CURRENT.npy",
+                _daily_bars_to_array(
+                    [
+                        full_bar("2026-08-19", 10),
+                        full_bar("2026-08-20", 5_000),
+                        full_bar("2026-08-21", 6_000),
+                    ],
+                    "CURRENT",
+                ),
+            )
+
+            everything, all_sessions, _ = dollar_volume_shortlist(
+                bars_dir, date(2022, 1, 1), top=1
+            )
+            windowed, windowed_sessions, _ = dollar_volume_shortlist(
+                bars_dir, date(2022, 1, 1), top=1, lookback_sessions=2
+            )
+
+        self.assertEqual(everything, ["CURRENT", "FADED"])
+        self.assertEqual(all_sessions, 3)
+        self.assertEqual(windowed, ["CURRENT"])
+        self.assertEqual(windowed_sessions, 2)
+
+    def test_dollar_volume_shortlist_lookback_beyond_history_keeps_every_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            np.save(
+                bars_dir / "A.npy",
+                _daily_bars_to_array(
+                    [full_bar("2026-08-20", 1_000), full_bar("2026-08-21", 10)], "A"
+                ),
+            )
+            np.save(
+                bars_dir / "B.npy",
+                _daily_bars_to_array(
+                    [full_bar("2026-08-20", 10), full_bar("2026-08-21", 2_000)], "B"
+                ),
+            )
+
+            symbols, sessions, _ = dollar_volume_shortlist(
+                bars_dir, date(2022, 1, 1), top=1, lookback_sessions=500
+            )
+
+        self.assertEqual(symbols, ["A", "B"])
+        self.assertEqual(sessions, 2)
+
+    def test_dollar_volume_shortlist_rejects_a_non_positive_lookback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            np.save(
+                bars_dir / "A.npy",
+                _daily_bars_to_array([full_bar("2026-08-20", 1_000)], "A"),
+            )
+            with self.assertRaises(ValueError):
+                dollar_volume_shortlist(
+                    bars_dir, date(2022, 1, 1), top=1, lookback_sessions=0
+                )
 
     def test_daily_array_merge_detects_historical_revision(self):
         base = _daily_bars_to_array(
