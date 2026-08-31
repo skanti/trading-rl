@@ -32,7 +32,7 @@ import requests
 from rich.console import Console
 from rich.table import Table
 
-from overnight.backtest import (
+from backtest import (
     DEFAULT_SECURITY_MASTER_CACHE,
     basket_quantities,
     issuer_key,

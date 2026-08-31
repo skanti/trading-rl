@@ -10,10 +10,10 @@
 4. Equal-weight the selected stocks, then close them at 09:45 on the next
    trading session.
 
-Run this package's tests from the repository root:
+Run the tests from this directory:
 
 ```bash
-python -m unittest discover -s overnight/tests -t .
+python -m unittest discover -s tests
 ```
 
 Transaction costs default to 1 basis point per side, or 2 basis points for a
@@ -49,7 +49,7 @@ To compare the original stable dollar-liquidity ranking with Alpaca's
 real-time most-actives definitions in one run:
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --top 10 \
   --months 12 \
   --ranking-time 15:15 \
@@ -80,7 +80,7 @@ Use one scheme name instead of `compare` to run it alone.
 For the fast dynamic approximation directly:
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --liquidity-scheme activity_union_ema \
   --activity-candidates 100 \
   --minimum-trading-days 100 \
@@ -123,7 +123,7 @@ To refresh the broad daily store, rebuild the dollar-volume shortlist, update
 the shortlist's minute bars, and extend auction data in one pass, run:
 
 ```bash
-scripts/download_latest_bars_and_auctions.sh
+../scripts/download_latest_bars_and_auctions.sh
 ```
 
 The script first merges Alpaca's currently available company stocks into
@@ -134,7 +134,7 @@ It obtains the auction end date from the refreshed daily bars, so a still-formin
 market session is not requested.
 
 ```bash
-.venv/bin/python scripts/download_bars.py \
+python ../scripts/download_bars.py \
   --source alpaca \
   --tickers_path /path/to/tickers.txt \
   --out_dir /data/ppv1/updates/bars \
@@ -157,7 +157,7 @@ not overflow. The downloader excludes a still-forming New York session.
 Future updates can reuse the manifest's start date:
 
 ```bash
-.venv/bin/python scripts/download_bars.py \
+python ../scripts/download_bars.py \
   --source alpaca \
   --timeframe 1Day \
   --tickers_path /home/aavetisyan/dev/trading-rl/data/master.txt \
@@ -179,9 +179,9 @@ does not apply splits itself.
 
 ```bash
 set -a
-source overnight/.env
+source .env
 set +a
-.venv/bin/python scripts/download_auctions.py \
+python ../scripts/download_auctions.py \
   --start 2022-01-01 \
   --end 2026-08-27 \
   --symbols-from-trades /tmp/overnight_liquidity_48m_minute.csv \
@@ -191,7 +191,7 @@ set +a
 For later updates, reuse the same output and provide only a new end date:
 
 ```bash
-.venv/bin/python scripts/download_auctions.py \
+python ../scripts/download_auctions.py \
   --update \
   --end 2026-09-04 \
   --output /data/ppv1/updates/alpaca_auctions_2022-01-01.npz
@@ -211,7 +211,7 @@ when the Alpaca plan does not permit querying the most recent SIP data.
 Then run the comparison:
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --top 12 \
   --months 24 \
   --budget 10000 \
@@ -240,7 +240,7 @@ opening cross under both `Q` and `T`, and on sessions such as 2023-01-30 only th
 for that date.
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --top 100 \
   --months 12 \
   --ema-span 20 \
@@ -259,7 +259,7 @@ simulation. Give it initial portfolio equity when comparing it with integer shar
 each exit's P&L is rolled into the next basket:
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --top 12 \
   --months 12 \
   --budget 10000 \
@@ -270,7 +270,7 @@ Use `--share-mode whole` to floor every selected stock's target allocation to a 
 number of shares:
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --top 12 \
   --months 12 \
   --budget 10000 \
@@ -286,7 +286,7 @@ position weights.
 To trade only liquidity ranks 51--100, excluding the 50 most-liquid stocks:
 
 ```bash
-python -m overnight.backtest \
+python backtest.py \
   --top 100 \
   --exclude-top 50 \
   --months 12 \
@@ -368,7 +368,7 @@ export ALPACA_SECRET="..."
 export ALPACA_DATA_KEY="..."       # optional separate market-data subscription
 export ALPACA_DATA_SECRET="..."
 
-python -m overnight.live run \
+python live.py run \
   --top 10 \
   --ranking-time 14:00 \
   --entry-time 15:55 \
@@ -431,7 +431,7 @@ one command. It uses isolated temporary state, never accepts `--submit`, and
 cannot replace or suppress the live daemon's scheduled ranking:
 
 ```bash
-python -m overnight.live preview \
+python live.py preview \
   --top 10 \
   --entry-time 15:59 \
   --exit-time 09:00 \
@@ -450,10 +450,10 @@ order. A still-working or partially filled exit remains in place across
 Entry submissions still require an open regular session.
 
 ```bash
-python -m overnight.live rank
-python -m overnight.live enter
-python -m overnight.live status
-python -m overnight.live exit
+python live.py rank
+python live.py enter
+python live.py status
+python live.py exit
 ```
 
 The default work directory is `/data/ppv1/live`. Durable restart state is
@@ -488,7 +488,7 @@ To export the current Alpaca-available company universe used by the live
 strategy, run:
 
 ```bash
-python -m overnight.universe
+python universe.py
 ```
 
 This writes one symbol per line to `data/nasdaq.txt` at the repository root.

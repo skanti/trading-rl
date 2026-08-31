@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from rich.console import Console
 
-from overnight.backtest import (
+from backtest import (
     DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
     activity_union_candidate_mask,

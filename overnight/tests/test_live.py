@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from rich.console import Console
 
-from overnight.live import (
+from live import (
     DEFAULT_EXCHANGES,
     EASTERN,
     RANKING_PIPELINE_VERSION,

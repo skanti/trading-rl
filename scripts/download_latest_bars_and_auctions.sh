@@ -103,8 +103,8 @@ fi
 
 log "Merging newly available company stocks into $MASTER_PATH"
 (
-  cd -- "$REPO_DIR"
-  "$PYTHON_BIN" -m overnight.universe \
+  cd -- "$REPO_DIR/overnight"
+  "$PYTHON_BIN" universe.py \
     --output "$MASTER_PATH" \
     --merge-existing \
     --refresh-security-master
