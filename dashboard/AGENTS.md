@@ -9,12 +9,12 @@
 ## Data flow
 - The browser never talks to Alpaca. `scripts/dashboard_daemon.py` is a standalone polling
   process that reads Alpaca and the trading daemon's JSON artifacts, then writes one snapshot
-  document plus a `sessions` subcollection. Nothing in `ml/baseline` imports dashboard code.
+  document plus a `sessions` subcollection. Nothing in `overnight/` imports dashboard code.
 - The dashboard daemon retries its own failures. Trading must never supervise, import, or call it.
 - `dashboard/config.yaml` holds Firebase and dashboard-login settings. `nuxt.config.ts` parses it
   at build time and copies only browser-safe values into `runtimeConfig.public`; configured
   secrets are never bundled (`deploy.sh` fails the build if they appear).
-- Alpaca credentials live in the environment (`ml/.env`), never in `config.yaml`.
+- Alpaca credentials live in the environment (`overnight/.env`), never in `config.yaml`.
 - Snapshot field shapes live in `app/types/dashboard.ts` and must track `build_snapshot`
   in `scripts/dashboard_daemon.py`, which is their only writer.
 

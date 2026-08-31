@@ -6,7 +6,7 @@ const props = withDefaults(defineProps<{
   appearance: 'badge'
 })
 
-// The strategy's own vocabulary from live_overnight_liquidity's state machine.
+// The strategy's own vocabulary from overnight/live.py's state machine.
 const presentation = computed(() => {
   switch (props.status) {
     case 'ranking':

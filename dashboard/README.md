@@ -41,7 +41,7 @@ dashboard login. Only code under `dashboard/` reads it.
 starting the dashboard daemon:
 
 ```bash
-set -a && source ../ml/.env && set +a
+set -a && source ../overnight/.env && set +a
 ```
 
 Only browser-safe values reach the bundle. `deploy.sh` checks that configured secrets
@@ -102,7 +102,7 @@ day, it also sends one digest email using `smtp` and `notifications.recipients` 
 SMTP failures are logged and retried without affecting Firestore publishing.
 
 ```bash
-set -a && source ../ml/.env && set +a
+set -a && source ../overnight/.env && set +a
 
 .venv/bin/python scripts/dashboard_daemon.py --dry-run  # print one payload
 .venv/bin/python scripts/dashboard_daemon.py --once     # publish once
