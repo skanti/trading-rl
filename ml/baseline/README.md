@@ -284,8 +284,10 @@ python -m baseline.overnight_liquidity \
 ## Alpaca paper execution
 
 `live_overnight_liquidity.py` applies the same causal liquidity idea to an
-Alpaca account. By default it starts ranking at 15:00 ET, opens an equal-notional top-10
+Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-10
 basket at 15:55, and submits its exit at 09:00 on the next trading session.
+The daemon checks Alpaca's market calendar once per New York date and idles on
+weekends and exchange holidays instead of attempting scheduled actions.
 Before ranking, it refreshes every symbol already present in the broad
 split-adjusted daily cache at `/data/ppv1/updates/bars_1day_2016-01-01` using
 batched SIP requests with 30 days of overlap. An exact overlap is appended;

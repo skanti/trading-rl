@@ -23,6 +23,7 @@ from baseline.live_overnight_liquidity import (
     _completed_session_end,
     _exit_order_time_in_force,
     _merge_daily_arrays,
+    _market_session_status,
     _print_entry_plan,
     _select_unconflicted_candidates,
     _validate_args,
@@ -252,6 +253,33 @@ class FakeBatchOmissionDailyBarsClient(FakeDailyBarsClient):
 
 
 class LiveOvernightLiquidityTest(unittest.TestCase):
+    def test_market_session_status_uses_alpaca_calendar(self):
+        class CalendarBroker:
+            def __init__(self):
+                self.requests = []
+
+            def calendar(self, start, end):
+                self.requests.append((start, end))
+                return [
+                    {"date": "2026-08-31"},
+                    {"date": "2026-09-01"},
+                ]
+
+        broker = CalendarBroker()
+
+        sunday = _market_session_status(broker, date(2026, 8, 30))
+        monday = _market_session_status(broker, date(2026, 8, 31))
+
+        self.assertEqual(sunday, (False, date(2026, 8, 31)))
+        self.assertEqual(monday, (True, date(2026, 9, 1)))
+        self.assertEqual(
+            broker.requests,
+            [
+                (date(2026, 8, 30), date(2026, 9, 9)),
+                (date(2026, 8, 31), date(2026, 9, 10)),
+            ],
+        )
+
     def test_whole_share_preview_prints_per_symbol_and_total_sizing(self):
         console = Console(record=True, width=140, color_system=None)
         _print_entry_plan(

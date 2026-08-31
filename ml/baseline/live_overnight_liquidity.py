@@ -1112,6 +1112,16 @@ def _next_session(client: AlpacaClient, current: date) -> date:
     return sessions[0]
 
 
+def _market_session_status(
+    client: AlpacaClient, current: date
+) -> tuple[bool, date | None]:
+    """Return whether ``current`` is a session and the following session date."""
+    sessions = _calendar_dates(client.calendar(current, current + timedelta(days=10)))
+    is_session = current in sessions
+    next_session = next((session for session in sessions if session > current), None)
+    return is_session, next_session
+
+
 def rank_for_day(
     client: AlpacaClient,
     store: StateStore,
@@ -2291,6 +2301,9 @@ def run_daemon(
     )
     last_error_key: tuple[str, str] | None = None
     last_attempts: dict[str, datetime] = {}
+    calendar_date: date | None = None
+    is_trading_session = False
+    next_trading_session: date | None = None
 
     def may_attempt(key: str, current: datetime) -> bool:
         previous = last_attempts.get(key)
@@ -2303,8 +2316,32 @@ def run_daemon(
         now = datetime.now(tz=EASTERN)
         today = now.date()
         sleep_seconds = config.poll_seconds
-        artifacts.directory(today)
         try:
+            if calendar_date != today:
+                if not may_attempt("calendar", now):
+                    time_module.sleep(sleep_seconds)
+                    continue
+                is_trading_session, next_trading_session = _market_session_status(
+                    client, today
+                )
+                calendar_date = today
+                if not is_trading_session:
+                    next_label = (
+                        next_trading_session.isoformat()
+                        if next_trading_session is not None
+                        else "unknown"
+                    )
+                    LOGGER.info(
+                        "%s is not an Alpaca trading session; idling until %s",
+                        today,
+                        next_label,
+                    )
+            if not is_trading_session:
+                last_error_key = None
+                time_module.sleep(sleep_seconds)
+                continue
+
+            artifacts.directory(today)
             state = store.load()
             position = state.get("position") or {}
             exit_date_value = position.get("exit_date")
