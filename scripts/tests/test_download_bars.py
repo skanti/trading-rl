@@ -9,7 +9,7 @@ from unittest import mock
 import numpy as np
 
 
-SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "download_bars.py"
+SCRIPT_PATH = Path(__file__).parents[1] / "download_bars.py"
 SPEC = importlib.util.spec_from_file_location("download_bars", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 download_bars = importlib.util.module_from_spec(SPEC)

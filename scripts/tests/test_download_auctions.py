@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "download_auctions.py"
+SCRIPT_PATH = Path(__file__).parents[1] / "download_auctions.py"
 SPEC = importlib.util.spec_from_file_location("download_auctions", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 download_auctions = importlib.util.module_from_spec(SPEC)

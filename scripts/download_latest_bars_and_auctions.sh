@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-ML_DIR="$REPO_DIR/ml"
+ML_DIR="$REPO_DIR/ml"   # retained only for the credentials file
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 ENV_FILE="${ENV_FILE:-$ML_DIR/.env}"
@@ -105,8 +105,8 @@ fi
 
 log "Merging newly available company stocks into $MASTER_PATH"
 (
-  cd -- "$ML_DIR"
-  "$PYTHON_BIN" -m baseline.export_alpaca_companies \
+  cd -- "$REPO_DIR"
+  "$PYTHON_BIN" -m overnight.universe \
     --output "$MASTER_PATH" \
     --merge-existing \
     --refresh-security-master

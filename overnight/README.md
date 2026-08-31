@@ -1,6 +1,6 @@
-# Trading baselines
+# Overnight dollar-liquidity strategy
 
-`overnight_liquidity.py` implements a point-in-time overnight baseline:
+`backtest.py` simulates the strategy point-in-time:
 
 1. Read each stock's completed daily dollar volume as split-adjusted daily
    `VWAP * volume` (falling back to the daily close when VWAP is unavailable).
@@ -9,6 +9,12 @@
    session only. The current session never contributes to its own rank.
 4. Equal-weight the selected stocks, then close them at 09:45 on the next
    trading session.
+
+Run this package's tests from the repository root:
+
+```bash
+python -m unittest discover -s overnight/tests -t .
+```
 
 Transaction costs default to 1 basis point per side, or 2 basis points for a
 complete entry-and-exit round trip. Override this with `--transaction-cost-bps`.
@@ -43,7 +49,7 @@ To compare the original stable dollar-liquidity ranking with Alpaca's
 real-time most-actives definitions in one run:
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --top 10 \
   --months 12 \
   --ranking-time 15:15 \
@@ -74,7 +80,7 @@ Use one scheme name instead of `compare` to run it alone.
 For the fast dynamic approximation directly:
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --liquidity-scheme activity_union_ema \
   --activity-candidates 100 \
   --minimum-trading-days 100 \
@@ -205,7 +211,7 @@ when the Alpaca plan does not permit querying the most recent SIP data.
 Then run the comparison:
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --top 12 \
   --months 24 \
   --budget 10000 \
@@ -234,7 +240,7 @@ opening cross under both `Q` and `T`, and on sessions such as 2023-01-30 only th
 for that date.
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --top 100 \
   --months 12 \
   --ema-span 20 \
@@ -253,7 +259,7 @@ simulation. Give it initial portfolio equity when comparing it with integer shar
 each exit's P&L is rolled into the next basket:
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --top 12 \
   --months 12 \
   --budget 10000 \
@@ -264,7 +270,7 @@ Use `--share-mode whole` to floor every selected stock's target allocation to a 
 number of shares:
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --top 12 \
   --months 12 \
   --budget 10000 \
@@ -280,7 +286,7 @@ position weights.
 To trade only liquidity ranks 51--100, excluding the 50 most-liquid stocks:
 
 ```bash
-python -m baseline.overnight_liquidity \
+python -m overnight.backtest \
   --top 100 \
   --exclude-top 50 \
   --months 12 \
@@ -290,7 +296,7 @@ python -m baseline.overnight_liquidity \
 
 ## Alpaca paper execution
 
-`live_overnight_liquidity.py` applies the same causal liquidity idea to an
+`live.py` applies the same causal liquidity idea to an
 Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-10
 basket at 15:55, and submits its exit at 09:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
@@ -362,7 +368,7 @@ export ALPACA_SECRET="..."
 export ALPACA_DATA_KEY="..."       # optional separate market-data subscription
 export ALPACA_DATA_SECRET="..."
 
-python -m baseline.live_overnight_liquidity run \
+python -m overnight.live run \
   --top 10 \
   --ranking-time 14:00 \
   --entry-time 15:55 \
@@ -425,7 +431,7 @@ one command. It uses isolated temporary state, never accepts `--submit`, and
 cannot replace or suppress the live daemon's scheduled ranking:
 
 ```bash
-python -m baseline.live_overnight_liquidity preview \
+python -m overnight.live preview \
   --top 10 \
   --entry-time 15:59 \
   --exit-time 09:00 \
@@ -444,10 +450,10 @@ order. A still-working or partially filled exit remains in place across
 Entry submissions still require an open regular session.
 
 ```bash
-python -m baseline.live_overnight_liquidity rank
-python -m baseline.live_overnight_liquidity enter
-python -m baseline.live_overnight_liquidity status
-python -m baseline.live_overnight_liquidity exit
+python -m overnight.live rank
+python -m overnight.live enter
+python -m overnight.live status
+python -m overnight.live exit
 ```
 
 The default work directory is `/data/ppv1/live`. Durable restart state is
@@ -482,7 +488,7 @@ To export the current Alpaca-available company universe used by the live
 strategy, run:
 
 ```bash
-python -m baseline.export_alpaca_companies
+python -m overnight.universe
 ```
 
 This writes one symbol per line to `data/nasdaq.txt` at the repository root.

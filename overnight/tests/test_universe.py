@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from baseline.export_alpaca_companies import merge_existing_symbols
+from overnight.universe import merge_existing_symbols
 
 
 class ExportAlpacaCompaniesTest(unittest.TestCase):

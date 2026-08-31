@@ -32,7 +32,7 @@ import requests
 from rich.console import Console
 from rich.table import Table
 
-from baseline.overnight_liquidity import (
+from overnight.backtest import (
     DEFAULT_SECURITY_MASTER_CACHE,
     basket_quantities,
     issuer_key,
@@ -50,7 +50,7 @@ DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_STATE_PATH = str(DEFAULT_WORK_DIR / "state.json")
 DEFAULT_DAILY_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2016-01-01")
 DEFAULT_LIQUIDITY_SHORTLIST = (
-    Path(__file__).resolve().parents[2] / "data" / "most_liquid.txt"
+    Path(__file__).resolve().parents[1] / "data" / "most_liquid.txt"
 )
 DEFAULT_SHORTLIST_SINCE = date(2022, 1, 1)
 # One session in the daily top-N used to buy permanent candidacy, so the shortlist

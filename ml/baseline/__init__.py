@@ -1,2 +1,0 @@
-"""Simple, reproducible trading baselines."""
-

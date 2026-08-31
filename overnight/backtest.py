@@ -29,7 +29,7 @@ from rich.table import Table
 from tqdm import tqdm
 import requests
 
-from price_utils import forward_fill_positions
+from overnight.price_utils import forward_fill_positions
 
 
 REFERENCE_SYMBOL = "SPY"
