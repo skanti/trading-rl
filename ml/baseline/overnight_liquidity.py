@@ -166,8 +166,16 @@ def load_primary_auction_exchange_mask(
     already applied the requested venue filter. Known historical auctions override
     it, which handles listing transfers without excluding symbols lacking downloaded
     auction history before they are ever selected.
+
+    A venue is matched against the whole family of codes the SIP uses for one
+    listing market. Alpaca reports a single Nasdaq opening cross under both "Q"
+    and "T", and on some sessions only the "T" copy survives, so matching "Q"
+    alone would silently drop genuine Nasdaq listings on those dates. Where a
+    name really did list elsewhere the primary print carries that venue's own
+    code and still wins the size/priority dedupe, so listing transfers remain
+    detected.
     """
-    exchange_codes = {"nasdaq": "Q"}
+    exchange_codes = {"nasdaq": frozenset({"Q", "T"})}
     if exchange not in exchange_codes:
         raise ValueError(f"unsupported exchange filter: {exchange}")
     wanted = exchange_codes[exchange]
@@ -178,7 +186,7 @@ def load_primary_auction_exchange_mask(
     symbol_index = pd.Index([_security_symbol(sample_id) for sample_id in symbols])
     columns = symbol_index.get_indexer(official["symbol"].astype(str).str.upper())
     valid = (rows >= 0) & (columns >= 0)
-    matching_exchange = official["exchange"].astype(str).to_numpy() == wanted
+    matching_exchange = official["exchange"].astype(str).isin(wanted).to_numpy()
     mask[rows[valid], columns[valid]] = matching_exchange[valid]
     return mask, int(valid.sum())
 
@@ -1926,8 +1934,9 @@ def main() -> None:
     parser.add_argument(
         "--exchange-filter",
         choices=("all", "nasdaq"),
-        default="all",
-        help="restrict the candidate universe before ranking; SPY remains as benchmark",
+        default="nasdaq",
+        help="restrict the candidate universe before ranking; SPY remains as benchmark. "
+        "Defaults to nasdaq to match live execution; pass all for the unrestricted universe",
     )
     parser.add_argument(
         "--unclassified-asset-policy",

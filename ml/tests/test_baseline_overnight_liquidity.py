@@ -131,6 +131,78 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertEqual(known, 2)
         self.assertEqual(mask.tolist(), [[False, True], [True, True]])
 
+    def test_nasdaq_mask_accepts_the_t_coded_copy_of_one_opening_cross(self):
+        """Alpaca publishes the Nasdaq cross as both Q and T; some sessions carry
+        only T (e.g. 2023-01-30), and matching Q alone emptied the universe."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auctions.npz"
+            write_auction_npz(
+                path,
+                [
+                    # 2023-01-27: both tape copies of the same Nasdaq cross.
+                    {
+                        "symbol": "AAPL",
+                        "date": "2023-01-27",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 143.10,
+                        "size": 406_648,
+                        "exchange": "Q",
+                    },
+                    {
+                        "symbol": "AAPL",
+                        "date": "2023-01-27",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 143.10,
+                        "size": 406_648,
+                        "exchange": "T",
+                    },
+                    # 2023-01-30: only the T copy survived.
+                    {
+                        "symbol": "AAPL",
+                        "date": "2023-01-30",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 144.90,
+                        "size": 593_788,
+                        "exchange": "T",
+                    },
+                    # A NYSE listing still loses to its own primary print, so a
+                    # smaller Nasdaq-book cross cannot make it look Nasdaq-listed.
+                    {
+                        "symbol": "UNH",
+                        "date": "2023-01-30",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 494.00,
+                        "size": 180_000,
+                        "exchange": "N",
+                    },
+                    {
+                        "symbol": "UNH",
+                        "date": "2023-01-30",
+                        "session": "open",
+                        "condition": "O",
+                        "price": 494.00,
+                        "size": 1_200,
+                        "exchange": "T",
+                    },
+                ],
+            )
+
+            mask, known = load_primary_auction_exchange_mask(
+                path,
+                pd.DatetimeIndex(["2023-01-27", "2023-01-30"]),
+                np.array(["AAPL", "UNH"]),
+                "nasdaq",
+            )
+
+        self.assertEqual(known, 3)
+        # AAPL stays eligible on both sessions; UNH is excluded only where its
+        # NYSE print is known, and stays eligible where no auction was recorded.
+        self.assertEqual(mask.tolist(), [[True, True], [True, False]])
+
     def test_whole_share_sizing_rounds_down_without_exceeding_budget(self):
         prices = np.array([120.0, 300.0, 700.0])
 
