@@ -17,9 +17,9 @@ const props = defineProps<{
 const runtime = useRuntimeConfig().public
 const schedule: ScheduleConfig = {
   timeZone: String(runtime.scheduleTimeZone || 'America/New_York'),
-  rankingTime: String(runtime.scheduleRankingTime || '15:00'),
+  rankingTime: String(runtime.scheduleRankingTime || '14:00'),
   entryTime: String(runtime.scheduleEntryTime || '15:59'),
-  exitTime: String(runtime.scheduleExitTime || '09:00')
+  exitTime: String(runtime.scheduleExitTime || '08:00')
 }
 
 const now = ref(new Date())

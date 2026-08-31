@@ -78,9 +78,9 @@ export default defineNuxtConfig({
       firestoreCollection: config.firebase?.collection ?? 'accounts',
       firestoreDocument: config.firebase?.document ?? 'current',
       scheduleTimeZone: config.schedule?.time_zone ?? 'America/New_York',
-      scheduleRankingTime: config.schedule?.ranking_time ?? '15:00',
+      scheduleRankingTime: config.schedule?.ranking_time ?? '14:00',
       scheduleEntryTime: config.schedule?.entry_time ?? '15:59',
-      scheduleExitTime: config.schedule?.exit_time ?? '09:00',
+      scheduleExitTime: config.schedule?.exit_time ?? '08:00',
       // Nuxt applies NUXT_PUBLIC_* overrides on top of these automatically, so setting
       // NUXT_PUBLIC_FIREBASE_API_KEY= (empty) forces the offline demo adapter.
       firebaseApiKey: web.apiKey ?? '',

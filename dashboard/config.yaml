@@ -9,9 +9,9 @@ dashboard:
 # flags used to launch the trading daemon; Alpaca's clock supplies actual market opens.
 schedule:
   time_zone: "America/New_York"
-  ranking_time: "15:00"
+  ranking_time: "14:00"
   entry_time: "15:59"
-  exit_time: "09:00"
+  exit_time: "08:00"
 
 auth:
   # Dashboard login. The username is bridged to a Firebase Auth account as
