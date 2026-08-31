@@ -14,7 +14,6 @@ MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_2016-01-01}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
 MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 MOST_LIQUID_PATH="${MOST_LIQUID_PATH:-$REPO_DIR/data/most_liquid.txt}"
-MINUTE_SYMBOLS_PATH="${MINUTE_SYMBOLS_PATH:-$REPO_DIR/data/tickers_all.txt}"
 SHORTLIST_SINCE="${SHORTLIST_SINCE:-2022-01-01}"
 SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-50}"
 BAR_SINCE="${BAR_SINCE:-2016-01-01}"
@@ -132,21 +131,22 @@ log "Rebuilding top-$SHORTLIST_DAILY_TOP daily dollar-volume union"
   --metric dollar-volume \
   --output "$MOST_LIQUID_PATH"
 
-minute_symbols_tmp="$(mktemp "$REPO_DIR/data/.tickers_all.XXXXXX")"
+# The minute universe is fully derived from the shortlist, so it lives in a
+# scratch file the exit trap removes. The durable record of what the store holds
+# is _symbols.txt inside the store itself, written once the download succeeds.
+minute_symbols_tmp="$(mktemp -t trading-rl-minute-symbols.XXXXXX)"
 printf 'SPY\n' >"$minute_symbols_tmp"
 while IFS= read -r symbol; do
   if [[ -n "$symbol" && "$symbol" != "SPY" ]]; then
     printf '%s\n' "$symbol" >>"$minute_symbols_tmp"
   fi
 done <"$MOST_LIQUID_PATH"
-mv -- "$minute_symbols_tmp" "$MINUTE_SYMBOLS_PATH"
-minute_symbols_tmp=""
 
 log "Updating shortlist minute bars in $MINUTE_BARS_DIR"
 "$PYTHON_BIN" "$SCRIPT_DIR/download_bars.py" \
   --source alpaca \
   --timeframe 1Min \
-  --tickers_path "$MINUTE_SYMBOLS_PATH" \
+  --tickers_path "$minute_symbols_tmp" \
   --out_dir "$MINUTE_BARS_DIR" \
   --since "$BAR_SINCE" \
   --workers_num "$WORKERS" \
@@ -154,7 +154,7 @@ log "Updating shortlist minute bars in $MINUTE_BARS_DIR"
   --overlap_days "$BAR_OVERLAP_DAYS"
 check_failures "$MINUTE_BARS_DIR"
 
-cp -- "$MINUTE_SYMBOLS_PATH" "$MINUTE_BARS_DIR/_symbols.txt.part"
+cp -- "$minute_symbols_tmp" "$MINUTE_BARS_DIR/_symbols.txt.part"
 mv -- "$MINUTE_BARS_DIR/_symbols.txt.part" "$MINUTE_BARS_DIR/_symbols.txt"
 
 calendar_path="$DAILY_BARS_DIR/$CALENDAR_SYMBOL.npy"
