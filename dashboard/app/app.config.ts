@@ -9,6 +9,16 @@ export default defineAppConfig({
         header: 'p-2 sm:p-2',
         body: 'p-2 sm:p-2',
         footer: 'p-2 sm:p-2'
+      },
+      variants: {
+        variant: {
+          outline: { root: 'divide-y-0' },
+          soft: { root: 'divide-y-0' },
+          subtle: { root: 'divide-y-0' }
+        }
+      },
+      defaultVariants: {
+        variant: 'soft'
       }
     },
     table: {

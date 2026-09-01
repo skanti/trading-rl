@@ -6,6 +6,7 @@ import {
   formatPercent,
   formatSignedCurrency,
   formatSignedPercent,
+  profitFactorToneClass,
   toneClass
 } from '~/utils/format'
 import {
@@ -188,7 +189,7 @@ const rows = computed<PerformanceRow[]>(() => [
     label: 'Profit factor',
     value: formatRatio(metrics.value.profitFactor),
     detail: 'Gross gains ÷ gross losses',
-    tone: toneClass(metrics.value.profitFactor)
+    tone: profitFactorToneClass(metrics.value.profitFactor)
   },
   {
     label: 'Best session',
@@ -207,7 +208,6 @@ const rows = computed<PerformanceRow[]>(() => [
 
 <template>
   <UCard
-    variant="subtle"
     class="min-w-0 max-w-full"
   >
     <template #header>

@@ -47,7 +47,7 @@ async function submit() {
         </div>
       </div>
 
-      <UCard variant="subtle">
+      <UCard>
         <form
           class="space-y-4"
           @submit.prevent="submit"

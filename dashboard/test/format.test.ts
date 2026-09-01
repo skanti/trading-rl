@@ -9,6 +9,7 @@ import {
   formatRelative,
   formatSignedCurrency,
   formatSignedPercent,
+  profitFactorToneClass,
   toneClass
 } from '~/utils/format'
 
@@ -59,6 +60,16 @@ describe('toneClass', () => {
     expect(toneClass(undefined)).toBe('text-slate-400')
     expect(toneClass(1)).toBe('text-emerald-400')
     expect(toneClass(-1)).toBe('text-rose-400')
+  })
+})
+
+describe('profitFactorToneClass', () => {
+  it('uses 1.0 as the break-even threshold', () => {
+    expect(profitFactorToneClass(undefined)).toBe('text-slate-400')
+    expect(profitFactorToneClass(1)).toBe('text-slate-400')
+    expect(profitFactorToneClass(0.99)).toBe('text-rose-400')
+    expect(profitFactorToneClass(1.01)).toBe('text-emerald-400')
+    expect(profitFactorToneClass(Number.POSITIVE_INFINITY)).toBe('text-emerald-400')
   })
 })
 

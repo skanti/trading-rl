@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { formatRelative } from '~/utils/format'
+import type { DropdownMenuItem } from '@nuxt/ui'
 
 const route = useRoute()
 const { signOut, demoMode } = useAuth()
@@ -36,24 +37,53 @@ async function handleSignOut() {
   await signOut()
   await navigateTo('/login')
 }
+
+const dashboardMenu: DropdownMenuItem[][] = [[
+  {
+    label: 'Sign out',
+    icon: 'i-lucide-log-out',
+    color: 'error',
+    onSelect: () => void handleSignOut()
+  }
+]]
 </script>
 
 <template>
   <div class="min-h-screen min-w-0 overflow-x-clip bg-slate-950 text-slate-100">
     <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/85 backdrop-blur">
       <div class="mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-2 py-3 sm:px-4 md:flex md:gap-x-6">
-        <NuxtLink
-          to="/"
-          class="flex min-w-0 items-center gap-2"
-        >
-          <span class="flex size-7 items-center justify-center rounded-md bg-emerald-500/15">
-            <UIcon
-              name="i-lucide-trending-up"
-              class="size-4 text-emerald-400"
-            />
-          </span>
-          <span class="truncate text-sm font-semibold">{{ config.dashboardTitle }}</span>
-        </NuxtLink>
+        <div class="flex min-w-0 items-center gap-1">
+          <UDropdownMenu
+            :items="dashboardMenu"
+            :content="{ align: 'start' }"
+          >
+            <UButton
+              color="neutral"
+              variant="ghost"
+              size="sm"
+              aria-label="Open dashboard menu"
+              class="-ml-1 px-1"
+            >
+              <span class="flex size-7 items-center justify-center rounded-md bg-emerald-500/15">
+                <UIcon
+                  name="i-lucide-trending-up"
+                  class="size-4 text-emerald-400"
+                />
+              </span>
+              <UIcon
+                name="i-lucide-chevron-down"
+                class="size-3 text-muted"
+              />
+            </UButton>
+          </UDropdownMenu>
+
+          <NuxtLink
+            to="/"
+            class="truncate text-sm font-semibold"
+          >
+            {{ config.dashboardTitle }}
+          </NuxtLink>
+        </div>
 
         <nav class="col-span-2 row-start-2 flex min-w-0 items-center gap-1 md:col-auto md:row-auto">
           <NuxtLink
@@ -94,14 +124,6 @@ async function handleSignOut() {
             :loading="pending"
             aria-label="Refresh"
             @click="refresh()"
-          />
-          <UButton
-            icon="i-lucide-log-out"
-            color="neutral"
-            variant="ghost"
-            size="sm"
-            aria-label="Sign out"
-            @click="handleSignOut"
           />
         </div>
       </div>

@@ -170,7 +170,6 @@ function eventIcon(event: ScheduleEvent): string {
 
 <template>
   <UCard
-    variant="subtle"
     class="min-w-0"
   >
     <template #header>

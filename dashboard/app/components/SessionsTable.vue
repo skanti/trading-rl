@@ -50,7 +50,6 @@ const columns: TableColumn<SessionRecord>[] = [
 
 <template>
   <UCard
-    variant="subtle"
     class="min-w-0 max-w-full"
   >
     <template #header>

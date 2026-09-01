@@ -99,7 +99,6 @@ const accountRows = computed<AccountRow[]>(() => [
 
         <UCard
           title="Account"
-          variant="subtle"
         >
           <UTable
             :data="accountRows"

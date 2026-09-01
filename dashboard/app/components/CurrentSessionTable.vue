@@ -99,20 +99,16 @@ const rows = computed<SessionMetricRow[]>(() => [
 
 <template>
   <UCard
-    variant="subtle"
     class="min-w-0"
   >
     <template #header>
       <div class="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <p class="text-xs uppercase tracking-wide text-muted">
-            Current trading session
-          </p>
-          <h1 class="mt-0.5 text-base font-semibold text-highlighted">
-            {{ strategy.entry_date ? formatDay(strategy.entry_date) : 'Awaiting the next entry' }}
-          </h1>
-        </div>
-        <StatusBadge :status="strategy.status" />
+        <h1 class="text-sm font-semibold text-highlighted">
+          Current trading session
+        </h1>
+        <p class="numeric text-right text-sm text-muted">
+          {{ strategy.entry_date ? formatDay(strategy.entry_date) : 'Awaiting the next entry' }}
+        </p>
       </div>
     </template>
 

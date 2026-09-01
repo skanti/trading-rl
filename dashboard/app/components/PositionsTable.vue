@@ -67,7 +67,6 @@ const columns: TableColumn<Position>[] = [
 
 <template>
   <UCard
-    variant="subtle"
     class="min-w-0 max-w-full"
   >
     <template #header>

@@ -13,7 +13,7 @@ withDefaults(defineProps<{
 </script>
 
 <template>
-  <UCard variant="subtle">
+  <UCard>
     <div class="flex items-center gap-1.5 text-[0.6875rem] font-medium uppercase tracking-wide text-slate-400 sm:gap-2 sm:text-xs">
       <UIcon
         v-if="icon"

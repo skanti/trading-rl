@@ -147,7 +147,6 @@ function shortDay(day: string | null | undefined): string {
 
 <template>
   <UCard
-    variant="subtle"
     class="equity-chart relative select-none"
     @selectstart.prevent
   >

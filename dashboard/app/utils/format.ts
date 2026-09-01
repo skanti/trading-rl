@@ -76,6 +76,14 @@ export function toneClass(value: number | null | undefined): string {
   return (value as number) > 0 ? 'text-emerald-400' : 'text-rose-400'
 }
 
+/** Profit factor breaks even at 1.0 rather than zero. */
+export function profitFactorToneClass(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value) || value === 1) {
+    return 'text-slate-400'
+  }
+  return value > 1 ? 'text-emerald-400' : 'text-rose-400'
+}
+
 export function formatDay(day: string | null | undefined): string {
   if (!day) return '—'
   const parsed = new Date(`${day}T00:00:00`)
