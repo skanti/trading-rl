@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@iconify-json/lucide": "^1.2.111",
+    "@internationalized/date": "^3.12.3",
     "@nuxt/ui": "^4.8.2",
     "firebase": "^12.14.0",
     "nuxt": "^4.4.6",

@@ -13,7 +13,7 @@ withDefaults(defineProps<{
 </script>
 
 <template>
-  <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-3 sm:p-4">
+  <UCard variant="subtle">
     <div class="flex items-center gap-1.5 text-[0.6875rem] font-medium uppercase tracking-wide text-slate-400 sm:gap-2 sm:text-xs">
       <UIcon
         v-if="icon"
@@ -34,5 +34,5 @@ withDefaults(defineProps<{
     >
       {{ hint }}
     </p>
-  </div>
+  </UCard>
 </template>

@@ -70,6 +70,13 @@ class FakeAlpacaClient:
     def clock(self):
         return {"is_open": False, "next_open": "2026-08-25T09:30:00-04:00"}
 
+    def calendar(self, start, end):
+        return [
+            {"date": "2026-08-24", "open": "09:30", "close": "16:00"},
+            {"date": "2026-08-25", "open": "09:30", "close": "16:00"},
+            {"date": "2026-08-26", "open": "09:30", "close": "16:00"},
+        ]
+
 
 class MetricsTest(unittest.TestCase):
     def test_equity_series_is_sorted_and_deduplicated(self):
@@ -328,6 +335,10 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["equity_curve"][-1]["equity"], 109000.0)
         self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-08-25")
         self.assertEqual(snapshot["equity_curve"][-1]["profit_loss"], 100.0)
+        self.assertEqual(
+            snapshot["market"]["sessions"][1],
+            {"date": "2026-08-25", "open": "09:30", "close": "16:00"},
+        )
 
     def test_shared_trading_config_is_published_without_runtime_values(self):
         configuration = load_trading_configuration(

@@ -1,17 +1,21 @@
 <script setup lang="ts">
-import { formatCurrency, formatQuantity, formatSignedCurrency, formatSignedPercent, toneClass } from '~/utils/format'
+import {
+  formatCurrency,
+  formatQuantity,
+  formatSignedCurrency,
+  formatSignedPercent,
+  toneClass
+} from '~/utils/format'
 import type { BasketTotals, ClosedTrade } from '~/types/dashboard'
+import type { TableColumn } from '@nuxt/ui'
 
 const props = withDefaults(defineProps<{
   trades: ClosedTrade[]
   totals?: BasketTotals
-  dense?: boolean
 }>(), {
-  totals: undefined,
-  dense: false
+  totals: undefined
 })
 
-// Fall back to summing the rows when the publisher had no totals to write.
 const summary = computed(() => {
   if (props.totals && props.totals.pnl !== undefined) return props.totals
   const entry = props.trades.reduce((sum, trade) => sum + trade.entry_notional, 0)
@@ -19,124 +23,113 @@ const summary = computed(() => {
   const pnl = props.trades.reduce((sum, trade) => sum + trade.pnl, 0)
   return { entry_notional: entry, exit_notional: exitTotal, pnl, pnl_pct: entry ? pnl / entry : 0 }
 })
+
+const columns: TableColumn<ClosedTrade>[] = [
+  { accessorKey: 'symbol', header: 'Symbol' },
+  {
+    accessorKey: 'qty',
+    header: 'Qty',
+    meta: { class: { th: 'hidden text-right sm:table-cell', td: 'hidden text-right sm:table-cell' } }
+  },
+  {
+    accessorKey: 'entry_price',
+    header: 'Entry',
+    meta: { class: { th: 'hidden text-right sm:table-cell', td: 'hidden text-right sm:table-cell' } }
+  },
+  {
+    accessorKey: 'exit_price',
+    header: 'Exit',
+    meta: { class: { th: 'hidden text-right sm:table-cell', td: 'hidden text-right sm:table-cell' } }
+  },
+  {
+    accessorKey: 'pnl',
+    header: 'Gross P&L',
+    meta: { class: { th: 'text-right', td: 'text-right' } }
+  },
+  {
+    accessorKey: 'pnl_pct',
+    header: '%',
+    meta: { class: { th: 'text-right', td: 'text-right' } }
+  }
+]
 </script>
 
 <template>
-  <div class="scroll-x">
-    <table class="w-full table-fixed text-sm sm:min-w-[38rem] sm:table-auto">
-      <thead>
-        <tr class="text-xs uppercase tracking-wide text-slate-500">
-          <th class="w-[32%] px-3 py-2 text-left font-medium sm:w-auto sm:px-4">
-            Symbol
-          </th>
-          <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
-            Qty
-          </th>
-          <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
-            Entry
-          </th>
-          <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
-            Exit
-          </th>
-          <th class="px-2 py-2 text-right font-medium sm:px-4">
-            Gross P&amp;L
-          </th>
-          <th class="px-3 py-2 text-right font-medium sm:px-4">
-            %
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr
-          v-for="trade in trades"
-          :key="trade.symbol"
-          class="border-t border-slate-800/70"
+  <div class="min-w-0">
+    <UTable
+      :data="trades"
+      :columns="columns"
+    >
+      <template #symbol-cell="{ row }">
+        <span class="font-semibold text-highlighted">{{ row.original.symbol }}</span>
+      </template>
+      <template #qty-cell="{ row }">
+        <span class="numeric text-muted">{{ formatQuantity(row.original.qty) }}</span>
+      </template>
+      <template #entry_price-cell="{ row }">
+        <span class="numeric">{{ formatCurrency(row.original.entry_price) }}</span>
+      </template>
+      <template #exit_price-cell="{ row }">
+        <span class="numeric">{{ formatCurrency(row.original.exit_price) }}</span>
+      </template>
+      <template #pnl-cell="{ row }">
+        <span
+          class="numeric font-semibold"
+          :class="toneClass(row.original.pnl)"
         >
-          <td
-            :class="dense ? 'px-3 py-1.5 sm:px-4' : 'px-3 py-2.5 sm:px-4'"
-            class="font-semibold text-slate-100"
-          >
-            {{ trade.symbol }}
-          </td>
-          <td
-            class="numeric hidden px-4 text-right text-slate-400 sm:table-cell"
-            :class="dense ? 'py-1.5' : 'py-2.5'"
-          >
-            {{ formatQuantity(trade.qty) }}
-          </td>
-          <td
-            class="numeric hidden px-4 text-right text-slate-300 sm:table-cell"
-            :class="dense ? 'py-1.5' : 'py-2.5'"
-          >
-            {{ formatCurrency(trade.entry_price) }}
-          </td>
-          <td
-            class="numeric hidden px-4 text-right text-slate-300 sm:table-cell"
-            :class="dense ? 'py-1.5' : 'py-2.5'"
-          >
-            {{ formatCurrency(trade.exit_price) }}
-          </td>
-          <td
-            class="numeric px-2 text-right font-semibold sm:px-4"
-            :class="[toneClass(trade.pnl), dense ? 'py-1.5' : 'py-2.5']"
-          >
-            {{ formatSignedCurrency(trade.pnl) }}
-          </td>
-          <td
-            class="numeric px-3 text-right sm:px-4"
-            :class="[toneClass(trade.pnl), dense ? 'py-1.5' : 'py-2.5']"
-          >
-            {{ formatSignedPercent(trade.pnl_pct) }}
-          </td>
-        </tr>
-      </tbody>
-      <tfoot>
-        <tr class="border-t border-slate-700 sm:hidden">
-          <td class="px-3 py-2.5 font-semibold text-slate-200">
-            Total
-          </td>
-          <td
-            class="numeric px-2 py-2.5 text-right font-semibold"
-            :class="toneClass(summary.pnl ?? 0)"
-          >
-            {{ formatSignedCurrency(summary.pnl ?? 0) }}
-          </td>
-          <td
-            class="numeric px-3 py-2.5 text-right"
-            :class="toneClass(summary.pnl ?? 0)"
-          >
-            {{ formatSignedPercent(summary.pnl_pct ?? 0) }}
-          </td>
-        </tr>
-        <!-- Notional totals sit under the columns they belong to: deployed under
-             Entry, realised under Exit. -->
-        <tr class="hidden border-t border-slate-700 sm:table-row">
-          <td
-            class="px-4 py-2.5 font-semibold text-slate-200"
-            colspan="2"
-          >
-            Total
-          </td>
-          <td class="numeric px-4 py-2.5 text-right text-slate-400">
-            {{ formatCurrency(summary.entry_notional) }}
-          </td>
-          <td class="numeric px-4 py-2.5 text-right text-slate-400">
-            {{ formatCurrency(summary.exit_notional) }}
-          </td>
-          <td
-            class="numeric px-4 py-2.5 text-right font-semibold"
-            :class="toneClass(summary.pnl ?? 0)"
-          >
-            {{ formatSignedCurrency(summary.pnl ?? 0) }}
-          </td>
-          <td
-            class="numeric px-4 py-2.5 text-right"
-            :class="toneClass(summary.pnl ?? 0)"
-          >
-            {{ formatSignedPercent(summary.pnl_pct ?? 0) }}
-          </td>
-        </tr>
-      </tfoot>
-    </table>
+          {{ formatSignedCurrency(row.original.pnl) }}
+        </span>
+      </template>
+      <template #pnl_pct-cell="{ row }">
+        <span
+          class="numeric"
+          :class="toneClass(row.original.pnl)"
+        >
+          {{ formatSignedPercent(row.original.pnl_pct) }}
+        </span>
+      </template>
+    </UTable>
+
+    <USeparator />
+    <div class="grid grid-cols-2 gap-2 px-2 py-2 text-right text-xs sm:grid-cols-4">
+      <div>
+        <p class="text-muted">
+          Deployed
+        </p>
+        <p class="numeric mt-0.5 font-semibold text-highlighted">
+          {{ formatCurrency(summary.entry_notional) }}
+        </p>
+      </div>
+      <div>
+        <p class="text-muted">
+          Exit value
+        </p>
+        <p class="numeric mt-0.5 font-semibold text-highlighted">
+          {{ formatCurrency(summary.exit_notional) }}
+        </p>
+      </div>
+      <div>
+        <p class="text-muted">
+          Gross P&amp;L
+        </p>
+        <p
+          class="numeric mt-0.5 font-semibold"
+          :class="toneClass(summary.pnl)"
+        >
+          {{ formatSignedCurrency(summary.pnl) }}
+        </p>
+      </div>
+      <div>
+        <p class="text-muted">
+          Return
+        </p>
+        <p
+          class="numeric mt-0.5 font-semibold"
+          :class="toneClass(summary.pnl)"
+        >
+          {{ formatSignedPercent(summary.pnl_pct) }}
+        </p>
+      </div>
+    </div>
   </div>
 </template>

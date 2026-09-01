@@ -109,6 +109,13 @@ export interface MarketClock {
   next_open?: string
   next_close?: string
   timestamp?: string
+  sessions?: MarketSession[]
+}
+
+export interface MarketSession {
+  date: string
+  open: string
+  close: string
 }
 
 export interface TradingSchedule {

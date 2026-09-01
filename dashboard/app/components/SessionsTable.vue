@@ -1,170 +1,159 @@
 <script setup lang="ts">
-import { formatCurrency, formatDay, formatSignedCurrency, formatSignedPercent, toneClass } from '~/utils/format'
+import {
+  formatCurrency,
+  formatDay,
+  formatSignedCurrency,
+  formatSignedPercent,
+  toneClass
+} from '~/utils/format'
 import type { SessionRecord } from '~/types/dashboard'
+import type { TableColumn } from '@nuxt/ui'
 
 const props = defineProps<{ sessions: SessionRecord[] }>()
+const expanded = ref<Record<string, boolean>>({})
 
-const expanded = ref<string | null>(null)
-
-function toggle(day: string) {
-  expanded.value = expanded.value === day ? null : day
-}
-
-// A day the daemon never completed carries an error instead of a result.
 const traded = computed(() => props.sessions.filter(session => session.trades.length > 0))
 const realizedTotal = computed(() =>
   traded.value.reduce((sum, session) => sum + (session.realized_pnl ?? 0), 0)
 )
+
+const columns: TableColumn<SessionRecord>[] = [
+  { id: 'expand', header: '' },
+  { accessorKey: 'trading_day', header: 'Day' },
+  {
+    accessorKey: 'last_action',
+    header: 'Action',
+    meta: { class: { th: 'hidden sm:table-cell', td: 'hidden sm:table-cell' } }
+  },
+  {
+    accessorKey: 'symbols',
+    header: 'Symbols',
+    meta: { class: { th: 'hidden sm:table-cell', td: 'hidden sm:table-cell' } }
+  },
+  {
+    accessorKey: 'entry_notional',
+    header: 'Deployed',
+    meta: { class: { th: 'hidden text-right sm:table-cell', td: 'hidden text-right sm:table-cell' } }
+  },
+  {
+    accessorKey: 'realized_pnl',
+    header: 'Net P&L',
+    meta: { class: { th: 'text-right', td: 'text-right' } }
+  },
+  {
+    accessorKey: 'realized_return',
+    header: 'Return',
+    meta: { class: { th: 'text-right', td: 'text-right' } }
+  }
+]
 </script>
 
 <template>
-  <div class="min-w-0 max-w-full rounded-xl border border-slate-800 bg-slate-900/50">
-    <div class="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-800 px-4 py-3">
-      <div>
-        <h2 class="text-sm font-semibold text-white">
-          Session history
-        </h2>
-        <p class="text-xs text-slate-500">
-          One row per trading day recorded by the daemon
-        </p>
+  <UCard
+    variant="subtle"
+    class="min-w-0 max-w-full"
+    :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0' }"
+  >
+    <template #header>
+      <div class="flex flex-wrap items-baseline justify-between gap-2">
+        <div>
+          <h2 class="text-sm font-semibold text-highlighted">
+            Session history
+          </h2>
+          <p class="text-xs text-muted">
+            One row per trading day recorded by the daemon
+          </p>
+        </div>
+        <UBadge
+          v-if="traded.length"
+          color="neutral"
+          variant="subtle"
+          class="numeric"
+        >
+          {{ formatSignedCurrency(realizedTotal) }} · {{ traded.length }} sessions
+        </UBadge>
       </div>
-      <span
-        v-if="traded.length"
-        class="numeric text-xs"
-        :class="toneClass(realizedTotal)"
-      >
-        {{ formatSignedCurrency(realizedTotal) }} realized across {{ traded.length }} session{{ traded.length === 1 ? '' : 's' }}
-      </span>
-    </div>
+    </template>
 
-    <div
+    <UEmpty
       v-if="!sessions.length"
-      class="px-4 py-6 text-sm text-slate-500"
-    >
-      No sessions recorded yet. The daemon writes one summary per trading day.
-    </div>
+      icon="i-lucide-history"
+      title="No sessions recorded yet"
+      description="The daemon writes one summary per trading day."
+      class="py-8"
+    />
 
-    <div
+    <UTable
       v-else
-      class="scroll-x"
+      v-model:expanded="expanded"
+      :data="sessions"
+      :columns="columns"
+      :get-row-id="row => row.trading_day"
+      :ui="{ tr: 'data-[expanded=true]:bg-elevated/50' }"
     >
-      <table class="w-full table-fixed text-sm sm:min-w-[44rem] sm:table-auto">
-        <thead>
-          <tr class="text-xs uppercase tracking-wide text-slate-500">
-            <th class="w-[42%] px-3 py-2 text-left font-medium sm:w-auto sm:px-4">
-              Day
-            </th>
-            <th class="hidden px-4 py-2 text-left font-medium sm:table-cell">
-              Action
-            </th>
-            <th class="hidden px-4 py-2 text-left font-medium sm:table-cell">
-              Symbols
-            </th>
-            <th class="hidden px-4 py-2 text-right font-medium sm:table-cell">
-              Deployed
-            </th>
-            <th class="px-2 py-2 text-right font-medium sm:px-4">
-              Net P&amp;L
-            </th>
-            <th class="px-3 py-2 text-right font-medium sm:px-4">
-              Return
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          <template
-            v-for="session in sessions"
-            :key="session.trading_day"
+      <template #expand-cell="{ row }">
+        <UButton
+          v-if="row.original.trades.length"
+          color="neutral"
+          variant="ghost"
+          size="xs"
+          square
+          :icon="row.getIsExpanded() ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
+          :aria-label="row.getIsExpanded() ? 'Collapse session' : 'Expand session'"
+          @click="row.toggleExpanded()"
+        />
+      </template>
+      <template #trading_day-cell="{ row }">
+        <div>
+          <span class="numeric font-medium text-highlighted">
+            {{ formatDay(row.original.trading_day) }}
+          </span>
+          <p
+            v-if="row.original.error"
+            class="mt-0.5 line-clamp-1 text-xs text-error"
           >
-            <tr
-              class="cursor-pointer border-t border-slate-800/70 transition hover:bg-slate-800/40"
-              @click="toggle(session.trading_day)"
-            >
-              <td class="numeric px-3 py-2.5 font-medium text-slate-200 sm:px-4">
-                <span class="inline-flex items-center gap-1.5">
-                  <UIcon
-                    v-if="session.trades.length"
-                    :name="expanded === session.trading_day ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
-                    class="size-3.5 text-slate-500"
-                  />
-                  <span
-                    v-else
-                    class="inline-block size-3.5"
-                  />
-                  {{ formatDay(session.trading_day) }}
-                </span>
-              </td>
-              <td class="hidden px-4 py-2.5 sm:table-cell">
-                <UBadge
-                  :color="session.error ? 'error' : session.last_action === 'exit' ? 'primary' : 'neutral'"
-                  variant="subtle"
-                  size="sm"
-                >
-                  {{ session.error ? 'error' : session.last_action ?? '—' }}
-                </UBadge>
-              </td>
-              <td class="hidden px-4 py-2.5 text-slate-400 sm:table-cell">
-                <span
-                  v-if="session.symbols.length"
-                  class="line-clamp-1"
-                >
-                  {{ session.symbols.join(', ') }}
-                </span>
-                <span v-else>—</span>
-              </td>
-              <td class="numeric hidden px-4 py-2.5 text-right text-slate-300 sm:table-cell">
-                {{ session.entry_notional ? formatCurrency(session.entry_notional) : '—' }}
-              </td>
-              <td
-                class="numeric px-2 py-2.5 text-right font-semibold sm:px-4"
-                :class="toneClass(session.realized_pnl)"
-              >
-                {{ session.realized_pnl === null ? '—' : formatSignedCurrency(session.realized_pnl) }}
-              </td>
-              <td
-                class="numeric px-3 py-2.5 text-right sm:px-4"
-                :class="toneClass(session.realized_pnl)"
-              >
-                {{ session.realized_return === null ? '—' : formatSignedPercent(session.realized_return) }}
-              </td>
-            </tr>
-
-            <tr
-              v-if="expanded === session.trading_day"
-              class="border-t border-slate-800/70 bg-slate-950/60"
-            >
-              <td
-                colspan="6"
-                class="px-0 py-0"
-              >
-                <ClosedTradesTable
-                  v-if="session.trades.length"
-                  :trades="session.trades"
-                  dense
-                />
-                <p
-                  v-else
-                  class="px-4 py-3 text-xs text-slate-500"
-                >
-                  {{ session.error ?? 'No fills recorded for this session.' }}
-                </p>
-              </td>
-            </tr>
-
-            <tr
-              v-if="session.error && expanded !== session.trading_day"
-              class="border-0"
-            >
-              <td
-                colspan="6"
-                class="px-4 pb-2.5 text-xs text-rose-400/80"
-              >
-                <span class="line-clamp-1">{{ session.error }}</span>
-              </td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
-    </div>
-  </div>
+            {{ row.original.error }}
+          </p>
+        </div>
+      </template>
+      <template #last_action-cell="{ row }">
+        <UBadge
+          :color="row.original.error ? 'error' : row.original.last_action === 'exit' ? 'primary' : 'neutral'"
+          variant="subtle"
+          size="sm"
+        >
+          {{ row.original.error ? 'error' : row.original.last_action ?? '—' }}
+        </UBadge>
+      </template>
+      <template #symbols-cell="{ row }">
+        <span class="line-clamp-1 text-muted">
+          {{ row.original.symbols.length ? row.original.symbols.join(', ') : '—' }}
+        </span>
+      </template>
+      <template #entry_notional-cell="{ row }">
+        <span class="numeric">{{ row.original.entry_notional ? formatCurrency(row.original.entry_notional) : '—' }}</span>
+      </template>
+      <template #realized_pnl-cell="{ row }">
+        <span
+          class="numeric font-semibold"
+          :class="toneClass(row.original.realized_pnl)"
+        >
+          {{ row.original.realized_pnl === null ? '—' : formatSignedCurrency(row.original.realized_pnl) }}
+        </span>
+      </template>
+      <template #realized_return-cell="{ row }">
+        <span
+          class="numeric"
+          :class="toneClass(row.original.realized_pnl)"
+        >
+          {{ row.original.realized_return === null ? '—' : formatSignedPercent(row.original.realized_return) }}
+        </span>
+      </template>
+      <template #expanded="{ row }">
+        <ClosedTradesTable
+          :trades="row.original.trades"
+        />
+      </template>
+    </UTable>
+  </UCard>
 </template>

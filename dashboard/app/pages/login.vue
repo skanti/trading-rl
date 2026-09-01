@@ -47,72 +47,70 @@ async function submit() {
         </div>
       </div>
 
-      <form
-        class="space-y-4 rounded-xl border border-slate-800 bg-slate-900/50 p-5"
-        @submit.prevent="submit"
-      >
-        <div class="space-y-1.5">
-          <label
-            for="username"
-            class="text-xs font-medium text-slate-400"
-          >Username</label>
-          <UInput
-            id="username"
-            v-model="username"
-            autocomplete="username"
-            autocapitalize="none"
-            spellcheck="false"
-            placeholder="username"
+      <UCard variant="subtle">
+        <form
+          class="space-y-4"
+          @submit.prevent="submit"
+        >
+          <UFormField
+            label="Username"
+            name="username"
+          >
+            <UInput
+              id="username"
+              v-model="username"
+              autocomplete="username"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="username"
+              size="lg"
+              class="w-full"
+            />
+          </UFormField>
+
+          <UFormField
+            label="Password"
+            name="password"
+          >
+            <UInput
+              id="password"
+              v-model="password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="••••••••"
+              size="lg"
+              class="w-full"
+            />
+          </UFormField>
+
+          <UAlert
+            v-if="error"
+            color="error"
+            variant="subtle"
+            icon="i-lucide-triangle-alert"
+            title="Could not sign in"
+            :description="error"
+          />
+
+          <UButton
+            type="submit"
+            block
             size="lg"
-            class="w-full"
+            :loading="busy"
+            :disabled="!username || !password"
+          >
+            Sign in
+          </UButton>
+
+          <UAlert
+            v-if="demoMode"
+            color="warning"
+            variant="subtle"
+            title="Demo data"
+            description="Firebase is not configured. Any credentials will sign in."
           />
-        </div>
-
-        <div class="space-y-1.5">
-          <label
-            for="password"
-            class="text-xs font-medium text-slate-400"
-          >Password</label>
-          <UInput
-            id="password"
-            v-model="password"
-            type="password"
-            autocomplete="current-password"
-            placeholder="••••••••"
-            size="lg"
-            class="w-full"
-          />
-        </div>
-
-        <p
-          v-if="error"
-          class="flex items-start gap-1.5 text-sm text-rose-400"
-        >
-          <UIcon
-            name="i-lucide-triangle-alert"
-            class="mt-0.5 size-4 shrink-0"
-          />
-          {{ error }}
-        </p>
-
-        <UButton
-          type="submit"
-          block
-          size="lg"
-          :loading="busy"
-          :disabled="!username || !password"
-        >
-          Sign in
-        </UButton>
-
-        <p
-          v-if="demoMode"
-          class="text-xs text-amber-400/80"
-        >
-          Firebase is not configured, so the dashboard is serving demo data. Any
-          credentials will get you in.
-        </p>
-      </form>
+        </form>
+      </UCard>
     </div>
   </div>
 </template>

@@ -1,45 +1,44 @@
 <script setup lang="ts">
-import { formatCurrency, formatDay, formatPercent, formatSignedCurrency, formatSignedPercent, toneClass } from '~/utils/format'
+import { formatCurrency } from '~/utils/format'
+import type { TableColumn } from '@nuxt/ui'
 
 const { snapshot, sessions, pending, error, ensureLoaded } = useSnapshot()
 
 await ensureLoaded()
 
 const account = computed(() => snapshot.value?.account ?? {})
-const stats = computed(() => snapshot.value?.statistics)
 const inception = computed(() => snapshot.value?.performance?.inception)
 const curve = computed(() => snapshot.value?.equity_curve ?? [])
 const openPerformance = computed(() => {
   const positions = snapshot.value?.positions ?? []
   const pnl = positions.reduce((sum, position) => sum + (position.unrealized_pl ?? 0), 0)
-  const cost = positions.reduce((sum, position) => sum + (position.cost_basis ?? 0), 0)
-  return { pnl, pnlPct: cost > 0 ? pnl / cost : 0, cost, positions: positions.length }
+  return { pnl, positions: positions.length }
 })
-const displayedPerformance = computed(() => {
-  const published = snapshot.value?.performance
-  if (!published) return null
-
-  return {
-    ...published,
-    today: {
-      ...published.today,
-      label: 'Open positions',
-      start_day: snapshot.value?.strategy?.entry_date ?? published.today.start_day,
-      start_equity: openPerformance.value.cost,
-      end_equity: account.value.equity ?? openPerformance.value.cost + openPerformance.value.pnl,
-      pnl: openPerformance.value.pnl,
-      pnl_pct: openPerformance.value.pnlPct,
-      sessions: openPerformance.value.positions ? 1 : 0
-    }
-  }
-})
-const winLossLabel = computed(() => {
-  const wins = stats.value?.winning_sessions ?? 0
-  const losses = stats.value?.losing_sessions ?? 0
-  return `${wins} ${wins === 1 ? 'win' : 'wins'} / ${losses} ${losses === 1 ? 'loss' : 'losses'}`
-})
-
 const recentSessions = computed(() => sessions.value.slice(0, 8))
+
+interface AccountRow {
+  metric: string
+  value: string
+  emphasis?: boolean
+  muted?: boolean
+}
+
+const accountColumns: TableColumn<AccountRow>[] = [
+  { accessorKey: 'metric', header: 'Metric' },
+  {
+    accessorKey: 'value',
+    header: 'Value',
+    meta: { class: { th: 'text-right', td: 'text-right' } }
+  }
+]
+
+const accountRows = computed<AccountRow[]>(() => [
+  { metric: 'Equity', value: formatCurrency(account.value.equity), emphasis: true },
+  { metric: 'Cash', value: formatCurrency(account.value.cash) },
+  { metric: 'Long market value', value: formatCurrency(account.value.long_market_value) },
+  { metric: 'Buying power', value: formatCurrency(account.value.buying_power) },
+  { metric: 'Account', value: account.value.account_number ?? '—', muted: true }
+])
 </script>
 
 <template>
@@ -57,13 +56,8 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
       v-if="pending && !snapshot"
       class="space-y-5"
     >
-      <div class="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-4">
-        <USkeleton
-          v-for="index in 4"
-          :key="index"
-          class="h-24 rounded-xl"
-        />
-      </div>
+      <USkeleton class="h-64 rounded-xl" />
+      <USkeleton class="h-52 rounded-xl" />
       <USkeleton class="h-80 rounded-xl" />
     </div>
 
@@ -77,127 +71,54 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
     />
 
     <template v-else>
-      <div class="space-y-2">
-        <div>
-          <p class="text-xs uppercase tracking-wide text-slate-500">
-            Account equity
-          </p>
-          <p class="numeric text-3xl font-semibold text-white">
-            {{ formatCurrency(account.equity) }}
-          </p>
-        </div>
-        <StrategyPipeline
-          :strategy="snapshot.strategy"
-          :market="snapshot.market"
-          :schedule="snapshot.configuration?.schedule"
-        />
-      </div>
+      <CurrentSessionTable
+        :strategy="snapshot.strategy"
+        :positions="snapshot.positions ?? []"
+      />
 
-      <div class="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-4">
-        <StatTile
-          label="Open P&amp;L"
-          icon="i-lucide-activity"
-          :value="formatSignedCurrency(openPerformance.pnl)"
-          :tone="toneClass(openPerformance.pnl)"
-          :hint="formatSignedPercent(openPerformance.pnlPct)"
-        />
-        <StatTile
-          label="Realized since inception"
-          icon="i-lucide-trending-up"
-          :value="formatSignedCurrency(inception?.pnl)"
-          :tone="toneClass(inception?.pnl)"
-          :hint="`${formatSignedPercent(inception?.pnl_pct)} over ${stats?.sessions ?? 0} sessions`"
-        />
-        <StatTile
-          label="Max drawdown"
-          icon="i-lucide-trending-down"
-          :value="formatCurrency(stats?.max_drawdown)"
-          :tone="(stats?.max_drawdown ?? 0) > 0 ? 'text-rose-400' : 'text-slate-400'"
-          :hint="formatPercent(stats?.max_drawdown_pct)"
-        />
-        <StatTile
-          label="Win rate"
-          icon="i-lucide-target"
-          :value="formatPercent(stats?.win_rate, 1)"
-          :hint="winLossLabel"
-        />
-      </div>
+      <StrategyPipeline
+        :strategy="snapshot.strategy"
+        :market="snapshot.market"
+        :schedule="snapshot.configuration?.schedule"
+      />
 
       <EquityChart
         :points="curve"
         :baseline="inception?.start_equity"
-        :sessions="stats?.sessions"
+        :sessions="snapshot.statistics?.sessions"
         :open-pnl="openPerformance.pnl"
         :open-day="snapshot.trading_day"
         :open-positions="openPerformance.positions"
       />
 
       <div class="grid gap-5 lg:grid-cols-2">
-        <PerformanceTable :performance="displayedPerformance" />
+        <PerformanceTable
+          :points="curve"
+          :as-of="snapshot.trading_day"
+        />
 
-        <div class="rounded-xl border border-slate-800 bg-slate-900/50">
-          <div class="border-b border-slate-800 px-4 py-3">
-            <h2 class="text-sm font-semibold text-white">
-              Account
-            </h2>
-          </div>
-          <dl class="divide-y divide-slate-800/70 text-sm">
-            <div class="flex justify-between px-4 py-2.5">
-              <dt class="text-slate-400">
-                Cash
-              </dt>
-              <dd class="numeric text-slate-200">
-                {{ formatCurrency(account.cash) }}
-              </dd>
-            </div>
-            <div class="flex justify-between px-4 py-2.5">
-              <dt class="text-slate-400">
-                Long market value
-              </dt>
-              <dd class="numeric text-slate-200">
-                {{ formatCurrency(account.long_market_value) }}
-              </dd>
-            </div>
-            <div class="flex justify-between px-4 py-2.5">
-              <dt class="text-slate-400">
-                Buying power
-              </dt>
-              <dd class="numeric text-slate-200">
-                {{ formatCurrency(account.buying_power) }}
-              </dd>
-            </div>
-            <div class="flex justify-between px-4 py-2.5">
-              <dt class="text-slate-400">
-                Best session
-              </dt>
-              <dd
+        <UCard
+          title="Account"
+          variant="subtle"
+          :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0' }"
+        >
+          <UTable
+            :data="accountRows"
+            :columns="accountColumns"
+          >
+            <template #value-cell="{ row }">
+              <span
                 class="numeric"
-                :class="toneClass(stats?.best_day?.profit_loss)"
+                :class="{
+                  'font-semibold text-highlighted': row.original.emphasis,
+                  'text-muted': row.original.muted
+                }"
               >
-                {{ stats?.best_day ? `${formatSignedCurrency(stats.best_day.profit_loss)} · ${formatDay(stats.best_day.day)}` : '—' }}
-              </dd>
-            </div>
-            <div class="flex justify-between px-4 py-2.5">
-              <dt class="text-slate-400">
-                Worst session
-              </dt>
-              <dd
-                class="numeric"
-                :class="toneClass(stats?.worst_day?.profit_loss)"
-              >
-                {{ stats?.worst_day ? `${formatSignedCurrency(stats.worst_day.profit_loss)} · ${formatDay(stats.worst_day.day)}` : '—' }}
-              </dd>
-            </div>
-            <div class="flex justify-between px-4 py-2.5">
-              <dt class="text-slate-400">
-                Account
-              </dt>
-              <dd class="numeric text-slate-500">
-                {{ account.account_number ?? '—' }}
-              </dd>
-            </div>
-          </dl>
-        </div>
+                {{ row.original.value }}
+              </span>
+            </template>
+          </UTable>
+        </UCard>
       </div>
 
       <PositionsTable :positions="snapshot.positions ?? []" />

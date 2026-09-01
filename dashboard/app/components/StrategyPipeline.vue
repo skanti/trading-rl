@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import {
-  buildNaiveSchedule,
+  buildSessionTimeline,
   formatCountdown,
-  formatScheduleTime,
+  lastCompletedTimelineIndex,
+  formatScheduleDateTime,
   formatZonedNow,
   type ScheduleConfig,
   type ScheduleEvent
 } from '~/utils/schedule'
 import type { MarketClock, StrategyState, TradingSchedule } from '~/types/dashboard'
+import type { TimelineItem } from '@nuxt/ui'
 
 const props = defineProps<{
   strategy: StrategyState
@@ -31,73 +33,97 @@ onMounted(() => {
 })
 onBeforeUnmount(() => clearInterval(timer))
 
-const events = computed(() => buildNaiveSchedule(now.value, props.strategy, schedule.value))
-const nextEvent = computed(() => events.value[0] ?? null)
-
-const marketTarget = computed(() => {
-  const value = props.market.is_open ? props.market.next_close : props.market.next_open
-  if (!value) return null
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? null : parsed
+const timeline = computed(() => buildSessionTimeline(
+  now.value,
+  props.strategy,
+  schedule.value,
+  props.market
+))
+const timelineItems = computed<TimelineItem[]>(() => {
+  const events = timeline.value?.events ?? []
+  const nextIndex = events.findIndex(event => event.at > now.value)
+  return events.map((event, index) => {
+    const completed = event.at <= now.value
+    const next = index === nextIndex
+    return {
+      value: index + 1,
+      title: event.label,
+      date: formatScheduleDateTime(event.at, now.value, schedule.value.timeZone),
+      description: next ? formatCountdown(event.at, now.value) : undefined,
+      icon: completed ? 'i-lucide-check' : eventIcon(event),
+      ui: next
+        ? {
+            indicator: 'bg-info text-inverted',
+            description: 'numeric ms-auto shrink-0 whitespace-nowrap text-info text-xs/4 font-medium lg:ms-0 lg:mt-0.5'
+          }
+        : undefined
+    }
+  })
+})
+const timelineStep = computed(() => {
+  return lastCompletedTimelineIndex(timeline.value?.events ?? [], now.value)
 })
 
-const marketText = computed(() => {
-  const state = props.market.is_open ? 'Market open' : 'Market closed'
-  const target = marketTarget.value
-  if (!target) return state
-  const action = props.market.is_open ? 'closes' : 'opens'
-  return `${state} · ${action} at ${formatScheduleTime(target, now.value, schedule.value.timeZone)}`
-})
-
-function eventText(event: ScheduleEvent): string {
-  return `${event.label} · ${formatScheduleTime(event.at, now.value, schedule.value.timeZone)}`
-}
-
-function eventColor(event: ScheduleEvent): 'neutral' | 'info' | 'primary' | 'warning' {
+function eventIcon(event: ScheduleEvent): string {
   switch (event.key) {
-    case 'exit': return 'warning'
-    case 'rank': return 'info'
-    case 'entry': return 'primary'
-    default: return 'neutral'
+    case 'market_open': return 'i-lucide-sunrise'
+    case 'rank': return 'i-lucide-list-ordered'
+    case 'entry': return 'i-lucide-log-in'
+    case 'market_close': return 'i-lucide-sunset'
+    case 'exit': return 'i-lucide-log-out'
+    case 'next_open': return 'i-lucide-bell-ring'
   }
-}
-
-function countdownColor(event: ScheduleEvent): 'error' | 'info' | 'primary' | 'warning' | 'neutral' {
-  return event.at < now.value ? 'error' : eventColor(event)
 }
 </script>
 
 <template>
-  <div class="min-w-0 rounded-lg border border-slate-800 bg-slate-900/40 px-2.5 py-2">
-    <div class="flex min-w-0 items-center justify-between gap-3">
-      <StatusBadge
-        :status="strategy.status"
-        appearance="eyebrow"
+  <UCard
+    variant="subtle"
+    class="min-w-0"
+  >
+    <template #header>
+      <div class="flex min-w-0 items-start justify-between gap-3">
+        <div class="min-w-0">
+          <h2 class="text-sm font-semibold text-highlighted">
+            Trading schedule
+          </h2>
+        </div>
+        <span class="numeric shrink-0 text-xs text-muted">
+          NY · {{ formatZonedNow(now, schedule.timeZone) }}
+        </span>
+      </div>
+    </template>
+
+    <template v-if="timeline">
+      <UTimeline
+        :items="timelineItems"
+        :model-value="timelineStep"
+        size="xs"
+        class="lg:hidden"
+        :ui="{
+          root: 'gap-0',
+          item: 'gap-2',
+          container: 'gap-1',
+          wrapper: 'mt-0 flex items-baseline gap-2 pb-2',
+          date: 'shrink-0 text-xs/4',
+          title: 'shrink-0 text-xs/4'
+        }"
       />
-      <span class="numeric shrink-0 text-[0.6875rem] text-slate-500">
-        NY · {{ formatZonedNow(now, schedule.timeZone) }}
-      </span>
-    </div>
-
-    <div
-      v-if="nextEvent"
-      class="mt-1.5 flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1"
-    >
-      <p class="min-w-0 text-sm font-semibold text-slate-100">
-        {{ eventText(nextEvent) }}
-      </p>
-      <UBadge
-        :color="countdownColor(nextEvent)"
-        variant="subtle"
-        size="sm"
-        class="numeric shrink-0"
-      >
-        {{ formatCountdown(nextEvent.at, now) }}
-      </UBadge>
-    </div>
-
-    <p class="mt-1 text-xs text-slate-500">
-      {{ marketText }}
-    </p>
-  </div>
+      <UTimeline
+        :items="timelineItems"
+        :model-value="timelineStep"
+        orientation="horizontal"
+        size="xs"
+        class="hidden lg:flex"
+        :ui="{
+          root: 'gap-1',
+          item: 'gap-2',
+          container: 'gap-1',
+          wrapper: 'pe-2',
+          date: 'text-xs/4',
+          title: 'text-xs/4'
+        }"
+      />
+    </template>
+  </UCard>
 </template>

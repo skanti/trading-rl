@@ -20,21 +20,24 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
     </div>
 
     <template v-else-if="snapshot">
-      <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 class="text-sm font-semibold text-white">
-              Current basket
-            </h1>
-            <p class="text-xs text-slate-500">
-              The overnight-liquidity strategy holds an equal-notional basket from the
-              close until the next morning.
-            </p>
+      <UCard
+        variant="subtle"
+        :ui="{ header: 'p-2 sm:p-2', body: 'p-2 sm:p-2' }"
+      >
+        <template #header>
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 class="text-sm font-semibold text-highlighted">
+                Current basket
+              </h1>
+              <p class="text-xs text-muted">
+                Equal-notional positions held from the afternoon entry until the next session.
+              </p>
+            </div>
+            <StatusBadge :status="strategy?.status" />
           </div>
-          <StatusBadge :status="strategy?.status" />
-        </div>
-
-        <dl class="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+        </template>
+        <dl class="grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <dt class="text-xs uppercase tracking-wide text-slate-500">
               Entered
@@ -81,43 +84,38 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
           </div>
         </dl>
 
-        <div
+        <UAlert
           v-if="strategy?.remaining_symbols?.length"
-          class="mt-4"
-        >
-          <UAlert
-            color="warning"
-            variant="subtle"
-            icon="i-lucide-triangle-alert"
-            title="Positions remain after the exit attempt"
-            :description="strategy.remaining_symbols.join(', ')"
-          />
-        </div>
-      </div>
+          class="mt-2"
+          color="warning"
+          variant="subtle"
+          icon="i-lucide-triangle-alert"
+          title="Positions remain after the exit attempt"
+          :description="strategy.remaining_symbols.join(', ')"
+        />
+      </UCard>
 
       <PositionsTable :positions="snapshot.positions ?? []" />
 
-      <div class="rounded-xl border border-slate-800 bg-slate-900/50">
-        <div class="border-b border-slate-800 px-4 py-3">
-          <h2 class="text-sm font-semibold text-white">
-            Most recent closed basket
-          </h2>
-          <p class="text-xs text-slate-500">
-            Realized per symbol, before fees
-          </p>
-        </div>
+      <UCard
+        title="Most recent closed basket"
+        description="Realized per symbol, before fees"
+        variant="subtle"
+        :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0' }"
+      >
         <ClosedTradesTable
           v-if="closed.length"
           :trades="closed"
           :totals="snapshot.basket_totals"
         />
-        <p
+        <UEmpty
           v-else
-          class="px-4 py-6 text-sm text-slate-500"
-        >
-          Nothing closed yet.
-        </p>
-      </div>
+          icon="i-lucide-history"
+          title="Nothing closed yet"
+          description="The first completed basket will appear here."
+          class="py-8"
+        />
+      </UCard>
     </template>
   </div>
 </template>

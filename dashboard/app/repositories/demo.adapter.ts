@@ -147,7 +147,15 @@ function buildSnapshot(): Snapshot {
     },
     closed_basket: [],
     basket_totals: {},
-    market: { is_open: false, next_open: `${last.day}T13:30:00Z` },
+    market: {
+      is_open: false,
+      next_open: `${last.day}T13:30:00Z`,
+      sessions: curve.slice(-8).map(point => ({
+        date: point.day,
+        open: '09:30',
+        close: '16:00'
+      }))
+    },
     meta: { trading_url: 'demo', paper: true }
   }
 }

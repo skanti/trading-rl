@@ -1,4 +1,4 @@
-import type { StrategyState } from '~/types/dashboard'
+import type { MarketClock, MarketSession, StrategyState } from '~/types/dashboard'
 
 export interface ScheduleConfig {
   timeZone: string
@@ -8,9 +8,19 @@ export interface ScheduleConfig {
 }
 
 export interface ScheduleEvent {
-  key: 'rank' | 'entry' | 'exit'
+  key: 'market_open' | 'rank' | 'entry' | 'market_close' | 'exit' | 'next_open'
   label: string
   at: Date
+}
+
+export interface SessionTimeline {
+  events: ScheduleEvent[]
+  progress: number
+  nextEvent: ScheduleEvent | null
+  phase: string
+  context: string
+  entryDate: string
+  exitDate: string
 }
 
 interface ZonedParts {
@@ -80,6 +90,168 @@ function nextWeekday(day: string, includeCurrent = false): string {
   return candidate
 }
 
+function isActiveStrategy(strategy: Pick<StrategyState, 'status'>): boolean {
+  return Boolean(
+    strategy.status
+    && strategy.status !== 'closed'
+    && strategy.status !== 'entry_failed'
+  )
+}
+
+function validSessions(sessions: MarketSession[]): MarketSession[] {
+  const unique = new Map<string, MarketSession>()
+  for (const session of sessions) {
+    if (
+      /^\d{4}-\d{2}-\d{2}$/.test(session.date)
+      && /^\d{1,2}:\d{2}$/.test(session.open)
+      && /^\d{1,2}:\d{2}$/.test(session.close)
+    ) {
+      unique.set(session.date, session)
+    }
+  }
+  return [...unique.values()].sort((left, right) => left.date.localeCompare(right.date))
+}
+
+function sessionCanEnter(session: MarketSession, config: ScheduleConfig): boolean {
+  const [openHour, openMinute] = clockParts(session.open)
+  const [closeHour, closeMinute] = clockParts(session.close)
+  const [rankHour, rankMinute] = clockParts(config.rankingTime)
+  const [entryHour, entryMinute] = clockParts(config.entryTime)
+  const open = openHour * 60 + openMinute
+  const close = closeHour * 60 + closeMinute
+  const rank = rankHour * 60 + rankMinute
+  const entry = entryHour * 60 + entryMinute
+  return rank >= open && rank < entry && entry < close
+}
+
+function stagedProgress(events: ScheduleEvent[], now: Date): number {
+  if (events.length < 2 || now <= events[0]!.at) return 0
+  if (now >= events[events.length - 1]!.at) return 100
+  const nextIndex = events.findIndex(event => event.at > now)
+  const previous = events[nextIndex - 1]!
+  const next = events[nextIndex]!
+  const duration = Math.max(1, next.at.getTime() - previous.at.getTime())
+  const withinStage = (now.getTime() - previous.at.getTime()) / duration
+  return ((nextIndex - 1 + withinStage) / (events.length - 1)) * 100
+}
+
+function nonTradingContext(
+  now: Date,
+  sessions: MarketSession[],
+  selected: MarketSession,
+  config: ScheduleConfig,
+  active: boolean
+): string {
+  const local = zonedParts(now, config.timeZone)
+  const today = isoDay(local)
+  const todaySession = sessions.find(session => session.date === today)
+  const hold = active ? ' · position held' : ''
+  if (!todaySession) {
+    return `${WEEKDAYS.has(local.weekday) ? 'Market holiday' : 'Weekend'}${hold}`
+  }
+  if (!active && !sessionCanEnter(todaySession, config) && selected.date !== today) {
+    return `Early close today at ${todaySession.close} · entry cycle skipped`
+  }
+  const open = zonedDateTime(today, todaySession.open, config.timeZone)
+  const close = zonedDateTime(today, todaySession.close, config.timeZone)
+  if (now < open) return `Pre-market${hold}`
+  if (now >= close) return `After hours${hold}`
+  return active ? 'Regular session · position held' : 'Regular session'
+}
+
+/**
+ * Build the complete overnight cycle from the exchange's real session calendar.
+ * Early closes that cannot fit ranking and entry are skipped. The progress bar
+ * gives every operational stage equal space, then interpolates by wall time inside
+ * the current stage so ranking and entry remain visible beside the overnight hold.
+ */
+export function buildSessionTimeline(
+  now: Date,
+  strategy: Pick<StrategyState, 'status' | 'entry_date' | 'exit_date'>,
+  config: ScheduleConfig,
+  market: Pick<MarketClock, 'sessions'>
+): SessionTimeline | null {
+  const sessions = validSessions(market.sessions ?? [])
+  if (sessions.length < 2) return null
+
+  const active = isActiveStrategy(strategy)
+  let entryIndex = active && strategy.entry_date
+    ? sessions.findIndex(session => session.date === strategy.entry_date)
+    : -1
+
+  if (entryIndex < 0) {
+    entryIndex = sessions.findIndex((session, index) => (
+      index + 1 < sessions.length
+      && sessionCanEnter(session, config)
+      && now < zonedDateTime(session.date, config.entryTime, config.timeZone)
+    ))
+  }
+  if (entryIndex < 0 || entryIndex + 1 >= sessions.length) return null
+
+  const entrySession = sessions[entryIndex]!
+  const configuredExit = strategy.exit_date
+    ? sessions.find(session => session.date === strategy.exit_date)
+    : undefined
+  const exitSession = active && configuredExit
+    ? configuredExit
+    : sessions[entryIndex + 1]!
+
+  const events: ScheduleEvent[] = [
+    {
+      key: 'market_open',
+      label: 'Market opens',
+      at: zonedDateTime(entrySession.date, entrySession.open, config.timeZone)
+    },
+    {
+      key: 'rank',
+      label: 'Rank stocks',
+      at: zonedDateTime(entrySession.date, config.rankingTime, config.timeZone)
+    },
+    {
+      key: 'entry',
+      label: 'Open position',
+      at: zonedDateTime(entrySession.date, config.entryTime, config.timeZone)
+    },
+    {
+      key: 'market_close',
+      label: 'Market closes',
+      at: zonedDateTime(entrySession.date, entrySession.close, config.timeZone)
+    },
+    {
+      key: 'exit',
+      label: 'Exit orders',
+      at: zonedDateTime(exitSession.date, config.exitTime, config.timeZone)
+    },
+    {
+      key: 'next_open',
+      label: 'Next market open',
+      at: zonedDateTime(exitSession.date, exitSession.open, config.timeZone)
+    }
+  ]
+  events.sort((left, right) => left.at.getTime() - right.at.getTime())
+
+  const nextEvent = events.find(event => event.at > now) ?? null
+  const previousEvent = [...events].reverse().find(event => event.at <= now)
+  let phase = 'Waiting for the next trading session'
+  if (!nextEvent) phase = 'Cycle complete'
+  else if (previousEvent?.key === 'market_close') phase = 'Holding overnight'
+  else if (previousEvent?.key === 'exit') phase = 'Exit window · awaiting market open'
+  else if (previousEvent?.key === 'next_open') phase = 'Market open · waiting to exit'
+  else if (previousEvent?.key === 'entry') phase = 'Position open'
+  else if (previousEvent?.key === 'rank') phase = 'Ranking window passed · waiting to enter'
+  else if (previousEvent?.key === 'market_open') phase = 'Market open · waiting to rank'
+
+  return {
+    events,
+    progress: stagedProgress(events, now),
+    nextEvent,
+    phase,
+    context: nonTradingContext(now, sessions, entrySession, config, active),
+    entryDate: entrySession.date,
+    exitDate: exitSession.date
+  }
+}
+
 /** Convert a wall-clock time in an IANA zone to a real timestamp without a date library. */
 export function zonedDateTime(day: string, clock: string, timeZone: string): Date {
   const [year, month, date] = day.split('-').map(Number)
@@ -126,7 +298,7 @@ export function buildNaiveSchedule(
   config: ScheduleConfig
 ): ScheduleEvent[] {
   const events: ScheduleEvent[] = []
-  const active = strategy.status && strategy.status !== 'closed' && strategy.status !== 'entry_failed'
+  const active = isActiveStrategy(strategy)
   if (active && strategy.exit_date) {
     events.push({
       key: 'exit',
@@ -161,6 +333,15 @@ export function buildNaiveSchedule(
   return events.sort((left, right) => left.at.getTime() - right.at.getTime()).slice(0, 3)
 }
 
+/** UTimeline uses a zero-based active index; point at the last reached event. */
+export function lastCompletedTimelineIndex(
+  events: Array<Pick<ScheduleEvent, 'at'>>,
+  now: Date
+): number | undefined {
+  const completed = events.filter(event => event.at <= now).length
+  return completed > 0 ? completed - 1 : undefined
+}
+
 export function formatCountdown(target: Date, now: Date): string {
   const totalMinutes = Math.round((target.getTime() - now.getTime()) / 60_000)
   if (Math.abs(totalMinutes) < 1) return 'now'
@@ -185,6 +366,26 @@ export function formatScheduleTime(target: Date, now: Date, timeZone: string): s
     hour: 'numeric',
     minute: '2-digit'
   }).format(target)
+}
+
+export function formatScheduleDateTime(target: Date, now: Date, timeZone: string): string {
+  const targetParts = zonedParts(target, timeZone)
+  const today = isoDay(zonedParts(now, timeZone))
+  const targetDay = isoDay(targetParts)
+  const dateLabel = targetDay === today
+    ? 'Today'
+    : new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric'
+      }).format(target)
+  const clock = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: 'numeric',
+    minute: '2-digit'
+  }).format(target)
+  return `${dateLabel} · ${clock}`
 }
 
 export function formatZonedNow(now: Date, timeZone: string): string {

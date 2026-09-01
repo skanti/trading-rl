@@ -146,8 +146,9 @@ function shortDay(day: string | null | undefined): string {
 </script>
 
 <template>
-  <div
-    class="equity-chart relative select-none rounded-xl border border-slate-800 bg-slate-900/50 p-3 sm:p-4"
+  <UCard
+    variant="subtle"
+    class="equity-chart relative select-none"
     @selectstart.prevent
   >
     <div
@@ -322,7 +323,7 @@ function shortDay(day: string | null | undefined): string {
         </svg>
       </div>
     </template>
-  </div>
+  </UCard>
 </template>
 
 <style scoped>

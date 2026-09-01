@@ -17,7 +17,7 @@ import os
 import re
 import sys
 import time as time_module
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
@@ -36,7 +36,7 @@ from dashboard_metrics import EASTERN
 
 LOGGER = logging.getLogger("dashboard-daemon")
 
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 4
 SESSIONS_SUBCOLLECTION = "sessions"
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_WORK_DIRS = {
@@ -231,6 +231,15 @@ class AlpacaClient:
 
     def clock(self) -> dict[str, Any]:
         return dict(self._get("clock"))
+
+    def calendar(self, start: date, end: date) -> list[dict[str, Any]]:
+        return list(
+            self._get(
+                "calendar",
+                start=start.isoformat(),
+                end=end.isoformat(),
+            )
+        )
 
 
 def _numeric(mapping: Mapping[str, Any], fields: Sequence[str]) -> dict[str, Any]:
@@ -481,17 +490,33 @@ def build_snapshot(
 
     account = client.account()
     positions = client.positions()
+    market: dict[str, Any] = {}
     try:
         clock = client.clock()
-        market = {
+        market.update({
             "is_open": bool(clock.get("is_open")),
             "next_open": clock.get("next_open"),
             "next_close": clock.get("next_close"),
             "timestamp": clock.get("timestamp")
-        }
+        })
     except Exception:  # noqa: BLE001 - the clock is decoration, not data
         LOGGER.warning("could not read the market clock; publishing without it")
-        market = {}
+    try:
+        calendar = client.calendar(
+            reference.date() - timedelta(days=7),
+            reference.date() + timedelta(days=14),
+        )
+        market["sessions"] = [
+            {
+                "date": str(session["date"]),
+                "open": str(session["open"]),
+                "close": str(session["close"]),
+            }
+            for session in calendar
+            if session.get("date") and session.get("open") and session.get("close")
+        ]
+    except Exception:  # noqa: BLE001 - the calendar is dashboard decoration
+        LOGGER.warning("could not read the market calendar; publishing without it")
 
     period = performance.history_period(inception or account.get("created_at"), reference)
     history = client.portfolio_history(period=period, timeframe="1D")
