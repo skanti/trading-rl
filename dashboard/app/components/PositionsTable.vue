@@ -69,7 +69,6 @@ const columns: TableColumn<Position>[] = [
   <UCard
     variant="subtle"
     class="min-w-0 max-w-full"
-    :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0', footer: 'p-2 sm:p-2' }"
   >
     <template #header>
       <div class="flex flex-wrap items-baseline justify-between gap-2">

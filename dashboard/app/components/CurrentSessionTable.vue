@@ -101,7 +101,6 @@ const rows = computed<SessionMetricRow[]>(() => [
   <UCard
     variant="subtle"
     class="min-w-0"
-    :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0' }"
   >
     <template #header>
       <div class="flex flex-wrap items-center justify-between gap-2">

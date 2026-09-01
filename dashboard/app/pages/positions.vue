@@ -22,7 +22,6 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
     <template v-else-if="snapshot">
       <UCard
         variant="subtle"
-        :ui="{ header: 'p-2 sm:p-2', body: 'p-2 sm:p-2' }"
       >
         <template #header>
           <div class="flex flex-wrap items-center justify-between gap-3">
@@ -101,7 +100,6 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
         title="Most recent closed basket"
         description="Realized per symbol, before fees"
         variant="subtle"
-        :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0' }"
       >
         <ClosedTradesTable
           v-if="closed.length"

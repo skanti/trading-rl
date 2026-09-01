@@ -209,7 +209,6 @@ const rows = computed<PerformanceRow[]>(() => [
   <UCard
     variant="subtle"
     class="min-w-0 max-w-full"
-    :ui="{ header: 'p-2 sm:p-2', body: 'p-0 sm:p-0' }"
   >
     <template #header>
       <div>
