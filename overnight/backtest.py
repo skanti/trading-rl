@@ -1876,7 +1876,7 @@ def main() -> None:
         default=_parse_clock("15:15"),
         help="causal cutoff for same-day Alpaca activity rankings",
     )
-    parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:55"))
+    parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:45"))
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:30"))
     parser.add_argument(
         "--exit-price-source",

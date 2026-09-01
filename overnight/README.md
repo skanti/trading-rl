@@ -5,7 +5,7 @@
 1. Read each stock's completed daily dollar volume as split-adjusted daily
    `VWAP * volume` (falling back to the daily close when VWAP is unavailable).
 2. Smooth `log1p(dollar_volume)` with a causal EMA.
-3. Before each 15:55 entry, rank using the EMA state through the previous
+3. Before each 15:45 entry, rank using the EMA state through the previous
    session only. The current session never contributes to its own rank.
 4. Equal-weight the selected stocks, then close them in the next session's
    opening auction.
@@ -60,7 +60,6 @@ python backtest.py \
   --top 10 \
   --months 12 \
   --ranking-time 15:15 \
-  --entry-time 15:55 \
   --exit-time 09:35 \
   --liquidity-scheme compare \
   --transaction-cost-bps 1
@@ -94,7 +93,6 @@ python backtest.py \
   --top 10 \
   --months 12 \
   --ranking-time 15:15 \
-  --entry-time 15:55 \
   --exit-time 09:35 \
   --transaction-cost-bps 1
 ```
@@ -113,7 +111,7 @@ restore the unfiltered legacy universe. The downloaded security master is
 cached for seven days at
 `/tmp/trading/baseline_cache/nasdaq_security_master.json`.
 
-Entry prices must have a print within 10 minutes of 15:55. A selected stock is
+Entry prices must have a print within 10 minutes of the entry time. A selected stock is
 never removed using knowledge of whether it trades the following morning. If
 no fresh print exists at the exit time, the backtest uses the latest causal mark
 up to 24 hours old and reports its staleness in both the trade CSV and summary.
@@ -225,12 +223,17 @@ python backtest.py \
   --months 24 \
   --budget 10000 \
   --share-mode fractional \
-  --entry-time 15:59 \
   --transaction-cost-bps 1
 ```
 
-There is no 15:59 auction. The entry therefore remains the 15:59 SIP minute-bar
+There is no auction at the entry time, so the entry remains the SIP minute-bar
 open. Substituting the 16:00 closing auction would model a different entry time.
+
+`--entry-time` defaults to 15:45 rather than the close. The selected basket
+drifts about 3.5 bps upward between 15:45 and 15:59 (t=2.66 over 500 sessions),
+so a later entry pays more for the same names; 15:40 and 15:45 form a plateau and
+both beat 15:59 in each half of the window separately. `experiments.py` records
+the measurement.
 
 `--exchange-filter` defaults to `nasdaq`, matching live execution, and removes
 non-Nasdaq candidates before ranking. The top basket is then reranked from the
@@ -305,7 +308,7 @@ python backtest.py \
 
 `live.py` applies the same causal liquidity idea to an
 Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-10
-basket at 15:55, and submits its exit at 08:00 on the next trading session.
+basket at 15:45, and submits its exit at 08:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
 weekends and exchange holidays instead of attempting scheduled actions.
 Before ranking, it refreshes every symbol already present in the broad
@@ -378,7 +381,6 @@ export ALPACA_DATA_SECRET="..."
 python live.py run \
   --top 10 \
   --ranking-time 14:00 \
-  --entry-time 15:55 \
   --entry-preflight-seconds 10 \
   --order-submit-workers 8 \
   --exit-time 08:00 \
@@ -440,7 +442,6 @@ cannot replace or suppress the live daemon's scheduled ranking:
 ```bash
 python live.py preview \
   --top 10 \
-  --entry-time 15:59 \
   --exit-time 08:00 \
   --capital-fraction 0.95
 ```

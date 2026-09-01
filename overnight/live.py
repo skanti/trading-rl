@@ -2537,7 +2537,14 @@ def build_parser() -> argparse.ArgumentParser:
         "action", choices=("run", "preview", "rank", "enter", "exit", "status")
     )
     parser.add_argument("--top", type=int, default=10)
-    parser.add_argument("--entry-time", type=parse_clock, default=parse_clock("15:55"))
+    parser.add_argument(
+        "--entry-time",
+        type=parse_clock,
+        default=parse_clock("15:45"),
+        help="ET time to open the basket. The selected names drift about 3.5 bps "
+        "upward between 15:45 and 15:59 (t=2.66 over 500 sessions), so a later "
+        "entry pays more for the same basket; see experiments.py",
+    )
     parser.add_argument(
         "--exit-time",
         type=parse_clock,
