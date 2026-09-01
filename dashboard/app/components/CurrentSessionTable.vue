@@ -103,8 +103,13 @@ const rows = computed<SessionMetricRow[]>(() => [
   >
     <template #header>
       <div class="flex flex-wrap items-center justify-between gap-2">
-        <h1 class="text-sm font-semibold text-highlighted">
-          Current trading session
+        <h1 class="flex items-center gap-2 text-sm font-semibold text-highlighted">
+          <UIcon
+            name="i-lucide-circle"
+            class="size-2 fill-success text-success"
+            aria-hidden="true"
+          />
+          Active Session
         </h1>
         <p class="numeric text-right text-sm text-muted">
           {{ strategy.entry_date ? formatDay(strategy.entry_date) : 'Awaiting the next entry' }}

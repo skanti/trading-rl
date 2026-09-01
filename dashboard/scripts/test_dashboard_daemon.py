@@ -201,7 +201,36 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].equity, 100000.0)
 
-    def test_realized_equity_prefers_flat_account_exit_equity(self):
+    def test_realized_equity_can_display_but_not_score_provisional_session(self):
+        sessions = [
+            {
+                "trading_day": "2026-08-31",
+                "entry_date": "2026-08-31",
+                "exit_date": "2026-09-01",
+                "status": "closed",
+                "fee_status": "pending",
+                "realized_pnl": 12.5,
+            }
+        ]
+
+        confirmed = metrics.realized_equity_series(
+            sessions,
+            base_value=10000.0,
+            inception=date(2026, 8, 31),
+        )
+        displayed = metrics.realized_equity_series(
+            sessions,
+            base_value=10000.0,
+            inception=date(2026, 8, 31),
+            include_provisional=True,
+        )
+
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[-1].equity, 10000.0)
+        self.assertEqual(displayed[-1].day, date(2026, 9, 1))
+        self.assertEqual(displayed[-1].equity, 10012.5)
+
+    def test_realized_equity_uses_fee_adjusted_strategy_pnl_not_account_equity(self):
         result = metrics.realized_equity_series(
             [
                 {
@@ -217,8 +246,8 @@ class MetricsTest(unittest.TestCase):
             inception=date(2026, 8, 27),
         )
 
-        self.assertEqual(result[-1].equity, 10002.40)
-        self.assertAlmostEqual(result[-1].profit_loss, 1.53)
+        self.assertAlmostEqual(result[-1].equity, 10002.5787)
+        self.assertAlmostEqual(result[-1].profit_loss, 1.7087)
 
     def test_closed_basket_totals(self):
         trades = metrics.closed_basket(
@@ -299,6 +328,7 @@ class SnapshotTest(unittest.TestCase):
                     "entry_equity": 108900.0,
                     "exit_equity": 109000.0,
                     "realized_pnl": 100.0,
+                    "trades": [{"symbol": "NVDA"}],
                 }
             ],
         )
@@ -335,10 +365,38 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["equity_curve"][-1]["equity"], 109000.0)
         self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-08-25")
         self.assertEqual(snapshot["equity_curve"][-1]["profit_loss"], 100.0)
+        self.assertEqual(snapshot["equity_curve"][-1]["trades"], 1)
         self.assertEqual(
             snapshot["market"]["sessions"][1],
             {"date": "2026-08-25", "open": "09:30", "close": "16:00"},
         )
+
+    def test_snapshot_displays_provisional_point_but_excludes_it_from_statistics(self):
+        snapshot = build_snapshot(
+            FakeAlpacaClient(),
+            {},
+            inception=date(2026, 8, 31),
+            now=datetime(2026, 9, 1, 10, 15, tzinfo=metrics.EASTERN),
+            session_history=[
+                {
+                    "trading_day": "2026-08-31",
+                    "entry_date": "2026-08-31",
+                    "exit_date": "2026-09-01",
+                    "entry_equity": 108900.0,
+                    "status": "closed",
+                    "fee_status": "pending",
+                    "realized_pnl": 12.5,
+                    "trades": [{"symbol": str(index)} for index in range(12)],
+                }
+            ],
+        )
+
+        self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-09-01")
+        self.assertEqual(snapshot["equity_curve"][-1]["equity"], 108912.5)
+        self.assertTrue(snapshot["equity_curve"][-1]["provisional"])
+        self.assertEqual(snapshot["equity_curve"][-1]["trades"], 12)
+        self.assertEqual(snapshot["statistics"]["sessions"], 0)
+        self.assertEqual(snapshot["performance"]["inception"]["sessions"], 0)
 
     def test_shared_trading_config_is_published_without_runtime_values(self):
         configuration = load_trading_configuration(
@@ -511,7 +569,19 @@ class ArtifactTest(unittest.TestCase):
                     )
                 )
 
-            records = session_records(root, order_history=order_history)
+            records = session_records(
+                root,
+                order_history=order_history,
+                fee_activities=[
+                    {
+                        "activity_type": "FEE",
+                        "activity_sub_type": "REG",
+                        "date": "2026-08-26",
+                        "net_amount": "-0.50",
+                    }
+                ],
+                fees_as_of=datetime(2026, 8, 27, tzinfo=timezone.utc),
+            )
 
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["trading_day"], "2026-08-25")
@@ -519,6 +589,10 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(records[0]["gross_realized_pnl"], 102.0)
         self.assertEqual(records[0]["realized_pnl"], 101.5)
         self.assertEqual(records[0]["realized_return"], 0.1015)
+        self.assertEqual(records[0]["fee_status"], "confirmed")
+        self.assertEqual(records[0]["fee_cost"], 0.5)
+        self.assertEqual(records[0]["account_equity_change"], 101.5)
+        self.assertEqual(records[0]["unexplained_residual"], 0.0)
 
     def test_closed_entry_artifact_wins_over_weekend_error_copy(self):
         entry_date = "2026-08-28"
@@ -561,13 +635,35 @@ class ArtifactTest(unittest.TestCase):
                     json.dumps({"trading_day": day, **artifact})
                 )
 
-            records = session_records(root)
+            records = session_records(
+                root,
+                fee_activities=[
+                    {
+                        "activity_type": "FEE",
+                        "activity_sub_type": "REG",
+                        "date": exit_date,
+                        "net_amount": "-0.23",
+                    }
+                ],
+                fees_as_of=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            )
+            cached_records = session_records(root, fee_activities=None)
+            empty_refresh_records = session_records(
+                root,
+                fee_activities=[],
+                fees_as_of=datetime(2026, 9, 3, tzinfo=timezone.utc),
+            )
 
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["trading_day"], entry_date)
         self.assertEqual(records[0]["status"], "closed")
         self.assertEqual(records[0]["exit_date"], exit_date)
-        self.assertEqual(records[0]["realized_pnl"], -10.5)
+        self.assertEqual(records[0]["gross_realized_pnl"], -10.5)
+        self.assertEqual(records[0]["fee_cost"], 0.23)
+        self.assertEqual(records[0]["realized_pnl"], -10.73)
+        self.assertAlmostEqual(records[0]["unexplained_residual"], 0.23)
+        self.assertEqual(cached_records[0]["realized_pnl"], -10.73)
+        self.assertEqual(empty_refresh_records[0]["realized_pnl"], -10.73)
         self.assertIsNone(records[0]["error"])
 
         curve = metrics.realized_equity_series(
@@ -576,7 +672,62 @@ class ArtifactTest(unittest.TestCase):
             inception=date(2026, 8, 28),
         )
         self.assertEqual(curve[-1].day, date(2026, 8, 31))
-        self.assertEqual(curve[-1].equity, 9991.90)
+        self.assertEqual(curve[-1].equity, 9991.67)
+
+    def test_newly_closed_session_waits_for_fee_activities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "2026-08-28"
+            folder.mkdir()
+            (folder / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "trading_day": "2026-08-28",
+                        "position": {
+                            "status": "closed",
+                            "entry_date": "2026-08-28",
+                            "exit_date": "2026-08-31",
+                            "entry_orders": {"NVDA": order(10, 100.0)},
+                            "exit_orders": {"NVDA": order(10, 101.0)},
+                        },
+                    }
+                )
+            )
+            # A reconciliation run from the old implementation could mark an
+            # empty, next-day fee response complete. The dashboard must downgrade
+            # that stale cache back to pending during the posting grace period.
+            (folder / "fee_activities.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "activity_date": "2026-08-31",
+                        "count": 0,
+                        "net_amount": 0.0,
+                        "cost": 0.0,
+                        "breakdown": {},
+                        "activities": [],
+                    }
+                )
+            )
+
+            pending = session_records(
+                root,
+                fee_activities=[],
+                fees_as_of=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            )[0]
+            confirmed_zero = session_records(
+                root,
+                fee_activities=[],
+                fees_as_of=datetime(2026, 9, 2, 16, tzinfo=timezone.utc),
+            )[0]
+
+        self.assertEqual(pending["fee_status"], "pending")
+        self.assertIsNone(pending["fee_cost"])
+        self.assertEqual(pending["realized_pnl"], 10.0)
+        self.assertEqual(pending["realized_return"], 0.01)
+        self.assertEqual(confirmed_zero["fee_status"], "confirmed")
+        self.assertEqual(confirmed_zero["fee_cost"], 0.0)
+        self.assertEqual(confirmed_zero["realized_pnl"], 10.0)
 
 
 class SafetyTest(unittest.TestCase):
@@ -650,6 +801,24 @@ class SafetyTest(unittest.TestCase):
         ):
             with mock.patch.object(dashboard_daemon.time_module, "sleep"):
                 self.assertEqual(client.account(), {"status": "ACTIVE"})
+
+    def test_account_activities_are_paginated(self):
+        client = AlpacaClient("key", "secret")
+        first = [
+            {"id": "1", "activity_type": "FEE"},
+            {"id": "2", "activity_type": "FEE"},
+        ]
+        with mock.patch.object(client, "_get", side_effect=[first, []]) as get:
+            activities = client.account_activities(
+                "fee",
+                after=date(2026, 8, 1),
+                until=date(2026, 9, 1),
+                page_size=2,
+            )
+
+        self.assertEqual(activities, first)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[1].kwargs["page_token"], "2")
 
     def test_missing_service_account_fails_fast(self):
         config = OmegaConf.create(

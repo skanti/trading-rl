@@ -16,11 +16,12 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time as time_module
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from omegaconf import DictConfig, OmegaConf
 import requests
@@ -34,9 +35,17 @@ from dashboard_config import (
 )
 from dashboard_metrics import EASTERN
 
+OVERNIGHT_DIR = Path(__file__).resolve().parents[2] / "overnight"
+if str(OVERNIGHT_DIR) not in sys.path:
+    sys.path.insert(0, str(OVERNIGHT_DIR))
+from broker_fees import (  # noqa: E402
+    classify_broker_fee_summary,
+    summarize_broker_fees,
+)
+
 LOGGER = logging.getLogger("dashboard-daemon")
 
-SNAPSHOT_VERSION = 4
+SNAPSHOT_VERSION = 5
 SESSIONS_SUBCOLLECTION = "sessions"
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_WORK_DIRS = {
@@ -229,6 +238,45 @@ class AlpacaClient:
             )
         )
 
+    def account_activities(
+        self,
+        activity_type: str,
+        *,
+        after: date | datetime | None = None,
+        until: date | datetime | None = None,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return every account activity of one type in chronological order."""
+        if page_size < 1 or page_size > 100:
+            raise ValueError("account activity page_size must be between 1 and 100")
+        output: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, object] = {
+                "direction": "asc",
+                "page_size": int(page_size),
+            }
+            if after is not None:
+                params["after"] = after.isoformat()
+            if until is not None:
+                params["until"] = until.isoformat()
+            if page_token:
+                params["page_token"] = page_token
+            page = list(
+                self._get(
+                    f"account/activities/{quote(activity_type.upper(), safe='')}",
+                    **params,
+                )
+            )
+            output.extend(dict(row) for row in page)
+            if len(page) < page_size:
+                break
+            next_token = page[-1].get("id") if page else None
+            if not next_token or str(next_token) == page_token:
+                raise ValueError("Alpaca account activity pagination did not advance")
+            page_token = str(next_token)
+        return output
+
     def clock(self) -> dict[str, Any]:
         return dict(self._get("clock"))
 
@@ -370,12 +418,96 @@ def first_trade_date(work_dir: Path) -> date | None:
     return None
 
 
+def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    """Durably replace a JSON cache without exposing a partial file to readers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(dict(payload), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _cached_fee_summary(
+    path: Path,
+    exit_day: date,
+    as_of: datetime,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("activity_date") != exit_day.isoformat():
+        return None
+    try:
+        float(payload["cost"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return classify_broker_fee_summary(payload, exit_day, as_of=as_of)
+
+
+def _session_fee_summary(
+    work_dir: Path,
+    entry_day: str,
+    exit_day: date,
+    fee_activities: Sequence[Mapping[str, object]] | None,
+    as_of: datetime,
+) -> tuple[str, dict[str, object] | None]:
+    """Resolve confirmed fees, retaining a cache while Alpaca posts new rows."""
+    cache_path = work_dir / entry_day / "fee_activities.json"
+    cached = _cached_fee_summary(cache_path, exit_day, as_of)
+    if fee_activities is None:
+        if cached is None:
+            return "unavailable", None
+        status = "confirmed" if cached.get("status") == "complete" else "pending"
+        return status, cached
+
+    fresh = summarize_broker_fees(fee_activities, exit_day, fetched_at=as_of)
+    has_fees = int(fresh.get("count") or 0) > 0
+    if cached is not None and int(cached.get("count") or 0) > 0 and not has_fees:
+        # A confirmed non-zero cache is safer than an unexpectedly empty account
+        # response (for example, a transient broker inconsistency or wrong account).
+        return "confirmed", cached
+    status = "confirmed" if fresh.get("status") == "complete" else "pending"
+    stable_fields = (
+        "status",
+        "count",
+        "net_amount",
+        "cost",
+        "breakdown",
+        "activities",
+    )
+    if cached is not None and all(
+        cached.get(field) == fresh.get(field) for field in stable_fields
+    ):
+        return status, cached
+    _atomic_json(cache_path, fresh)
+    return status, fresh
+
+
 def session_records(
     work_dir: Path,
     limit: int | None = 120,
     order_history: Sequence[Mapping[str, Any]] | None = None,
+    fee_activities: Sequence[Mapping[str, object]] | None = None,
+    fees_as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Turn per-day ``summary.json`` artifacts into dashboard session rows."""
+    """Turn artifacts into rows whose net P&L uses confirmed Alpaca fees."""
     if not work_dir.exists():
         return []
 
@@ -431,12 +563,48 @@ def session_records(
         gross_realized_return = (
             totals.get("pnl_pct") if totals else execution.get("realized_return_before_fees")
         )
-        if entry_equity > 0.0 and exit_equity > 0.0:
-            realized_pnl = exit_equity - entry_equity
-            realized_return = realized_pnl / entry_equity
+        account_equity_change = (
+            exit_equity - entry_equity
+            if entry_equity > 0.0 and exit_equity > 0.0
+            else None
+        )
+        fee_status = "not_applicable"
+        fee_summary: dict[str, object] | None = None
+        if position.get("status") == "closed" and exit_date:
+            try:
+                fee_status, fee_summary = _session_fee_summary(
+                    work_dir,
+                    entry_date,
+                    date.fromisoformat(exit_date),
+                    fee_activities,
+                    fees_as_of or datetime.now(tz=UTC),
+                )
+            except (OSError, TypeError, ValueError) as error:
+                LOGGER.warning("could not resolve broker fees for %s: %s", entry_date, error)
+                fee_status = "unavailable"
+
+        fee_cost = (
+            performance._float(fee_summary.get("cost"))
+            if fee_status == "confirmed" and fee_summary is not None
+            else None
+        )
+        assumed_fee_cost = (
+            fee_cost
+            if fee_status == "confirmed"
+            else 0.0 if fee_status in {"pending", "unavailable"} else None
+        )
+        if gross_realized_pnl is not None and assumed_fee_cost is not None:
+            realized_pnl = performance._float(gross_realized_pnl) - assumed_fee_cost
+            denominator = entry_equity if entry_equity > 0.0 else entry_notional
+            realized_return = realized_pnl / denominator if denominator > 0.0 else None
         else:
-            realized_pnl = gross_realized_pnl
-            realized_return = gross_realized_return
+            realized_pnl = None
+            realized_return = None
+        unexplained_residual = (
+            account_equity_change - realized_pnl
+            if account_equity_change is not None and realized_pnl is not None
+            else None
+        )
         record = {
             "trading_day": entry_date,
             "last_action": summary.get("last_action"),
@@ -451,8 +619,20 @@ def session_records(
             "exit_notional": exit_notional,
             "gross_realized_pnl": gross_realized_pnl,
             "gross_realized_return": gross_realized_return,
+            "fee_status": fee_status,
+            "fee_cost": fee_cost,
+            "fee_activity_count": (
+                int(fee_summary.get("count") or 0) if fee_summary is not None else None
+            ),
+            "fee_breakdown": (
+                dict(fee_summary.get("breakdown") or {})
+                if fee_summary is not None
+                else {}
+            ),
             "realized_pnl": realized_pnl,
             "realized_return": realized_return,
+            "account_equity_change": account_equity_change,
+            "unexplained_residual": unexplained_residual,
             "trades": [trade.as_dict() for trade in trades],
             "error": summary.get("error")
         }
@@ -532,15 +712,39 @@ def build_snapshot(
             series_start = None
 
     account_series = performance.equity_series(history, since=series_start)
-    series = performance.realized_equity_series(
+    confirmed_series = performance.realized_equity_series(
         session_history or [],
         base_value=performance.strategy_inception_equity(
             session_history or [], history, account_series
         ),
         inception=inception,
     )
-    buckets = performance.realized_performance_table(series, now=reference)
-    stats = performance.statistics(series, baseline_is_first=True)
+    series = performance.realized_equity_series(
+        session_history or [],
+        base_value=performance.strategy_inception_equity(
+            session_history or [], history, account_series
+        ),
+        inception=inception,
+        include_provisional=True,
+    )
+    provisional_days = {
+        str(session.get("exit_date") or session.get("trading_day"))
+        for session in session_history or []
+        if session.get("status") == "closed"
+        and session.get("realized_pnl") is not None
+        and session.get("fee_status") in {"pending", "unavailable"}
+    }
+    trades_by_day: dict[str, int] = {}
+    for session in session_history or []:
+        if session.get("status") != "closed" or session.get("realized_pnl") is None:
+            continue
+        exit_day = str(session.get("exit_date") or session.get("trading_day") or "")
+        if exit_day:
+            trades_by_day[exit_day] = trades_by_day.get(exit_day, 0) + len(
+                session.get("trades") or []
+            )
+    buckets = performance.realized_performance_table(confirmed_series, now=reference)
+    stats = performance.statistics(confirmed_series, baseline_is_first=True)
 
     position = state.get("position") or {}
     closed = performance.closed_basket(position) if position else []
@@ -571,7 +775,9 @@ def build_snapshot(
                 "day": point.day.isoformat(),
                 "equity": point.equity,
                 "profit_loss": point.profit_loss,
-                "profit_loss_pct": point.profit_loss_pct
+                "profit_loss_pct": point.profit_loss_pct,
+                "provisional": point.day.isoformat() in provisional_days,
+                "trades": trades_by_day.get(point.day.isoformat(), 0),
             }
             for point in series
         ],
@@ -782,6 +988,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     client = AlpacaClient(key, secret, trading_url)
 
     def publish_once() -> None:
+        reference = datetime.now(tz=UTC)
         state = load_state(state_path)
         configuration = load_trading_configuration(
             trading_config_path,
@@ -794,16 +1001,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 order_history = client.orders(after=f"{inception.isoformat()}T00:00:00Z")
             except Exception:  # noqa: BLE001 - fall back to durable artifact summaries
                 LOGGER.warning("could not load order history; using artifact session totals")
+        fee_activities = None
+        if inception is not None:
+            try:
+                fee_activities = client.account_activities(
+                    "FEE",
+                    after=inception - timedelta(days=1),
+                    until=reference.date() + timedelta(days=1),
+                )
+                LOGGER.info(
+                    "loaded %d Alpaca fee activit%s",
+                    len(fee_activities),
+                    "y" if len(fee_activities) == 1 else "ies",
+                )
+            except Exception:  # noqa: BLE001 - confirmed per-session caches remain usable
+                LOGGER.warning("could not load broker fees; using confirmed fee caches")
         all_sessions = session_records(
             work_dir,
             limit=None,
             order_history=order_history,
+            fee_activities=fee_activities,
+            fees_as_of=reference,
         )
         sessions = all_sessions[:args.sessions_limit]
         snapshot = build_snapshot(
             client,
             state,
             inception=inception,
+            now=reference,
             order_history=order_history,
             session_history=all_sessions,
             configuration=configuration,

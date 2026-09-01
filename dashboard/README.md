@@ -25,12 +25,15 @@ copies of the same audit summary are collapsed into that one record. `firestore.
 allows authenticated reads and no browser writes at all — the publisher writes through
 the Admin SDK, which bypasses rules.
 
-The chart is dated by basket exit day. When the account is flat, its solid endpoint uses
-the Alpaca equity snapshot captured at exit, including fees and settlement rounding;
-older artifacts fall back to closed-basket fill arithmetic. Open baskets affect the
-separately displayed provisional equity but do not enter the realized curve until their
-exits complete. This keeps the chart consistent with Session History and independent of
-Alpaca's delayed daily portfolio-history rollover.
+The chart is dated by basket exit day and compounds strategy net P&L: closed-basket fill
+P&L less confirmed Alpaca `FEE` account activities booked on the exit date. The daemon
+caches those activities beside the live summary. Newly closed sessions appear
+immediately as provisional, using gross fill P&L with zero fees assumed. Their final
+chart segment is dashed, and they remain excluded from performance statistics until
+fees post, normally the next day. Confirmed results then subtract the actual fees.
+Account-equity change remains a separate reconciliation value, with any difference
+shown as the unexplained residual. This keeps strategy performance independent of
+deposits, settlement rounding, and Alpaca's delayed portfolio-history rollover.
 
 The publisher reads the credential-free schedule, strategy, data, and execution
 sections from the live runner's `effective_config.json` on every poll, falling back to

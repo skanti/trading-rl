@@ -3,10 +3,10 @@ import { performanceWindow, periodMetrics } from '~/utils/performance'
 import type { EquityPoint } from '~/types/dashboard'
 
 const curve: EquityPoint[] = [
-  { day: '2025-12-31', equity: 100, profit_loss: 0, profit_loss_pct: 0 },
-  { day: '2026-01-02', equity: 110, profit_loss: 10, profit_loss_pct: 0.10 },
-  { day: '2026-01-05', equity: 99, profit_loss: -1, profit_loss_pct: -0.01 },
-  { day: '2026-01-06', equity: 118.8, profit_loss: 18.8, profit_loss_pct: 0.188 }
+  { day: '2025-12-31', equity: 100, profit_loss: 0, profit_loss_pct: 0, trades: 0 },
+  { day: '2026-01-02', equity: 110, profit_loss: 10, profit_loss_pct: 0.10, trades: 10 },
+  { day: '2026-01-05', equity: 99, profit_loss: -1, profit_loss_pct: -0.01, trades: 11 },
+  { day: '2026-01-06', equity: 118.8, profit_loss: 18.8, profit_loss_pct: 0.188, trades: 12 }
 ]
 
 describe('performanceWindow', () => {
@@ -28,6 +28,7 @@ describe('periodMetrics', () => {
     const metrics = periodMetrics(curve, { start: '2026-01-05', end: '2026-01-07' })
 
     expect(metrics.sessions).toBe(2)
+    expect(metrics.trades).toBe(23)
     expect(metrics.startEquity).toBe(110)
     expect(metrics.endEquity).toBe(118.8)
     expect(metrics.pnl).toBeCloseTo(8.8)
@@ -52,5 +53,27 @@ describe('periodMetrics', () => {
     expect(metrics.pnl).toBe(0)
     expect(metrics.sharpe).toBeNull()
     expect(metrics.winRate).toBeNull()
+  })
+
+  it('excludes provisional points from performance statistics', () => {
+    const metrics = periodMetrics(
+      [
+        ...curve,
+        {
+          day: '2026-01-07',
+          equity: 130,
+          profit_loss: 30,
+          profit_loss_pct: 0.30,
+          provisional: true,
+          trades: 100
+        }
+      ],
+      { start: null, end: '2026-01-07' }
+    )
+
+    expect(metrics.sessions).toBe(3)
+    expect(metrics.trades).toBe(33)
+    expect(metrics.endEquity).toBe(118.8)
+    expect(metrics.pnl).toBeCloseTo(18.8)
   })
 })

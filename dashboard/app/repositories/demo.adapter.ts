@@ -31,7 +31,8 @@ function buildCurve(sessions: number): EquityPoint[] {
         day: day.toISOString().slice(0, 10),
         equity: Math.round(equity * 100) / 100,
         profit_loss: Math.round((equity - previous) * 100) / 100,
-        profit_loss_pct: (equity - previous) / previous
+        profit_loss_pct: (equity - previous) / previous,
+        trades: 12
       })
       previous = equity
     }
@@ -182,8 +183,14 @@ function buildSessions(snapshot: Snapshot): SessionRecord[] {
         exit_notional: 38000 + point.profit_loss,
         gross_realized_pnl: point.profit_loss,
         gross_realized_return: point.profit_loss_pct,
+        fee_status: 'confirmed',
+        fee_cost: 0,
+        fee_activity_count: 0,
+        fee_breakdown: {},
         realized_pnl: point.profit_loss,
         realized_return: point.profit_loss_pct,
+        account_equity_change: point.profit_loss,
+        unexplained_residual: 0,
         trades: chosen.map((symbol, position) => {
           const entry = 100 + position * 37.5
           const pnl = perSymbol

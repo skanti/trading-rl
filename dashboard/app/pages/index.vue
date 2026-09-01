@@ -9,6 +9,7 @@ await ensureLoaded()
 const account = computed(() => snapshot.value?.account ?? {})
 const inception = computed(() => snapshot.value?.performance?.inception)
 const curve = computed(() => snapshot.value?.equity_curve ?? [])
+const confirmedCurve = computed(() => curve.value.filter(point => !point.provisional))
 const openPerformance = computed(() => {
   const positions = snapshot.value?.positions ?? []
   const pnl = positions.reduce((sum, position) => sum + (position.unrealized_pl ?? 0), 0)
@@ -72,6 +73,7 @@ const accountRows = computed<AccountRow[]>(() => [
 
     <template v-else>
       <CurrentSessionTable
+        v-if="snapshot.positions?.length"
         :strategy="snapshot.strategy"
         :positions="snapshot.positions ?? []"
       />
@@ -93,7 +95,7 @@ const accountRows = computed<AccountRow[]>(() => [
 
       <div class="grid gap-5 lg:grid-cols-2">
         <PerformanceTable
-          :points="curve"
+          :points="confirmedCurve"
           :as-of="snapshot.trading_day"
         />
 

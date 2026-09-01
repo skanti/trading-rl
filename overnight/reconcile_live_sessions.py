@@ -33,6 +33,7 @@ from backtest import (
     _official_opening_auctions,
     _security_symbol,
 )
+from broker_fees import classify_broker_fee_summary, summarize_broker_fees
 from live import AlpacaClient, completed_liquidity_ranking, load_credentials
 from price_utils import forward_fill_positions
 
@@ -150,79 +151,6 @@ def effective_broker_runtime(work_dir: Path) -> tuple[str, float]:
     except (KeyError, OSError, TypeError, ValueError) as error:
         raise ValueError(f"cannot read broker endpoint from {path}: {error}") from error
     return trading_url, timeout
-
-
-def _safe_fee_activity(activity: Mapping[str, object]) -> dict[str, object]:
-    output: dict[str, object] = {}
-    for field in (
-        "activity_type",
-        "activity_sub_type",
-        "activity_subtype",
-        "date",
-        "net_amount",
-        "symbol",
-        "qty",
-        "per_share_amount",
-        "order_id",
-    ):
-        if activity.get(field) is not None:
-            output[field] = activity[field]
-    description = activity.get("description")
-    if description:
-        output["description"] = re.sub(
-            r"\s+by\s+\S+\s*$", "", str(description), flags=re.IGNORECASE
-        )
-    return output
-
-
-def summarize_broker_fees(
-    activities: Sequence[Mapping[str, object]],
-    exit_day: date,
-    *,
-    fetched_at: datetime | None = None,
-) -> dict[str, object]:
-    """Summarize account-level fee activities booked for the exit trade date."""
-    selected: list[dict[str, object]] = []
-    for activity in activities:
-        activity_type = str(activity.get("activity_type") or "").upper()
-        activity_day = str(activity.get("date") or "")[:10]
-        if activity_type != "FEE" or activity_day != exit_day.isoformat():
-            continue
-        safe = _safe_fee_activity(activity)
-        _number(safe.get("net_amount"), "broker fee net amount")
-        selected.append(safe)
-
-    net_amount = sum(
-        _number(activity["net_amount"], "broker fee net amount")
-        for activity in selected
-    )
-    breakdown: dict[str, dict[str, float | int]] = {}
-    for activity in selected:
-        subtype = str(
-            activity.get("activity_sub_type")
-            or activity.get("activity_subtype")
-            or "UNSPECIFIED"
-        ).upper()
-        item = breakdown.setdefault(subtype, {"count": 0, "net_amount": 0.0})
-        item["count"] = int(item["count"]) + 1
-        item["net_amount"] = float(item["net_amount"]) + _number(
-            activity["net_amount"], "broker fee net amount"
-        )
-    for item in breakdown.values():
-        item["cost"] = -float(item["net_amount"])
-
-    return {
-        "status": "complete",
-        "source": "alpaca_account_activities",
-        "scope": "all account FEE activities whose activity date equals the exit date",
-        "activity_date": exit_day.isoformat(),
-        "fetched_at": (fetched_at or datetime.now(tz=UTC)).isoformat(),
-        "count": len(selected),
-        "net_amount": net_amount,
-        "cost": -net_amount,
-        "breakdown": breakdown,
-        "activities": selected,
-    }
 
 
 def attach_broker_fees(
@@ -653,17 +581,18 @@ def broker_fees_for_session(
     exit_day: date,
     *,
     unavailable_reason: str | None = None,
+    as_of: datetime | None = None,
 ) -> tuple[dict[str, object], str | None]:
     cached: dict[str, object] | None = None
     if cache_path.exists():
         try:
             payload = json.loads(cache_path.read_text())
-            if (
-                isinstance(payload, dict)
-                and payload.get("activity_date") == exit_day.isoformat()
-                and payload.get("status") == "complete"
-            ):
-                cached = payload
+            if isinstance(payload, dict) and payload.get(
+                "activity_date"
+            ) == exit_day.isoformat():
+                cached = classify_broker_fee_summary(
+                    payload, exit_day, as_of=as_of
+                )
         except (OSError, TypeError, ValueError):
             cached = None
 
@@ -682,13 +611,18 @@ def broker_fees_for_session(
         activities = client.account_activities(
             "FEE", after=query_after, until=query_until
         )
-        summary = summarize_broker_fees(activities, exit_day)
+        summary = summarize_broker_fees(activities, exit_day, fetched_at=as_of)
         summary["query"] = {
             "after": query_after.isoformat(),
             "until": query_until.isoformat(),
         }
         _atomic_json(cache_path, summary)
-        return summary, None
+        warning = (
+            "broker fees have not posted yet; reconciliation remains provisional"
+            if summary.get("status") == "pending"
+            else None
+        )
+        return summary, warning
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         if cached is not None:
             return cached, f"broker fee refresh failed; using cache: {error}"

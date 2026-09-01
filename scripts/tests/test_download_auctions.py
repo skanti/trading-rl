@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -29,6 +30,32 @@ def auction_row(symbol: str, date: str, price: object) -> dict[str, object]:
 
 
 class AuctionUpdateTests(unittest.TestCase):
+    def test_default_end_uses_the_new_york_calendar_date(self):
+        self.assertEqual(
+            download_auctions.default_end(
+                datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
+            ),
+            "2026-09-01",
+        )
+
+    def test_current_day_query_is_clamped_behind_delayed_sip(self):
+        query_end, current_day = download_auctions.auction_query_end(
+            "2026-09-01",
+            now=datetime(2026, 9, 1, 14, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(current_day)
+        self.assertEqual(query_end, "2026-09-01T13:52:00Z")
+
+    def test_historical_query_end_is_unchanged(self):
+        query_end, current_day = download_auctions.auction_query_end(
+            "2026-08-31",
+            now=datetime(2026, 9, 1, 14, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(current_day)
+        self.assertEqual(query_end, "2026-08-31")
+
     def test_symbols_file_normalizes_legacy_ids_and_ignores_comments(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "symbols.txt"

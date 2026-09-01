@@ -7,15 +7,16 @@ from pathlib import Path
 import numpy as np
 
 from backtest import BAR_ORIGIN, EASTERN
+from broker_fees import summarize_broker_fees
 from reconcile_live_sessions import (
     attach_broker_fees,
+    broker_fees_for_session,
     execution_context,
     format_usd,
     infer_entry_minute,
     pnl_comparison_context,
     reconcile_execution,
     replay_ranking,
-    summarize_broker_fees,
 )
 
 
@@ -174,6 +175,36 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             totals["actual_minus_simulator_net_bps"], 2.87 / 1005 * 10_000
         )
         self.assertAlmostEqual(totals["broker_minus_fee_adjusted_fill_pnl"], -0.02)
+
+    def test_empty_fee_response_is_cached_as_pending_during_grace_period(self):
+        class Client:
+            def account_activities(self, *_args, **_kwargs):
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "fee_activities.json"
+            summary, warning = broker_fees_for_session(
+                Client(),
+                cache,
+                date(2026, 9, 1),
+                as_of=datetime(2026, 9, 1, 15, 0, tzinfo=UTC),
+            )
+            persisted = json.loads(cache.read_text())
+
+        self.assertEqual(summary["status"], "pending")
+        self.assertEqual(persisted["status"], "pending")
+        self.assertEqual(summary["count"], 0)
+        self.assertIn("remains provisional", str(warning))
+
+    def test_empty_fee_response_confirms_after_grace_period(self):
+        summary = summarize_broker_fees(
+            [],
+            date(2026, 9, 1),
+            fetched_at=datetime(2026, 9, 3, 15, 0, tzinfo=UTC),
+        )
+
+        self.assertEqual(summary["status"], "complete")
+        self.assertEqual(summary["cost"], 0.0)
 
     def test_entry_time_prefers_archived_configuration(self):
         summary = {

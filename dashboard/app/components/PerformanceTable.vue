@@ -144,6 +144,18 @@ const rows = computed<PerformanceRow[]>(() => [
     tone: toneClass(metrics.value.pnl)
   },
   {
+    label: 'Sessions',
+    value: metrics.value.sessions.toLocaleString(),
+    detail: 'Confirmed baskets',
+    tone: 'text-slate-200'
+  },
+  {
+    label: 'Trades',
+    value: metrics.value.trades.toLocaleString(),
+    detail: 'Completed symbol round trips',
+    tone: 'text-slate-200'
+  },
+  {
     label: 'Annualized return',
     value: formatSignedPercent(metrics.value.annualizedReturn),
     detail: `${metrics.value.sessions} closed session${metrics.value.sessions === 1 ? '' : 's'}`,
@@ -217,7 +229,7 @@ const rows = computed<PerformanceRow[]>(() => [
             Realized performance
           </h2>
           <p class="mt-0.5 text-xs text-muted">
-            {{ formatDay(window.start ?? firstDay) }}–{{ formatDay(window.end) }} · closed baskets only
+            {{ formatDay(window.start ?? firstDay) }}–{{ formatDay(window.end) }} · confirmed baskets only
           </p>
         </div>
 
@@ -273,7 +285,7 @@ const rows = computed<PerformanceRow[]>(() => [
       v-if="!points.length"
       icon="i-lucide-chart-no-axes-combined"
       title="No realized performance yet"
-      description="Closed-session equity will appear after the first basket exits."
+      description="Performance appears after the first closed basket's fees are confirmed."
       class="py-8"
     />
 
@@ -283,8 +295,8 @@ const rows = computed<PerformanceRow[]>(() => [
         color="neutral"
         variant="subtle"
         icon="i-lucide-info"
-        title="No baskets closed in this period"
-        description="Risk metrics require at least two closed sessions."
+        title="No confirmed baskets in this period"
+        description="Risk metrics exclude sessions whose fees are still pending."
         class="rounded-none"
       />
 

@@ -32,6 +32,7 @@ export interface PeriodMetrics {
   bestSession: { day: string, value: number } | null
   worstSession: { day: string, value: number } | null
   sessions: number
+  trades: number
 }
 
 const DAY_MS = 86_400_000
@@ -93,7 +94,7 @@ export function periodMetrics(
   window: Pick<PerformanceWindow, 'start' | 'end'>
 ): PeriodMetrics {
   const points = [...source]
-    .filter(point => Number.isFinite(point.equity) && point.equity > 0)
+    .filter(point => !point.provisional && Number.isFinite(point.equity) && point.equity > 0)
     .sort((left, right) => left.day.localeCompare(right.day))
   const endIndex = points.findLastIndex(point => point.day <= window.end)
   if (endIndex < 0) {
@@ -115,7 +116,8 @@ export function periodMetrics(
       maxDrawdownPct: 0,
       bestSession: null,
       worstSession: null,
-      sessions: 0
+      sessions: 0,
+      trades: 0
     }
   }
 
@@ -125,12 +127,16 @@ export function periodMetrics(
     anchorIndex = prior >= 0 ? prior : 0
   }
 
-  const moves: Array<{ day: string, value: number }> = []
+  const moves: Array<{ day: string, value: number, trades: number }> = []
   for (let index = Math.max(1, anchorIndex + 1); index <= endIndex; index += 1) {
     const current = points[index]!
     const previous = points[index - 1]!
     if (window.start && current.day < window.start) continue
-    moves.push({ day: current.day, value: current.equity / previous.equity - 1 })
+    moves.push({
+      day: current.day,
+      value: current.equity / previous.equity - 1,
+      trades: current.trades ?? 0
+    })
   }
 
   const startEquity = points[anchorIndex]!.equity
@@ -195,6 +201,7 @@ export function periodMetrics(
     maxDrawdownPct,
     bestSession: best,
     worstSession: worst,
-    sessions: returns.length
+    sessions: returns.length,
+    trades: moves.reduce((sum, move) => sum + move.trades, 0)
   }
 }

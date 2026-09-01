@@ -24,6 +24,8 @@ export interface EquityPoint {
   equity: number
   profit_loss: number
   profit_loss_pct: number
+  provisional?: boolean
+  trades?: number
 }
 
 export interface AccountSummary {
@@ -165,8 +167,14 @@ export interface SessionRecord {
   exit_notional: number
   gross_realized_pnl: number | null
   gross_realized_return: number | null
+  fee_status: 'confirmed' | 'pending' | 'unavailable' | 'not_applicable'
+  fee_cost: number | null
+  fee_activity_count: number | null
+  fee_breakdown: Record<string, { count: number, net_amount: number, cost: number }>
   realized_pnl: number | null
   realized_return: number | null
+  account_equity_change: number | null
+  unexplained_residual: number | null
   trades: ClosedTrade[]
   error: string | null
 }

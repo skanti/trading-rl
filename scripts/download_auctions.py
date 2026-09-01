@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import time
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,48 @@ FIELDNAMES = (
 )
 SPLIT_FIELDNAMES = ("type", "symbol", "ex_date", "old_rate", "new_rate", "id")
 FORMAT_VERSION = 1
+EASTERN = ZoneInfo("America/New_York")
+RECENT_SIP_SAFETY_DELAY = timedelta(minutes=20)
+
+
+def default_end(now: datetime | None = None) -> str:
+    """Return today's US trading-calendar date."""
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(EASTERN).date().isoformat()
+
+
+def auction_query_end(
+    requested_end: str,
+    now: datetime | None = None,
+) -> tuple[str, bool]:
+    """Clamp current-day requests behind Alpaca's recent-SIP restriction."""
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    reference = reference.astimezone(timezone.utc)
+    parsed = pd.Timestamp(requested_end)
+    requested_day = parsed.date()
+    today = reference.astimezone(EASTERN).date()
+    if requested_day > today:
+        raise ValueError(f"auction end {requested_end} is in the future")
+    if requested_day < today:
+        return requested_end, False
+
+    delayed_cutoff = reference - RECENT_SIP_SAFETY_DELAY
+    if delayed_cutoff.astimezone(EASTERN).date() < requested_day:
+        raise ValueError(
+            "today's delayed SIP window has not started yet; retry in 20 minutes"
+        )
+
+    if len(requested_end) > 10:
+        explicit = parsed
+        if explicit.tzinfo is None:
+            explicit = explicit.tz_localize(timezone.utc)
+        explicit_utc = explicit.tz_convert(timezone.utc).to_pydatetime()
+        delayed_cutoff = min(delayed_cutoff, explicit_utc)
+    return delayed_cutoff.isoformat().replace("+00:00", "Z"), True
 
 
 def _security_symbol(sample_id: str) -> str:
@@ -105,7 +148,15 @@ def _request_page(
             delay = float(retry_after) if retry_after else min(30.0, 2.0**attempt)
             time.sleep(delay)
             continue
-        response.raise_for_status()
+        if not 200 <= response.status_code < 300:
+            try:
+                message = str(response.json().get("message") or response.text)
+            except (TypeError, ValueError):
+                message = response.text
+            raise RuntimeError(
+                f"Alpaca auction request failed with HTTP {response.status_code}: "
+                f"{message.strip()}"
+            )
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Alpaca returned a non-object auction response")
@@ -434,11 +485,14 @@ def download_auctions(
     headers = _request_headers()
     start_bound = pd.Timestamp(start).date().isoformat()
     end_bound = pd.Timestamp(end).date().isoformat()
+    query_end, _current_day = auction_query_end(end)
     split_end = max(
         pd.Timestamp(end).date(), datetime.now(timezone.utc).date()
     ).isoformat()
     with requests.Session() as session:
-        rows = _download_auction_rows(session, headers, symbols, start, end, batch_size)
+        rows = _download_auction_rows(
+            session, headers, symbols, start, query_end, batch_size
+        )
         split_rows = _download_splits(session, headers, symbols, start, split_end)
     rows = [
         row for row in rows if start_bound <= str(row["date"]) <= end_bound
@@ -480,6 +534,7 @@ def update_auctions(
     refresh_start = refresh_start_date.isoformat()
     dataset_start_bound = dataset_start_date.isoformat()
     requested_end_bound = requested_end_date.isoformat()
+    query_end, _current_day = auction_query_end(end)
 
     existing_symbols = {_security_symbol(symbol) for symbol in manifest["symbols"]}
     new_symbols = {_security_symbol(symbol) for symbol in additional_symbols} - existing_symbols
@@ -494,7 +549,7 @@ def update_auctions(
             headers,
             sorted(existing_symbols),
             refresh_start,
-            end,
+            query_end,
             batch_size,
         )
         # Alpaca can occasionally include a print just outside the requested
@@ -515,7 +570,7 @@ def update_auctions(
                 headers,
                 sorted(new_symbols),
                 dataset_start,
-                end,
+                query_end,
                 batch_size,
             )
             refreshed_rows.extend(
@@ -561,7 +616,11 @@ def main() -> None:
         default=None,
         help="inclusive RFC-3339 or YYYY-MM-DD; required for an initial download",
     )
-    parser.add_argument("--end", required=True, help="inclusive RFC-3339 or YYYY-MM-DD")
+    parser.add_argument(
+        "--end",
+        default=default_end(),
+        help="inclusive RFC-3339 or YYYY-MM-DD (default: today in New York)",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--update",
@@ -595,6 +654,16 @@ def main() -> None:
         parser.error("--overlap-days must be positive")
     if not args.update and not args.start:
         parser.error("--start is required unless --update is used")
+    try:
+        query_end, current_day = auction_query_end(args.end)
+    except ValueError as error:
+        parser.error(str(error))
+    if current_day:
+        print(
+            f"current-day SIP query is delayed through {query_end}; "
+            "today's closing auctions may be incomplete and will be filled by "
+            "the next overlap refresh"
+        )
     symbols = {_security_symbol(symbol) for symbol in args.symbols.split(",") if symbol.strip()}
     for path in args.symbols_from_trades:
         symbols.update(symbols_from_trade_csv(Path(path)))

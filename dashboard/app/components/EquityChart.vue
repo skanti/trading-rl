@@ -46,6 +46,11 @@ const geometry = computed(() => ({
 
 const anchor = computed(() => props.baseline ?? props.points[0]?.equity ?? 0)
 const realizedLatest = computed(() => props.points[props.points.length - 1]?.equity ?? 0)
+const confirmedPoints = computed(() => props.points.filter(point => !point.provisional))
+const confirmedLatest = computed(() =>
+  confirmedPoints.value[confirmedPoints.value.length - 1]?.equity ?? anchor.value
+)
+const latestProvisional = computed(() => Boolean(props.points[props.points.length - 1]?.provisional))
 const openPoint = computed<EquityPoint | null>(() => {
   if (!props.openPositions || !props.points.length) return null
   const pnl = Number.isFinite(props.openPnl) ? props.openPnl : 0
@@ -62,19 +67,31 @@ const displayPoints = computed(() => openPoint.value
   : props.points)
 const scale = computed(() => buildScale(displayPoints.value, geometry.value))
 const latest = computed(() => displayPoints.value[displayPoints.value.length - 1]?.equity ?? 0)
-const gaining = computed(() => realizedLatest.value >= anchor.value)
+const gaining = computed(() => confirmedLatest.value >= anchor.value)
+const seriesColor = computed(() => gaining.value ? '#34d399' : '#fb7185')
 const sessionCount = computed(() => props.sessions ?? Math.max(0, props.points.length - 1))
 
 const line = computed(() => {
-  if (openPoint.value && props.points.length === 1) {
-    const point = props.points[0]!
+  if (confirmedPoints.value.length === 1 && displayPoints.value.length > 1) {
+    const point = confirmedPoints.value[0]!
     return `M ${scale.value.x(0)} ${scale.value.y(point.equity)}`
   }
-  return linePath(props.points, scale.value)
+  return linePath(confirmedPoints.value, scale.value)
 })
-const area = computed(() => openPoint.value && props.points.length === 1
+const area = computed(() => confirmedPoints.value.length < 2
   ? ''
-  : areaPath(props.points, scale.value, props.height - geometry.value.padding.bottom))
+  : areaPath(confirmedPoints.value, scale.value, props.height - geometry.value.padding.bottom))
+const provisionalSegment = computed(() => {
+  const first = props.points.findIndex(point => point.provisional)
+  if (first <= 0) return ''
+  return props.points
+    .slice(first - 1)
+    .map((point, offset) => {
+      const index = first - 1 + offset
+      return `${offset === 0 ? 'M' : 'L'} ${scale.value.x(index)} ${scale.value.y(point.equity)}`
+    })
+    .join(' ')
+})
 const openSegment = computed(() => {
   if (!openPoint.value || !props.points.length) return ''
   const realizedIndex = props.points.length - 1
@@ -114,6 +131,7 @@ const active = computed(() => {
   return {
     point,
     open: Boolean(openPoint.value && hovered.value === displayPoints.value.length - 1),
+    provisional: Boolean(point.provisional),
     x: scale.value.x(hovered.value),
     y: scale.value.y(point.equity),
     change: point.equity - anchor.value,
@@ -159,9 +177,19 @@ function shortDay(day: string | null | undefined): string {
 
     <template v-else>
       <div class="mb-3">
-        <p class="text-xs font-medium uppercase tracking-wide text-slate-400">
-          Strategy equity · {{ sessionCount }} closed session{{ sessionCount === 1 ? '' : 's' }}
-        </p>
+        <div class="flex flex-wrap items-center gap-2">
+          <p class="text-xs font-medium uppercase tracking-wide text-slate-400">
+            Strategy equity · {{ sessionCount }} confirmed session{{ sessionCount === 1 ? '' : 's' }}
+          </p>
+          <UBadge
+            v-if="latestProvisional"
+            color="warning"
+            variant="subtle"
+            size="sm"
+          >
+            Provisional · fees pending
+          </UBadge>
+        </div>
         <div class="mt-1 flex items-baseline justify-between gap-2">
           <p class="numeric whitespace-nowrap text-[clamp(0.875rem,4vw,1.5rem)] font-semibold text-white">
             {{ formatCurrency(active?.point.equity ?? latest) }}
@@ -178,10 +206,10 @@ function shortDay(day: string | null | undefined): string {
               {{ active?.open
                 ? `Open (unrealized) · ${dayLabel(active.point.day)}`
                 : active
-                  ? `Realized · ${dayLabel(active.point.day)}`
+                  ? `${active.provisional ? 'Provisional' : 'Confirmed'} · ${dayLabel(active.point.day)}`
                   : openPoint
                     ? `Open (unrealized) · ${dayLabel(openPoint.day)}`
-                    : `Last realized · ${dayLabel(points[points.length - 1]?.day)}` }}
+                    : `${latestProvisional ? 'Provisional' : 'Last confirmed'} · ${dayLabel(points[points.length - 1]?.day)}` }}
             </p>
           </div>
         </div>
@@ -263,7 +291,7 @@ function shortDay(day: string | null | undefined): string {
           <path
             :d="line"
             fill="none"
-            :stroke="gaining ? '#34d399' : '#fb7185'"
+            :stroke="seriesColor"
             stroke-width="2"
             stroke-linejoin="round"
             stroke-linecap="round"
@@ -271,10 +299,30 @@ function shortDay(day: string | null | undefined): string {
           />
 
           <path
+            v-if="provisionalSegment"
+            :d="provisionalSegment"
+            fill="none"
+            :stroke="seriesColor"
+            stroke-width="2"
+            stroke-dasharray="6 5"
+            stroke-linecap="round"
+            vector-effect="non-scaling-stroke"
+          />
+          <circle
+            v-if="latestProvisional"
+            :cx="scale.x(points.length - 1)"
+            :cy="scale.y(realizedLatest)"
+            r="4"
+            fill="#020617"
+            :stroke="seriesColor"
+            stroke-width="2"
+          />
+
+          <path
             v-if="openSegment"
             :d="openSegment"
             fill="none"
-            stroke="#fbbf24"
+            :stroke="seriesColor"
             stroke-width="2"
             stroke-dasharray="6 5"
             stroke-linecap="round"
@@ -285,7 +333,7 @@ function shortDay(day: string | null | undefined): string {
             :cx="scale.x(displayPoints.length - 1)"
             :cy="scale.y(openPoint.equity)"
             r="4"
-            fill="#fbbf24"
+            :fill="seriesColor"
             stroke="#020617"
             stroke-width="2"
           />
@@ -304,7 +352,7 @@ function shortDay(day: string | null | undefined): string {
               :cx="active.x"
               :cy="active.y"
               r="4"
-              :fill="active.open ? '#fbbf24' : gaining ? '#34d399' : '#fb7185'"
+              :fill="seriesColor"
               stroke="#020617"
               stroke-width="2"
             />

@@ -208,19 +208,27 @@ def realized_equity_series(
     sessions: Sequence[Mapping[str, Any]],
     *,
     base_value: float,
-    inception: date | None = None
+    inception: date | None = None,
+    include_provisional: bool = False,
 ) -> list[EquityPoint]:
     """Build strategy equity from completed basket results.
 
-    The first point is the untraded baseline. Each later point uses the authoritative
-    flat-account exit equity when available, otherwise applying gross fill P&L for a
-    legacy basket. Open sessions are deliberately absent: live mark-to-market account
-    equity is displayed separately by the dashboard.
+    The first point is the untraded baseline. Each later point adds confirmed strategy
+    net P&L (gross fills less Alpaca fee activities). Account equity is deliberately
+    separate because deposits, rounding, and non-strategy activity can move it. Open
+    sessions and, by default, sessions whose fees are still pending are absent.
+    ``include_provisional`` adds pending/unavailable gross-fill results for display,
+    while callers keep the default series for statistics.
     """
-    closed: list[tuple[date, date, float, float]] = []
+    closed: list[tuple[date, date, float]] = []
     entry_days: list[date] = []
     for session in sessions:
         if session.get("status") != "closed" or session.get("realized_pnl") is None:
+            continue
+        if (
+            session.get("fee_status") in {"pending", "unavailable"}
+            and not include_provisional
+        ):
             continue
         try:
             exit_day = date.fromisoformat(
@@ -239,7 +247,6 @@ def realized_equity_series(
                 exit_day,
                 entry_day,
                 _float(session["realized_pnl"]),
-                _float(session.get("exit_equity")),
             )
         )
 
@@ -249,15 +256,13 @@ def realized_equity_series(
 
     balance = base_value
     points = [EquityPoint(baseline_day, balance, 0.0, 0.0)]
-    realized_by_day: dict[date, list[tuple[date, float, float]]] = {}
-    for exit_day, entry_day, pnl, exit_equity in sorted(closed):
-        realized_by_day.setdefault(exit_day, []).append((entry_day, pnl, exit_equity))
+    realized_by_day: dict[date, list[tuple[date, float]]] = {}
+    for exit_day, entry_day, pnl in sorted(closed):
+        realized_by_day.setdefault(exit_day, []).append((entry_day, pnl))
 
     for exit_day in sorted(realized_by_day):
-        for _entry_day, pnl, exit_equity in sorted(realized_by_day[exit_day]):
-            # A flat-account snapshot includes fees and settlement rounding, making
-            # it authoritative. Legacy sessions fall back to gross fill arithmetic.
-            balance = exit_equity if exit_equity > 0.0 else balance + pnl
+        for _entry_day, pnl in sorted(realized_by_day[exit_day]):
+            balance += pnl
         cumulative_pnl = balance - base_value
         point = EquityPoint(
             day=exit_day,
