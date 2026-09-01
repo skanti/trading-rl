@@ -1909,7 +1909,7 @@ def main() -> None:
             "alpaca_trades",
             "compare",
         ),
-        default="dollar_ema",
+        default="turnover_stability",
         help="compare runs all schemes on identical dates and execution prices",
     )
     parser.add_argument(
@@ -2259,7 +2259,7 @@ def main() -> None:
             f"{auction_path}"
         )
     schemes = (
-        ("dollar_ema", "activity_union_ema", "alpaca_volume", "alpaca_trades")
+        ("dollar_ema", "turnover_stability", "activity_union_ema", "alpaca_volume", "alpaca_trades")
         if args.liquidity_scheme == "compare"
         else (args.liquidity_scheme,)
     )

@@ -2583,7 +2583,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--liquidity-scheme",
         choices=("dollar_ema", "turnover_stability"),
-        default="dollar_ema",
+        default="turnover_stability",
         help="dollar_ema ranks on the lagged log-dollar-volume EMA; turnover_stability "
         "subtracts that name's own dispersion, demoting a stock that is only briefly "
         "enormous below one that trades heavily every session",

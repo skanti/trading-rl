@@ -4,7 +4,8 @@
 
 1. Read each stock's completed daily dollar volume as split-adjusted daily
    `VWAP * volume` (falling back to the daily close when VWAP is unavailable).
-2. Smooth `log1p(dollar_volume)` with a causal EMA.
+2. Smooth `log1p(dollar_volume)` with a causal EMA, then subtract that series'
+   own 20-session dispersion so steady turnover outranks episodic turnover.
 3. Before each 15:45 entry, rank using the EMA state through the previous
    session only. The current session never contributes to its own rank.
 4. Equal-weight the selected stocks, then close them in the next session's
@@ -78,7 +79,8 @@ The comparison includes four schemes on identical entry and exit prices:
   one holding every three sessions (97% basket overlap) and improves annualised
   return 55.8% -> 58.7%, profit factor 1.44 -> 1.46 and Sharpe 2.08 -> 2.17.
   `live.py --liquidity-scheme` selects the same implementation, so a live basket
-  and a simulated one cannot drift apart.
+  and a simulated one cannot drift apart. This is the default in both; pass
+  `--liquidity-scheme dollar_ema` for the level-only ranking.
 - `activity_union_ema`: each day, union the top 100 current-session symbols by
   share volume and trade count, remove non-company assets, then rerank the
   remaining candidates using their recent lagged dollar-volume EMA. The union
