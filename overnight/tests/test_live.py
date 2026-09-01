@@ -477,6 +477,70 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             self.assertEqual(summary["market_data"]["feed"], "sip")
             self.assertEqual((daily / "live.log").read_text(), "INFO rank complete\n")
 
+    def test_daily_artifacts_preserve_entry_ranking_and_schedule_at_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            day = date(2026, 8, 24)
+            store = StateStore(root / "state.json")
+            entry_ranking = {
+                "trade_date": day.isoformat(),
+                "candidates": [{"rank": 1, "symbol": "AAPL"}],
+            }
+            state = store.load()
+            state["ranking"] = entry_ranking
+            store.save(state)
+            artifacts = DailyArtifacts(root)
+            effective_path = root / EFFECTIVE_CONFIG_FILENAME
+            effective_path.write_text(
+                json.dumps(
+                    {
+                        "configuration": {
+                            "schedule": {
+                                "time_zone": "America/New_York",
+                                "ranking_time": "14:00",
+                                "entry_time": "15:45",
+                                "exit_time": "08:00",
+                            }
+                        }
+                    }
+                )
+            )
+            artifacts.write_summary(day, "rank", store, config())
+
+            state = store.load()
+            state["ranking"] = {
+                "trade_date": "2026-08-25",
+                "candidates": [{"rank": 1, "symbol": "MSFT"}],
+            }
+            state["position"] = {
+                "entry_date": day.isoformat(),
+                "status": "closed",
+                "ranking_snapshot": entry_ranking,
+                "entry_orders": {},
+                "exit_orders": {},
+            }
+            store.save(state)
+            effective_path.write_text(
+                json.dumps(
+                    {
+                        "configuration": {
+                            "schedule": {
+                                "time_zone": "America/New_York",
+                                "ranking_time": "15:00",
+                                "entry_time": "15:59",
+                                "exit_time": "09:00",
+                            }
+                        }
+                    }
+                )
+            )
+            artifacts.write_summary(day, "exit", store, config())
+
+            summary = json.loads((root / day.isoformat() / "summary.json").read_text())
+            self.assertEqual(summary["ranking"], entry_ranking)
+            self.assertEqual(summary["configuration"]["entry_time"], "15:45")
+            self.assertEqual(summary["last_action"], "exit")
+
     def test_ranking_excludes_trade_date_bar(self):
         sessions = [date(2026, 8, 20), date(2026, 8, 21), date(2026, 8, 24)]
         original = {
@@ -932,6 +996,37 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(calls[0][2], "stocks/quotes/latest")
         self.assertEqual(calls[0][3]["params"], {"symbols": "AAPL", "feed": "sip"})
         self.assertTrue(calls[0][3]["data_credentials"])
+
+    def test_account_activities_paginates_in_chronological_order(self):
+        client = AlpacaClient("key", "secret")
+        calls = []
+
+        def request(method, base, path, **kwargs):
+            calls.append((method, base, path, kwargs))
+            if len(calls) == 1:
+                return [{"id": "one"}, {"id": "two"}]
+            return [{"id": "three"}]
+
+        client._request = request
+        rows = client.account_activities(
+            "fee",
+            after=date(2026, 8, 30),
+            until=date(2026, 9, 3),
+            page_size=2,
+        )
+
+        self.assertEqual([row["id"] for row in rows], ["one", "two", "three"])
+        self.assertEqual(calls[0][2], "account/activities/FEE")
+        self.assertEqual(
+            calls[0][3]["params"],
+            {
+                "direction": "asc",
+                "page_size": 2,
+                "after": "2026-08-30",
+                "until": "2026-09-03",
+            },
+        )
+        self.assertEqual(calls[1][3]["params"]["page_token"], "two")
 
     def test_data_requests_use_separate_credentials_and_completed_timestamp(self):
         client = AlpacaClient(

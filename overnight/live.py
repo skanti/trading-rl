@@ -194,6 +194,17 @@ class DailyArtifacts:
         position = dict(state.get("position") or {})
         entry_orders = position.get("entry_orders") or {}
         exit_orders = position.get("exit_orders") or {}
+        summary_path = self.directory(day) / "summary.json"
+        existing: dict[str, object] = {}
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text())
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, ValueError):
+                LOGGER.warning(
+                    "could not preserve existing session summary %s", summary_path
+                )
 
         def filled_notional(orders: Mapping[str, Mapping[str, object]]) -> float:
             total = 0.0
@@ -209,6 +220,63 @@ class DailyArtifacts:
         entry_notional = filled_notional(entry_orders)
         exit_notional = filled_notional(exit_orders)
         realized_pnl = exit_notional - entry_notional if exit_orders else None
+        configuration: dict[str, object] = {
+            "top": config.top,
+            "ema_span": config.ema_span,
+            "min_history_days": config.min_history_days,
+            "minimum_trading_days": config.minimum_trading_days,
+            "liquidity_lookback_calendar_days": config.lookback_calendar_days,
+            "daily_bars_dir": str(config.daily_bars_dir),
+            "liquidity_shortlist": str(config.liquidity_shortlist),
+            "shortlist_since": config.shortlist_since.isoformat(),
+            "shortlist_daily_top": config.shortlist_daily_top,
+            "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
+            "liquidity_scheme": config.liquidity_scheme,
+            "daily_overlap_days": config.daily_overlap_days,
+            "feed": config.feed,
+            "ranking_feed": config.feed,
+            "quote_feed": config.quote_feed,
+            "exchanges": sorted(config.exchanges),
+            "capital": config.capital,
+            "capital_fraction": config.capital_fraction,
+            "cash_buffer_fraction": config.cash_buffer_fraction,
+            "share_mode": config.share_mode,
+            "quote_max_age_seconds": config.quote_max_age_seconds,
+        }
+        effective_path = self.work_dir / EFFECTIVE_CONFIG_FILENAME
+        if effective_path.exists():
+            try:
+                effective = (
+                    json.loads(effective_path.read_text()).get("configuration") or {}
+                )
+                schedule = effective.get("schedule") or {}
+                for key in ("time_zone", "ranking_time", "entry_time", "exit_time"):
+                    if key in schedule:
+                        configuration[key] = schedule[key]
+            except (AttributeError, OSError, ValueError):
+                LOGGER.warning(
+                    "could not read session schedule from %s", effective_path
+                )
+        existing_configuration = existing.get("configuration")
+        if isinstance(existing_configuration, Mapping):
+            # The first write on the entry day is the immutable configuration record.
+            # An exit may be written after a restart with different defaults.
+            configuration = dict(existing_configuration)
+
+        ranking_options = (
+            position.get("ranking_snapshot"),
+            existing.get("ranking"),
+            state.get("ranking"),
+        )
+        session_ranking: Mapping[str, object] = {}
+        for option in ranking_options:
+            if (
+                isinstance(option, Mapping)
+                and option.get("trade_date") == day.isoformat()
+            ):
+                session_ranking = option
+                break
+
         summary: dict[str, object] = {
             "version": 1,
             "strategy": "overnight_liquidity_long",
@@ -216,29 +284,8 @@ class DailyArtifacts:
             "updated_at": _iso_now(),
             "last_action": action,
             "state_path": str(store.path),
-            "configuration": {
-                "top": config.top,
-                "ema_span": config.ema_span,
-                "minimum_trading_days": config.minimum_trading_days,
-                "liquidity_lookback_calendar_days": config.lookback_calendar_days,
-                "daily_bars_dir": str(config.daily_bars_dir),
-                "liquidity_shortlist": str(config.liquidity_shortlist),
-                "shortlist_since": config.shortlist_since.isoformat(),
-                "shortlist_daily_top": config.shortlist_daily_top,
-                "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
-                "liquidity_scheme": config.liquidity_scheme,
-                "daily_overlap_days": config.daily_overlap_days,
-                "feed": config.feed,
-                "ranking_feed": config.feed,
-                "quote_feed": config.quote_feed,
-                "exchanges": sorted(config.exchanges),
-                "capital": config.capital,
-                "capital_fraction": config.capital_fraction,
-                "cash_buffer_fraction": config.cash_buffer_fraction,
-                "share_mode": config.share_mode,
-                "quote_max_age_seconds": config.quote_max_age_seconds,
-            },
-            "ranking": state.get("ranking") or {},
+            "configuration": configuration,
+            "ranking": dict(session_ranking),
             "position": position,
             "execution": {
                 "entry_filled_notional": entry_notional,
@@ -256,7 +303,7 @@ class DailyArtifacts:
             summary["market_data"] = json.loads(ticks_summary.read_text())
         if error is not None:
             summary["error"] = error
-        _atomic_write_json(self.directory(day) / "summary.json", summary)
+        _atomic_write_json(summary_path, summary)
 
 
 class AlpacaAPIError(RuntimeError):
@@ -490,6 +537,47 @@ class AlpacaClient:
                 params={"status": status, "limit": 500, "direction": "desc"},
             )
         )
+
+    def account_activities(
+        self,
+        activity_type: str,
+        *,
+        after: date | datetime | None = None,
+        until: date | datetime | None = None,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return every account activity of one type in chronological order."""
+        if page_size < 1 or page_size > 100:
+            raise ValueError("account activity page_size must be between 1 and 100")
+        output: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, object] = {
+                "direction": "asc",
+                "page_size": int(page_size),
+            }
+            if after is not None:
+                params["after"] = after.isoformat()
+            if until is not None:
+                params["until"] = until.isoformat()
+            if page_token:
+                params["page_token"] = page_token
+            page = list(
+                self._request(
+                    "GET",
+                    self.trading_url,
+                    f"account/activities/{quote(activity_type.upper(), safe='')}",
+                    params=params,
+                )
+            )
+            output.extend(dict(row) for row in page)
+            if len(page) < page_size:
+                break
+            next_token = page[-1].get("id") if page else None
+            if not next_token or str(next_token) == page_token:
+                raise ValueError("Alpaca account activity pagination did not advance")
+            page_token = str(next_token)
+        return output
 
     def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
         result = self._request(
@@ -1787,6 +1875,10 @@ def enter_for_day(
             position = {
                 "entry_date": trade_date.isoformat(),
                 "exit_date": _next_session(client, trade_date).isoformat(),
+                # The global ranking is replaced on the next session. Keep the exact
+                # decision inputs with the position so an eventual exit cannot rewrite
+                # the entry day's audit trail with a later ranking.
+                "ranking_snapshot": dict(ranking),
                 "status": "planned" if preflight_only or not submit else "entering",
                 "share_mode": share_mode,
                 "quote_feed": config.quote_feed if share_mode == "whole" else None,

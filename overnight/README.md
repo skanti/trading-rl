@@ -516,6 +516,45 @@ or use `--work-dir`/`--state-path` for a one-run override.
 
 The Nasdaq security-master cache is also kept under the work root.
 
+### Reconcile live sessions with the simulator
+
+`reconcile_live_sessions.py` replays a completed basket using only information the
+simulator can observe: the split-adjusted minute-bar open at the scheduled entry minute
+and the next session's primary condition-O opening auction. It compares those prices
+with the actual filled quantities and prices, separately reports the configured
+transaction-cost assumption and the broker-equity residual, and re-runs the shared
+liquidity ranker from that entry day's archived `ticks.jsonl`. The console report also
+shows aggregate actual-versus-model entry and exit price differences in basis points;
+the optional symbol table gives the same attribution for every symbol. Entry-fill,
+exit-fill, and quantity-mismatch P&L impacts form an exact attribution of the gross
+actual-minus-simulator difference.
+
+With no date it reconciles the latest closed session. Select one session or a range with:
+
+```bash
+python reconcile_live_sessions.py --entry-date 2026-08-28
+python reconcile_live_sessions.py --since 2026-08-01
+python reconcile_live_sessions.py --entry-date 2026-08-28 --show-symbol-breakdown
+```
+
+Results are written to `WORK_DIR/reconciliations/YYYY-MM-DD.json` and `.csv`. Use
+`--show-symbol-breakdown` to print the per-symbol execution table; the aggregate
+entry/exit attribution is always shown. Use
+`--entry-time` or `--liquidity-scheme` only to reconstruct legacy summaries that lack
+those fields; normal sessions retain their original schedule and ranking snapshot so a
+later daemon restart or configuration change cannot rewrite the audit inputs.
+
+By default the reconciler authenticates with the same Alpaca environment variables as
+`live.py`, reads the trading endpoint from `WORK_DIR/effective_config.json`, and queries
+`FEE` account activities around the exit date. Exit-date fees are cached in the entry
+session's `fee_activities.json`, embedded in the reconciliation JSON, and used for the
+actual net P&L. Bulk regulatory fees are account-day amounts and may not identify an
+individual order, so the report labels that scope explicitly. Use `--skip-broker-fees`
+for a fully offline gross reconciliation or `--trading-url` for an explicit endpoint.
+The simulator's default one-basis-point cost per side remains a separate modeled
+deduction. Account-equity residuals stay separate from confirmed Alpaca fee activities,
+and gross actual-versus-simulator execution attribution always excludes costs.
+
 Entry and exit order IDs are deterministic, so restarting the process does not
 intentionally duplicate an order. It also excludes symbols with pre-existing
 account positions or open orders and exits only the symbols recorded as owned

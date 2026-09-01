@@ -104,6 +104,11 @@ def _official_opening_auctions(
         session_codes = np.asarray(data["session"], dtype=np.uint8)
         conditions = np.asarray(data["condition"]).astype(str, copy=False)
         price_values = np.asarray(data["price"], dtype=np.float64)
+        raw_price_values = (
+            np.asarray(data["raw_price"], dtype=np.float64)
+            if "raw_price" in data.files
+            else price_values
+        )
         selected = np.flatnonzero(
             (session_codes == 0)
             & (conditions == "O")
@@ -133,6 +138,7 @@ def _official_opening_auctions(
                 "symbol": selected_symbols,
                 "date": pd.to_datetime(date_values[selected]),
                 "price": price_values[selected],
+                "raw_price": raw_price_values[selected],
                 "size": np.asarray(data["size"], dtype=np.float64)[selected],
                 "exchange": np.asarray(data["exchange"]).astype(str, copy=False)[
                     selected
