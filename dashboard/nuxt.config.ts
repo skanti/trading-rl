@@ -11,12 +11,6 @@ const config = parse(
   readFileSync(fileURLToPath(new URL('./config.yaml', import.meta.url)), 'utf8')
 ) as {
   dashboard?: { title?: string }
-  schedule?: {
-    time_zone?: string
-    ranking_time?: string
-    entry_time?: string
-    exit_time?: string
-  }
   auth?: { email_domain?: string }
   firebase?: {
     collection?: string
@@ -77,10 +71,6 @@ export default defineNuxtConfig({
       authEmailDomain: config.auth?.email_domain ?? '',
       firestoreCollection: config.firebase?.collection ?? 'accounts',
       firestoreDocument: config.firebase?.document ?? 'current',
-      scheduleTimeZone: config.schedule?.time_zone ?? 'America/New_York',
-      scheduleRankingTime: config.schedule?.ranking_time ?? '14:00',
-      scheduleEntryTime: config.schedule?.entry_time ?? '15:59',
-      scheduleExitTime: config.schedule?.exit_time ?? '08:00',
       // Nuxt applies NUXT_PUBLIC_* overrides on top of these automatically, so setting
       // NUXT_PUBLIC_FIREBASE_API_KEY= (empty) forces the offline demo adapter.
       firebaseApiKey: web.apiKey ?? '',

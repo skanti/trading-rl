@@ -31,6 +31,8 @@ import numpy as np
 import requests
 from rich.console import Console
 from rich.table import Table
+from omegaconf import DictConfig
+from omegaconf.errors import OmegaConfBaseException
 
 from backtest import (
     DEFAULT_SECURITY_MASTER_CACHE,
@@ -41,6 +43,13 @@ from backtest import (
     causal_turnover_stability,
     is_company_security,
     load_nasdaq_security_master,
+)
+from live_config import (
+    DEFAULT_LIVE_CONFIG_PATH,
+    EFFECTIVE_CONFIG_FILENAME,
+    argparse_defaults,
+    effective_live_settings,
+    load_live_settings,
 )
 
 
@@ -2547,12 +2556,29 @@ def run_daemon(
         time_module.sleep(sleep_seconds)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    defaults: Mapping[str, object] | None = None,
+) -> argparse.ArgumentParser:
+    effective_defaults = (
+        argparse_defaults(load_live_settings()) if defaults is None else dict(defaults)
+    )
     parser = argparse.ArgumentParser(
         description="Rank and trade the most-liquid company stocks overnight."
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_LIVE_CONFIG_PATH,
+        help="complete YAML configuration (CLI options override its values)",
+    )
+    parser.add_argument(
         "action", choices=("run", "preview", "rank", "enter", "exit", "status")
+    )
+    parser.add_argument(
+        "--time-zone",
+        choices=("America/New_York",),
+        default="America/New_York",
+        help="exchange schedule time zone (fixed for US equities)",
     )
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument(
@@ -2718,23 +2744,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout-seconds", type=float, default=30.0)
     parser.add_argument(
         "--submit",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="actually send orders; enter/exit are dry runs without this flag",
     )
     parser.add_argument(
         "--allow-live-endpoint",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="explicitly allow an endpoint other than paper-api.alpaca.markets",
     )
     parser.add_argument(
         "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO"
     )
+    parser.set_defaults(**effective_defaults)
     return parser
+
+
+def parse_live_arguments(
+    argv: Sequence[str] | None = None,
+) -> tuple[argparse.ArgumentParser, argparse.Namespace, DictConfig]:
+    """Load YAML defaults first, then let explicit CLI arguments override them."""
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config", type=Path, default=DEFAULT_LIVE_CONFIG_PATH
+    )
+    config_args, _ = config_parser.parse_known_args(argv)
+    try:
+        settings = load_live_settings(config_args.config)
+    except (FileNotFoundError, ValueError, OmegaConfBaseException) as error:
+        config_parser.error(str(error))
+    parser = build_parser(argparse_defaults(settings))
+    args = parser.parse_args(argv)
+    return parser, args, settings
 
 
 def _validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> StrategyConfig:
+    if args.time_zone != EASTERN.key:
+        parser.error(f"time-zone must be {EASTERN.key} for US equity execution")
+    if args.liquidity_scheme not in {"dollar_ema", "turnover_stability"}:
+        parser.error("liquidity-scheme must be dollar_ema or turnover_stability")
+    if args.feed not in {"iex", "sip"} or args.quote_feed not in {"iex", "sip"}:
+        parser.error("feed and quote-feed must be iex or sip")
+    if args.share_mode not in {"whole", "fractional"}:
+        parser.error("share-mode must be whole or fractional")
+    if args.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        parser.error("log-level must be DEBUG, INFO, WARNING, or ERROR")
     if (
         args.top < 1
         or args.ema_span < 1
@@ -2848,9 +2903,71 @@ def _validate_args(
     )
 
 
+def _print_effective_configuration(
+    args: argparse.Namespace,
+    config_path: Path,
+    work_dir: Path,
+    state_path: Path,
+) -> None:
+    """Print the effective, credential-free parameters before doing any work."""
+    table = Table(title="Effective live configuration")
+    table.add_column("Setting", style="bold")
+    table.add_column("Value")
+    table.add_row("Config", str(config_path.expanduser().resolve()))
+    table.add_row("Action", str(args.action))
+    table.add_row(
+        "Orders",
+        "SUBMIT ENABLED" if args.submit else "preview / no submission",
+    )
+    table.add_row(
+        "Endpoint",
+        f"{args.trading_url} ({'paper' if _is_paper_endpoint(args.trading_url) else 'live'})",
+    )
+    table.add_row(
+        "Schedule",
+        f"rank {args.ranking_time:%H:%M} · enter {args.entry_time:%H:%M} · "
+        f"exit {args.exit_time:%H:%M} {args.time_zone}",
+    )
+    table.add_row(
+        "Ranking",
+        f"top {args.top} · {args.liquidity_scheme} · EMA {args.ema_span} · "
+        f"minimum {args.minimum_trading_days} sessions",
+    )
+    capital = (
+        f"${args.capital:,.2f} cap"
+        if args.capital is not None
+        else f"{args.capital_fraction:.1%} of cash"
+    )
+    table.add_row(
+        "Sizing",
+        f"{capital} · {args.cash_buffer_fraction:.1%} buffer · {args.share_mode} shares",
+    )
+    table.add_row(
+        "Market data",
+        f"ranking={args.feed} · quotes={args.quote_feed} · exchanges={args.exchanges}",
+    )
+    table.add_row("Work directory", str(work_dir))
+    table.add_row("State", str(state_path))
+    CONSOLE.print(table)
+
+
+def _write_effective_configuration(args: argparse.Namespace, work_dir: Path) -> Path:
+    """Persist the merged runtime values consumed by this daemon invocation."""
+    path = work_dir / EFFECTIVE_CONFIG_FILENAME
+    _atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "loaded_at": _iso_now(),
+            "config_path": str(args.config.expanduser().resolve()),
+            "configuration": effective_live_settings(args),
+        },
+    )
+    return path
+
+
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    parser, args, _settings = parse_live_arguments()
     config = _validate_args(parser, args)
     preview_workspace = (
         tempfile.TemporaryDirectory(prefix="overnight-liquidity-preview.")
@@ -2885,6 +3002,9 @@ def main() -> None:
         if args.state_path
         else work_dir / "state.json"
     )
+    if args.action == "run":
+        _write_effective_configuration(args, work_dir)
+    _print_effective_configuration(args, args.config, work_dir, state_path)
     store = StateStore(state_path)
     artifacts = DailyArtifacts(work_dir)
     artifacts.directory(trade_date)

@@ -15,19 +15,23 @@ MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 MOST_LIQUID_PATH="${MOST_LIQUID_PATH:-$REPO_DIR/data/most_liquid.txt}"
 SHORTLIST_SINCE="${SHORTLIST_SINCE:-2022-01-01}"
 SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-50}"
+SHORTLIST_LOOKBACK_SESSIONS="${SHORTLIST_LOOKBACK_SESSIONS:-250}"
 BAR_SINCE="${BAR_SINCE:-2016-01-01}"
 AUCTION_START="${AUCTION_START:-2022-01-01}"
 BAR_OVERLAP_DAYS="${BAR_OVERLAP_DAYS:-30}"
 AUCTION_OVERLAP_DAYS="${AUCTION_OVERLAP_DAYS:-7}"
 WORKERS="${WORKERS:-8}"
+DAILY_BAR_BATCH_SIZE="${DAILY_BAR_BATCH_SIZE:-100}"
+MINUTE_BAR_BATCH_SIZE="${MINUTE_BAR_BATCH_SIZE:-10}"
+ALPACA_REQUESTS_PER_MINUTE="${ALPACA_REQUESTS_PER_MINUTE:-180}"
 CALENDAR_SYMBOL="${CALENDAR_SYMBOL:-AAPL}"
 LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 
 usage() {
   cat <<'EOF'
-Merge newly available stocks into the historical master, update split-adjusted
+Refresh the current eligible company-stock universe, update its split-adjusted
 daily bars, rebuild the dollar-volume shortlist, update minute bars for the
-shortlist plus SPY, and update auctions.
+shortlist plus SPY, and update auctions. Historical bar files are retained.
 
 Usage:
   scripts/download_latest_bars_and_auctions.sh
@@ -37,10 +41,15 @@ Common environment overrides:
   ENV_FILE=/path/to/.env
   UPDATES_DIR=/data/ppv1/updates
   WORKERS=8
+  DAILY_BAR_BATCH_SIZE=100
+  MINUTE_BAR_BATCH_SIZE=10
+  # Algo Trader Plus accounts may use 9000 (below Alpaca's documented 10000 RPM).
+  ALPACA_REQUESTS_PER_MINUTE=180
   BAR_OVERLAP_DAYS=30
   AUCTION_OVERLAP_DAYS=7
   SHORTLIST_SINCE=2022-01-01
   SHORTLIST_DAILY_TOP=50
+  SHORTLIST_LOOKBACK_SESSIONS=250
 EOF
 }
 
@@ -88,7 +97,6 @@ check_failures() {
   fi
 }
 
-require_file "$MASTER_PATH"
 if [[ -f "$ENV_FILE" ]]; then
   log "Loading credentials from $ENV_FILE"
   set -a
@@ -101,12 +109,11 @@ fi
 : "${ALPACA_KEY:?ALPACA_KEY must be set to refresh the asset master}"
 : "${ALPACA_SECRET:?ALPACA_SECRET must be set to refresh the asset master}"
 
-log "Merging newly available company stocks into $MASTER_PATH"
+log "Refreshing the current eligible company-stock universe in $MASTER_PATH"
 (
   cd -- "$REPO_DIR/overnight"
   "$PYTHON_BIN" universe.py \
     --output "$MASTER_PATH" \
-    --merge-existing \
     --refresh-security-master
 )
 
@@ -118,15 +125,18 @@ log "Updating broad daily bars in $DAILY_BARS_DIR"
   --out_dir "$DAILY_BARS_DIR" \
   --since "$BAR_SINCE" \
   --workers_num "$WORKERS" \
+  --batch_size "$DAILY_BAR_BATCH_SIZE" \
+  --requests_per_minute "$ALPACA_REQUESTS_PER_MINUTE" \
   --update_existing \
   --overlap_days "$BAR_OVERLAP_DAYS"
 check_failures "$DAILY_BARS_DIR"
 
-log "Rebuilding top-$SHORTLIST_DAILY_TOP daily dollar-volume union"
+log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAILY_TOP daily dollar-volume union"
 "$PYTHON_BIN" "$SCRIPT_DIR/build_most_liquid.py" \
   --bars-dir "$DAILY_BARS_DIR" \
   --since "$SHORTLIST_SINCE" \
   --top "$SHORTLIST_DAILY_TOP" \
+  --lookback-sessions "$SHORTLIST_LOOKBACK_SESSIONS" \
   --metric dollar-volume \
   --output "$MOST_LIQUID_PATH"
 
@@ -149,6 +159,8 @@ log "Updating shortlist minute bars in $MINUTE_BARS_DIR"
   --out_dir "$MINUTE_BARS_DIR" \
   --since "$BAR_SINCE" \
   --workers_num "$WORKERS" \
+  --batch_size "$MINUTE_BAR_BATCH_SIZE" \
+  --requests_per_minute "$ALPACA_REQUESTS_PER_MINUTE" \
   --update_existing \
   --overlap_days "$BAR_OVERLAP_DAYS"
 check_failures "$MINUTE_BARS_DIR"

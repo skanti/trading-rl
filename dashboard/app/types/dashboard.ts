@@ -111,10 +111,27 @@ export interface MarketClock {
   timestamp?: string
 }
 
+export interface TradingSchedule {
+  time_zone: string
+  ranking_time: string
+  entry_time: string
+  exit_time: string
+  minimum_ranking_lead_minutes: number
+  entry_grace_seconds: number
+}
+
+export interface TradingConfiguration {
+  schedule?: TradingSchedule
+  strategy?: Record<string, unknown>
+  data?: Record<string, unknown>
+  execution?: Record<string, unknown>
+}
+
 export interface Snapshot {
   version: number
   updated_at: string
   trading_day: string
+  configuration: TradingConfiguration
   account: AccountSummary
   performance: Record<BucketKey, PerformanceBucket>
   statistics: Statistics

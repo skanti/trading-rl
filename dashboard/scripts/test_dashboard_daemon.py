@@ -22,6 +22,7 @@ from dashboard_daemon import (
     build_parser,
     build_snapshot,
     first_trade_date,
+    load_trading_configuration,
     load_state,
     session_records,
 )
@@ -300,6 +301,7 @@ class SnapshotTest(unittest.TestCase):
                 "version",
                 "updated_at",
                 "trading_day",
+                "configuration",
                 "account",
                 "performance",
                 "statistics",
@@ -326,6 +328,79 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["equity_curve"][-1]["equity"], 109000.0)
         self.assertEqual(snapshot["equity_curve"][-1]["day"], "2026-08-25")
         self.assertEqual(snapshot["equity_curve"][-1]["profit_loss"], 100.0)
+
+    def test_shared_trading_config_is_published_without_runtime_values(self):
+        configuration = load_trading_configuration(
+            Path(__file__).resolve().parents[2] / "overnight" / "config.yaml"
+        )
+
+        self.assertEqual(configuration["schedule"]["entry_time"], "15:45")
+        self.assertEqual(configuration["strategy"]["top"], 12)
+        self.assertEqual(configuration["data"]["data_workers"], 8)
+        self.assertEqual(configuration["execution"]["share_mode"], "fractional")
+        self.assertNotIn("runtime", configuration)
+
+    def test_effective_runtime_config_wins_over_yaml_defaults(self):
+        trading_config = Path(__file__).resolve().parents[2] / "overnight" / "config.yaml"
+        with tempfile.TemporaryDirectory() as directory:
+            effective_path = Path(directory) / "effective_config.json"
+            effective_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "configuration": {
+                            "schedule": {
+                                "time_zone": "America/New_York",
+                                "ranking_time": "13:50",
+                                "entry_time": "15:40",
+                                "exit_time": "08:05",
+                                "minimum_ranking_lead_minutes": 20,
+                                "entry_grace_seconds": 75,
+                            },
+                            "strategy": {
+                                "top": 15,
+                                "liquidity_scheme": "turnover_stability",
+                                "ema_span": 10,
+                                "min_history_days": 20,
+                                "minimum_trading_days": 100,
+                                "liquidity_lookback_days": 180,
+                                "exchanges": "NASDAQ",
+                            },
+                            "data": {
+                                "shortlist_since": "2022-01-01",
+                                "shortlist_daily_top": 50,
+                                "shortlist_lookback_sessions": 250,
+                                "daily_overlap_days": 30,
+                                "feed": "sip",
+                                "quote_feed": "iex",
+                                "data_batch_size": 100,
+                                "data_workers": 8,
+                            },
+                            "execution": {
+                                "order_submit_workers": 8,
+                                "capital": None,
+                                "capital_fraction": 1.0,
+                                "cash_buffer_fraction": 0.02,
+                                "share_mode": "fractional",
+                                "quote_max_age_seconds": 120.0,
+                                "fill_timeout_seconds": 45.0,
+                                "poll_seconds": 1.0,
+                                "entry_preflight_seconds": 10.0,
+                            },
+                            "runtime": {"submit": True},
+                        },
+                    }
+                )
+            )
+
+            configuration = load_trading_configuration(
+                trading_config,
+                effective_path,
+            )
+
+        self.assertEqual(configuration["schedule"]["entry_time"], "15:40")
+        self.assertEqual(configuration["strategy"]["top"], 15)
+        self.assertNotIn("runtime", configuration)
 
 
 class ArtifactTest(unittest.TestCase):
@@ -433,6 +508,64 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(records[0]["gross_realized_pnl"], 102.0)
         self.assertEqual(records[0]["realized_pnl"], 101.5)
         self.assertEqual(records[0]["realized_return"], 0.1015)
+
+    def test_closed_entry_artifact_wins_over_weekend_error_copy(self):
+        entry_date = "2026-08-28"
+        exit_date = "2026-08-31"
+        entry_orders = {"NVDA": order(10, 100.0)}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = {
+                "2026-08-28": {
+                    "updated_at": "2026-08-31T13:30:04Z",
+                    "last_action": "exit",
+                    "error": None,
+                    "position": {
+                        "status": "closed",
+                        "entry_date": entry_date,
+                        "exit_date": exit_date,
+                        "entry_account_snapshot": {"equity": "10002.40"},
+                        "exit_account_snapshot": {"equity": "9991.90"},
+                        "entry_orders": entry_orders,
+                        "exit_orders": {"NVDA": order(10, 98.95)},
+                    },
+                },
+                "2026-08-30": {
+                    "updated_at": "2026-08-30T19:38:12Z",
+                    "last_action": "error",
+                    "error": "2026-08-30 is not an Alpaca trading session",
+                    "position": {
+                        "status": "open",
+                        "entry_date": entry_date,
+                        "exit_date": exit_date,
+                        "entry_account_snapshot": {"equity": "10002.40"},
+                        "entry_orders": entry_orders,
+                    },
+                },
+            }
+            for day, artifact in artifacts.items():
+                folder = root / day
+                folder.mkdir()
+                (folder / "summary.json").write_text(
+                    json.dumps({"trading_day": day, **artifact})
+                )
+
+            records = session_records(root)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["trading_day"], entry_date)
+        self.assertEqual(records[0]["status"], "closed")
+        self.assertEqual(records[0]["exit_date"], exit_date)
+        self.assertEqual(records[0]["realized_pnl"], -10.5)
+        self.assertIsNone(records[0]["error"])
+
+        curve = metrics.realized_equity_series(
+            records,
+            base_value=10002.40,
+            inception=date(2026, 8, 28),
+        )
+        self.assertEqual(curve[-1].day, date(2026, 8, 31))
+        self.assertEqual(curve[-1].equity, 9991.90)
 
 
 class SafetyTest(unittest.TestCase):

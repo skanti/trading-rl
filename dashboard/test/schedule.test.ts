@@ -9,7 +9,7 @@ import {
 const config: ScheduleConfig = {
   timeZone: 'America/New_York',
   rankingTime: '14:00',
-  entryTime: '15:59',
+  entryTime: '15:45',
   exitTime: '08:00'
 }
 
@@ -34,7 +34,7 @@ describe('buildNaiveSchedule', () => {
     expect(events.map(event => event.at.toISOString())).toEqual([
       '2026-08-27T12:00:00.000Z',
       '2026-08-27T18:00:00.000Z',
-      '2026-08-27T19:59:00.000Z'
+      '2026-08-27T19:45:00.000Z'
     ])
   })
 
@@ -47,7 +47,7 @@ describe('buildNaiveSchedule', () => {
 
     expect(events.map(event => event.at.toISOString())).toEqual([
       '2026-08-31T18:00:00.000Z',
-      '2026-08-31T19:59:00.000Z',
+      '2026-08-31T19:45:00.000Z',
       '2026-09-01T12:00:00.000Z'
     ])
   })

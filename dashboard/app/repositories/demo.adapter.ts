@@ -84,6 +84,16 @@ function buildSnapshot(): Snapshot {
     version: 1,
     updated_at: new Date().toISOString(),
     trading_day: last.day,
+    configuration: {
+      schedule: {
+        time_zone: 'America/New_York',
+        ranking_time: '14:00',
+        entry_time: '15:45',
+        exit_time: '08:00',
+        minimum_ranking_lead_minutes: 20,
+        entry_grace_seconds: 75
+      }
+    },
     account: {
       account_number: 'PA0DEMO0000',
       status: 'ACTIVE',

@@ -146,12 +146,13 @@ the shortlist's minute bars, and extend auction data in one pass, run:
 ../scripts/download_latest_bars_and_auctions.sh
 ```
 
-The script first merges Alpaca's currently available company stocks into
-`data/master.txt`; it never removes historical or delisted symbols. It then loads
-`overnight/.env` by default and accepts environment overrides such as `PYTHON_BIN`,
-`UPDATES_DIR`, `WORKERS`, and the overlap/shortlist settings shown by `--help`.
-It obtains the auction end date from the refreshed daily bars, so a still-forming
-market session is not requested.
+The script first rewrites `data/master.txt` with Alpaca's currently active,
+tradable, fractionable Nasdaq company stocks. Only that current universe is
+refreshed, while historical and delisted `.npy` files already in the bar stores are
+retained for backtests. It then loads `overnight/.env` by default and accepts
+environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
+overlap/shortlist settings shown by `--help`. It obtains the auction end date from
+the refreshed daily bars, so a still-forming market session is not requested.
 
 ```bash
 python ../scripts/download_bars.py \
@@ -360,9 +361,8 @@ union-everything behaviour.
 | 250 (default) | 338 |
 | 125 | 218 |
 
-Configure these locations and bounds with `--daily-bars-dir`,
-`--liquidity-shortlist`, `--shortlist-since`, `--shortlist-daily-top`,
-`--shortlist-lookback-sessions`, and `--daily-overlap-days`.
+Configure these locations and bounds in `config.yaml`; the corresponding CLI options
+remain available as one-run overrides.
 
 As in the simulator, a company must have at least 100 completed daily bars
 strictly before the entry date. Configure this with `--minimum-trading-days`;
@@ -381,8 +381,15 @@ shortlist members are ranked. Dollar liquidity is `daily VWAP * volume`, falling
 back to `daily close * volume` when VWAP is unavailable or zero, and is smoothed
 as a causal EMA of `log1p(dollar volume)`.
 
-Credentials remain in environment variables and are never stored in the state
-file. For the paper endpoint:
+`config.yaml` is the complete, validated source of truth for the live runner's
+schedule, ranking, data, sizing, and runtime parameters. It is loaded with OmegaConf;
+missing, unknown, or mistyped values fail before any broker call. Explicit CLI options
+override YAML for operational exceptions, while the positional action (`run`, `status`,
+and so on) remains a required command. The process prints the effective non-secret
+settings at startup for a sanity check.
+
+Credentials remain in environment variables and are never stored in YAML or the state
+file. Endpoint values support OmegaConf environment interpolation. For a paper endpoint:
 
 ```bash
 export ALPACA_URL="https://paper-api.alpaca.markets/v2"
@@ -391,18 +398,24 @@ export ALPACA_SECRET="..."
 export ALPACA_DATA_KEY="..."       # optional separate market-data subscription
 export ALPACA_DATA_SECRET="..."
 
-python live.py run \
-  --top 10 \
-  --ranking-time 14:00 \
-  --entry-preflight-seconds 10 \
-  --order-submit-workers 8 \
-  --exit-time 08:00 \
-  --feed sip \
-  --quote-feed iex \
-  --capital-fraction 1.00 \
-  --share-mode whole \
-  --submit
+python live.py run --submit
 ```
+
+For the configured live endpoint, retain both explicit safety gates:
+
+```bash
+python live.py run --submit --allow-live-endpoint
+```
+
+Use `--config /path/to/alternate.yaml` to select another complete configuration.
+For a temporary exception, a regular option has final precedence, for example
+`python live.py status --entry-time 15:40 --top 10`.
+
+Persistent `run` mode atomically records the merged values it actually consumed in
+`WORK_DIR/effective_config.json`. This includes CLI overrides but no credentials. The
+dashboard publisher prefers that active-runtime artifact and falls back to YAML when it
+does not exist, so an override or an unapplied YAML edit cannot make the displayed
+schedule drift from the running trader.
 
 `--capital-fraction` defaults to `1.0`. Basket sizing remains cash-only even on a
 margin-enabled account. The requested
@@ -424,14 +437,14 @@ restart-safe, and the state records per-order dispatch timing for later analysis
 Alpaca has no batch request for unrelated equity orders, so every symbol remains
 an individual `POST /v2/orders` request.
 
-Live execution defaults to `--share-mode whole`. During entry preflight it requests the
+The shipped live configuration uses `share_mode: fractional`, preserving the current
+deployment. In whole-share mode, entry preflight requests the
 latest ask for every selected stock from `--quote-feed iex`, rejects missing quotes or
 quotes older than the default `--quote-max-age-seconds 120`, and floors each
 equal-notional allocation to an integer quantity using the same rule as the simulator.
 Unused dollars and any allocation too small to buy one share remain cash; they are not
 redistributed to cheaper names. The quote prices, timestamps, target quantities, skipped
-symbols, and estimated deployed notional are persisted in strategy state. Use
-`--share-mode fractional` to retain the earlier notional-order behavior. Both modes use
+symbols, and estimated deployed notional are persisted in strategy state. Both modes use
 the same liquidity ranking. Fractional mode restricts the universe to Alpaca-fractionable
 companies; whole mode can also rank non-fractionable companies. Share mode otherwise
 affects sizing and the submitted order payload.
@@ -481,7 +494,7 @@ python live.py status
 python live.py exit
 ```
 
-The default work directory is `/data/ppv1/live`. Durable restart state is
+The configured work directory is `/data/ppv1/live`. Durable restart state is
 written atomically to `/data/ppv1/live/state.json`, while every ET trading day
 gets an audit directory such as:
 
@@ -498,8 +511,8 @@ ranking and labels every row with its `1Day` timeframe and feed. It is not a
 trade-by-trade exchange tick stream. `summary.json` is refreshed after ranking,
 entry, exit, status, and failures; it includes the ranking, position and order
 state, and realized fill-price P&L after exit. The daily log rolls over using
-the America/New_York date. Use `--work-dir` to override the entire root or
-`--state-path` to relocate only restart state.
+the America/New_York date. Change `runtime.work_dir` or `runtime.state_path` in YAML,
+or use `--work-dir`/`--state-path` for a one-run override.
 
 The Nasdaq security-master cache is also kept under the work root.
 

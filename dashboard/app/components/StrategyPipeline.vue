@@ -7,20 +7,20 @@ import {
   type ScheduleConfig,
   type ScheduleEvent
 } from '~/utils/schedule'
-import type { MarketClock, StrategyState } from '~/types/dashboard'
+import type { MarketClock, StrategyState, TradingSchedule } from '~/types/dashboard'
 
 const props = defineProps<{
   strategy: StrategyState
   market: MarketClock
+  schedule?: TradingSchedule
 }>()
 
-const runtime = useRuntimeConfig().public
-const schedule: ScheduleConfig = {
-  timeZone: String(runtime.scheduleTimeZone || 'America/New_York'),
-  rankingTime: String(runtime.scheduleRankingTime || '14:00'),
-  entryTime: String(runtime.scheduleEntryTime || '15:59'),
-  exitTime: String(runtime.scheduleExitTime || '08:00')
-}
+const schedule = computed<ScheduleConfig>(() => ({
+  timeZone: props.schedule?.time_zone || 'America/New_York',
+  rankingTime: props.schedule?.ranking_time || '14:00',
+  entryTime: props.schedule?.entry_time || '15:45',
+  exitTime: props.schedule?.exit_time || '08:00'
+}))
 
 const now = ref(new Date())
 let timer: ReturnType<typeof setInterval> | undefined
@@ -31,7 +31,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => clearInterval(timer))
 
-const events = computed(() => buildNaiveSchedule(now.value, props.strategy, schedule))
+const events = computed(() => buildNaiveSchedule(now.value, props.strategy, schedule.value))
 const nextEvent = computed(() => events.value[0] ?? null)
 
 const marketTarget = computed(() => {
@@ -46,11 +46,11 @@ const marketText = computed(() => {
   const target = marketTarget.value
   if (!target) return state
   const action = props.market.is_open ? 'closes' : 'opens'
-  return `${state} · ${action} at ${formatScheduleTime(target, now.value, schedule.timeZone)}`
+  return `${state} · ${action} at ${formatScheduleTime(target, now.value, schedule.value.timeZone)}`
 })
 
 function eventText(event: ScheduleEvent): string {
-  return `${event.label} · ${formatScheduleTime(event.at, now.value, schedule.timeZone)}`
+  return `${event.label} · ${formatScheduleTime(event.at, now.value, schedule.value.timeZone)}`
 }
 
 function eventColor(event: ScheduleEvent): 'neutral' | 'info' | 'primary' | 'warning' {

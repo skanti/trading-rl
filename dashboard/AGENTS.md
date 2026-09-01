@@ -8,8 +8,10 @@
 
 ## Data flow
 - The browser never talks to Alpaca. `scripts/dashboard_daemon.py` is a standalone polling
-  process that reads Alpaca and the trading daemon's JSON artifacts, then writes one snapshot
-  document plus a `sessions` subcollection. Nothing in `overnight/` imports dashboard code.
+  process that reads Alpaca, the trading daemon's JSON artifacts, and its credential-free
+  effective configuration (falling back to `overnight/config.yaml`), then writes one
+  snapshot document plus a `sessions` subcollection. Nothing in `overnight/` imports
+  dashboard code.
 - The dashboard daemon retries its own failures. Trading must never supervise, import, or call it.
 - `dashboard/config.yaml` holds Firebase and dashboard-login settings. `nuxt.config.ts` parses it
   at build time and copies only browser-safe values into `runtimeConfig.public`; configured

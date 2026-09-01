@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from omegaconf.errors import ConfigKeyError
 from rich.console import Console
 
 from live import (
@@ -28,6 +29,7 @@ from live import (
     _select_unconflicted_candidates,
     _validate_args,
     _validate_exit_clock,
+    _write_effective_configuration,
     available_budget,
     build_parser,
     completed_liquidity_ranking,
@@ -38,6 +40,13 @@ from live import (
     refresh_daily_cache,
     seed_missing_daily_cache,
     whole_share_order_plan,
+    parse_live_arguments,
+)
+from live_config import (
+    DEFAULT_LIVE_CONFIG_PATH,
+    EFFECTIVE_CONFIG_FILENAME,
+    effective_live_settings,
+    load_live_settings,
 )
 
 
@@ -337,7 +346,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertIsInstance(parsed, StrategyConfig)
         self.assertEqual(args.ranking_time.strftime("%H:%M"), "14:00")
-        self.assertEqual(args.share_mode, "whole")
+        self.assertEqual(args.share_mode, "fractional")
         self.assertEqual(args.feed, "sip")
         self.assertEqual(args.quote_feed, "iex")
         self.assertEqual(args.capital_fraction, 1.0)
@@ -363,6 +372,67 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         preview_args = parser.parse_args(["preview"])
         preview_config = _validate_args(parser, preview_args)
         self.assertIsInstance(preview_config, StrategyConfig)
+
+    def test_yaml_defaults_and_cli_overrides_are_merged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "live.yaml"
+            config_path.write_text(
+                DEFAULT_LIVE_CONFIG_PATH.read_text().replace(
+                    'entry_time: "15:45"', 'entry_time: "15:40"'
+                )
+            )
+
+            parser, yaml_args, _ = parse_live_arguments(
+                ["status", "--config", str(config_path)]
+            )
+            yaml_config = _validate_args(parser, yaml_args)
+            parser, cli_args, _ = parse_live_arguments(
+                [
+                    "status",
+                    "--config",
+                    str(config_path),
+                    "--entry-time",
+                    "15:35",
+                    "--top",
+                    "15",
+                ]
+            )
+            cli_config = _validate_args(parser, cli_args)
+
+        self.assertEqual(yaml_args.entry_time.strftime("%H:%M"), "15:40")
+        self.assertEqual(yaml_config.top, 12)
+        self.assertEqual(cli_args.entry_time.strftime("%H:%M"), "15:35")
+        self.assertEqual(cli_config.top, 15)
+        effective = effective_live_settings(cli_args)
+        self.assertEqual(effective["schedule"]["entry_time"], "15:35")
+        self.assertEqual(effective["strategy"]["top"], 15)
+
+    def test_effective_config_artifact_records_merged_runtime_values(self):
+        parser, args, _ = parse_live_arguments(
+            ["run", "--entry-time", "15:40", "--submit", "--allow-live-endpoint"]
+        )
+        _validate_args(parser, args)
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_effective_configuration(args, Path(directory))
+            payload = json.loads(path.read_text())
+
+        self.assertEqual(path.name, EFFECTIVE_CONFIG_FILENAME)
+        self.assertEqual(payload["configuration"]["schedule"]["entry_time"], "15:40")
+        self.assertEqual(payload["configuration"]["strategy"]["top"], 12)
+        self.assertTrue(payload["configuration"]["runtime"]["submit"])
+
+    def test_live_yaml_is_complete_and_rejects_unknown_keys(self):
+        settings = load_live_settings()
+        self.assertEqual(settings.schedule.entry_time, "15:45")
+        self.assertEqual(settings.strategy.top, 12)
+        self.assertEqual(settings.strategy.liquidity_scheme, "turnover_stability")
+        self.assertEqual(settings.execution.share_mode, "fractional")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "invalid.yaml"
+            config_path.write_text(DEFAULT_LIVE_CONFIG_PATH.read_text() + "\nunknown: true\n")
+            with self.assertRaises(ConfigKeyError):
+                load_live_settings(config_path)
 
     def test_preopen_exit_clock_allows_queued_orders(self):
         preopen = FakeClockBroker("2026-08-25T09:00:00-04:00", False)

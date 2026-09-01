@@ -36,14 +36,57 @@ from dashboard_metrics import EASTERN
 
 LOGGER = logging.getLogger("dashboard-daemon")
 
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 SESSIONS_SUBCOLLECTION = "sessions"
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_WORK_DIRS = {
     "paper": Path("/data/ppv1/paper"),
     "live": Path("/data/ppv1/live"),
 }
+DEFAULT_TRADING_CONFIG_PATH = Path(__file__).resolve().parents[2] / "overnight" / "config.yaml"
+EFFECTIVE_CONFIG_FILENAME = "effective_config.json"
 _DAY_DIRECTORY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_PUBLIC_TRADING_CONFIG_FIELDS = {
+    "schedule": (
+        "time_zone",
+        "ranking_time",
+        "entry_time",
+        "exit_time",
+        "minimum_ranking_lead_minutes",
+        "entry_grace_seconds",
+    ),
+    "strategy": (
+        "top",
+        "liquidity_scheme",
+        "ema_span",
+        "min_history_days",
+        "minimum_trading_days",
+        "liquidity_lookback_days",
+        "exchanges",
+    ),
+    "data": (
+        "shortlist_since",
+        "shortlist_daily_top",
+        "shortlist_lookback_sessions",
+        "daily_overlap_days",
+        "feed",
+        "quote_feed",
+        "data_batch_size",
+        "data_workers",
+    ),
+    "execution": (
+        "order_submit_workers",
+        "capital",
+        "capital_fraction",
+        "cash_buffer_fraction",
+        "share_mode",
+        "quote_max_age_seconds",
+        "fill_timeout_seconds",
+        "poll_seconds",
+        "entry_preflight_seconds",
+    ),
+}
 
 # Only these account fields reach the browser. Everything else Alpaca returns is either
 # noise or something there is no reason to publish.
@@ -256,6 +299,39 @@ def load_state(state_path: Path) -> dict[str, Any]:
         return {}
 
 
+def load_trading_configuration(
+    path: Path,
+    effective_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load active merged values, falling back to YAML when no daemon is running."""
+    config_path = path.expanduser().resolve()
+    if effective_path is not None and effective_path.is_file():
+        try:
+            effective = json.loads(effective_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"invalid effective trading config: {effective_path}") from error
+        if effective.get("version") != 1 or not isinstance(
+            effective.get("configuration"), dict
+        ):
+            raise ValueError(f"unsupported effective trading config: {effective_path}")
+        config = OmegaConf.create(effective["configuration"])
+    else:
+        if not config_path.is_file():
+            raise FileNotFoundError(f"trading config does not exist: {config_path}")
+        config = OmegaConf.load(config_path)
+    public: dict[str, dict[str, Any]] = {}
+    for section, fields in _PUBLIC_TRADING_CONFIG_FIELDS.items():
+        values: dict[str, Any] = {}
+        for field in fields:
+            key = f"{section}.{field}"
+            value = OmegaConf.select(config, key)
+            if value is None and key != "execution.capital":
+                raise ValueError(f"trading config is missing {key}")
+            values[field] = value
+        public[section] = values
+    return public
+
+
 def first_trade_date(work_dir: Path) -> date | None:
     """Return the earliest strategy entry date with at least one actual fill."""
     if not work_dir.exists():
@@ -300,8 +376,7 @@ def session_records(
         reverse=True
     )
 
-    records: list[dict[str, Any]] = []
-    seen_baskets: set[tuple[str, str]] = set()
+    candidates: dict[tuple[str, str], tuple[tuple[bool, bool, str], dict[str, Any]]] = {}
     for directory in days:
         summary_path = directory / "summary.json"
         if not summary_path.exists():
@@ -319,9 +394,6 @@ def session_records(
         entry_date = str(position.get("entry_date") or summary.get("trading_day") or directory.name)
         exit_date = str(position.get("exit_date") or "")
         basket_key = (entry_date, exit_date)
-        if basket_key in seen_baskets:
-            continue
-        seen_baskets.add(basket_key)
 
         execution = summary.get("execution") or {}
         entry_snapshot = position.get("entry_account_snapshot") or {}
@@ -356,30 +428,43 @@ def session_records(
         else:
             realized_pnl = gross_realized_pnl
             realized_return = gross_realized_return
-        records.append(
-            {
-                "trading_day": entry_date,
-                "last_action": summary.get("last_action"),
-                "updated_at": summary.get("updated_at"),
-                "status": position.get("status"),
-                "entry_date": position.get("entry_date"),
-                "exit_date": position.get("exit_date"),
-                "symbols": list(position.get("symbols") or []),
-                "entry_equity": entry_equity if entry_equity > 0.0 else None,
-                "exit_equity": exit_equity if exit_equity > 0.0 else None,
-                "entry_notional": entry_notional,
-                "exit_notional": exit_notional,
-                "gross_realized_pnl": gross_realized_pnl,
-                "gross_realized_return": gross_realized_return,
-                "realized_pnl": realized_pnl,
-                "realized_return": realized_return,
-                "trades": [trade.as_dict() for trade in trades],
-                "error": summary.get("error")
-            }
+        record = {
+            "trading_day": entry_date,
+            "last_action": summary.get("last_action"),
+            "updated_at": summary.get("updated_at"),
+            "status": position.get("status"),
+            "entry_date": position.get("entry_date"),
+            "exit_date": position.get("exit_date"),
+            "symbols": list(position.get("symbols") or []),
+            "entry_equity": entry_equity if entry_equity > 0.0 else None,
+            "exit_equity": exit_equity if exit_equity > 0.0 else None,
+            "entry_notional": entry_notional,
+            "exit_notional": exit_notional,
+            "gross_realized_pnl": gross_realized_pnl,
+            "gross_realized_return": gross_realized_return,
+            "realized_pnl": realized_pnl,
+            "realized_return": realized_return,
+            "trades": [trade.as_dict() for trade in trades],
+            "error": summary.get("error")
+        }
+
+        # The trading daemon can copy an open basket into weekend/non-session
+        # artifacts before its canonical entry-day summary is updated at the exit.
+        # Pick the most authoritative copy instead of whichever directory happens
+        # to sort first: a closed basket wins, then its entry-day artifact, then the
+        # latest update. Otherwise a Sunday error can hide Monday's realized result.
+        priority = (
+            position.get("status") == "closed",
+            directory.name == entry_date,
+            str(summary.get("updated_at") or ""),
         )
-        if limit is not None and len(records) >= limit:
-            break
-    return records
+        existing = candidates.get(basket_key)
+        if existing is None or priority > existing[0]:
+            candidates[basket_key] = (priority, record)
+
+    records = [candidate[1] for candidate in candidates.values()]
+    records.sort(key=lambda record: str(record.get("trading_day") or ""), reverse=True)
+    return records if limit is None else records[:limit]
 
 
 def build_snapshot(
@@ -389,6 +474,7 @@ def build_snapshot(
     now: datetime | None = None,
     order_history: Sequence[Mapping[str, Any]] | None = None,
     session_history: Sequence[Mapping[str, Any]] | None = None,
+    configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fetch everything the dashboard shows and shape it into one Firestore document."""
     reference = (now or datetime.now(tz=EASTERN)).astimezone(EASTERN)
@@ -451,6 +537,7 @@ def build_snapshot(
         "version": SNAPSHOT_VERSION,
         "updated_at": reference.isoformat(),
         "trading_day": reference.date().isoformat(),
+        "configuration": dict(configuration or {}),
         "account": _numeric(account, _ACCOUNT_FIELDS),
         "performance": {key: value.as_dict() for key, value in buckets.items()},
         "statistics": stats.as_dict(),
@@ -607,6 +694,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="daemon work directory holding per-day artifacts (default: /data/ppv1/<mode>)"
     )
     parser.add_argument("--state-path", default=None, help="strategy state.json (default: <work-dir>/state.json)")
+    parser.add_argument(
+        "--trading-config",
+        default=str(DEFAULT_TRADING_CONFIG_PATH),
+        help="shared overnight live config published with each snapshot",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print one snapshot and exit")
     parser.add_argument("--once", action="store_true", help="publish one snapshot and exit")
     parser.add_argument("--interval-seconds", type=float, default=120.0)
@@ -654,6 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     LOGGER.info("using %s strategy artifacts from %s", trading_mode, work_dir)
     state_path = Path(args.state_path).expanduser() if args.state_path else work_dir / "state.json"
+    trading_config_path = Path(args.trading_config).expanduser()
     digest_state_path = (
         Path(args.digest_state_path).expanduser()
         if args.digest_state_path
@@ -665,6 +758,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def publish_once() -> None:
         state = load_state(state_path)
+        configuration = load_trading_configuration(
+            trading_config_path,
+            work_dir / EFFECTIVE_CONFIG_FILENAME,
+        )
         inception = first_trade_date(work_dir)
         order_history = None
         if inception is not None:
@@ -684,6 +781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inception=inception,
             order_history=order_history,
             session_history=all_sessions,
+            configuration=configuration,
         )
         if args.dry_run:
             print(json.dumps({"snapshot": snapshot, "sessions": sessions}, indent=2, default=str))

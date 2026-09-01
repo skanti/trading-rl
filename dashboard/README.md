@@ -12,11 +12,11 @@ Alpaca plus the trading process's JSON artifacts and publishes them to Firestore
 trading process has no Firebase imports, flags, callbacks, or failure modes.
 
 ```
-Alpaca paper API ───────────────┐
-                               ▼
-trading state.json ──read──▶ scripts/dashboard_daemon.py
-                               │
-                               └──▶ Firestore ──authed read──▶ Nuxt app
+Alpaca API ─────────────────────┐
+trading state.json ─────────────┤
+overnight/config.yaml ─────────┴──▶ scripts/dashboard_daemon.py
+                                      │
+                                      └──▶ Firestore ──authed read──▶ Nuxt app
 ```
 
 `accounts/paper` holds the snapshot; `accounts/paper/sessions/{YYYY-MM-DD}` holds one
@@ -31,6 +31,12 @@ older artifacts fall back to closed-basket fill arithmetic. Open baskets affect 
 separately displayed provisional equity but do not enter the realized curve until their
 exits complete. This keeps the chart consistent with Session History and independent of
 Alpaca's delayed daily portfolio-history rollover.
+
+The publisher reads the credential-free schedule, strategy, data, and execution
+sections from the live runner's `effective_config.json` on every poll, falling back to
+`overnight/config.yaml` when no active-runtime artifact exists. The frontend renders
+pipeline times from that snapshot, including CLI overrides, so parameters no longer
+need to be copied into dashboard config or baked into a new frontend build.
 
 ## Configuration
 

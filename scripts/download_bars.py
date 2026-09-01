@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from itertools import islice
 import tarfile
 import logging
 from datetime import datetime, timedelta, UTC
@@ -25,6 +26,7 @@ ANNO = datetime(2010, 1, 1, tzinfo=UTC)
 REQUEST_TIMEOUT = (10, 90)
 REQUEST_RETRIES = 10
 ALPACA_REQUESTS_PER_MINUTE = 180
+ALPACA_BATCH_SIZE = 100
 ALPACA_SIP_DELAY = timedelta(minutes=20)
 DATASET_MANIFEST = "_download_manifest.json"
 BAR_COLUMNS = {
@@ -60,6 +62,15 @@ class RateLimiter:
 
 
 ALPACA_RATE_LIMITER = RateLimiter(ALPACA_REQUESTS_PER_MINUTE)
+
+
+def batches(values: list, size: int):
+    """Yield bounded lists without requiring a second full copy of ``values``."""
+    if size < 1:
+        raise ValueError("batch size must be positive")
+    iterator = iter(values)
+    while batch := list(islice(iterator, size)):
+        yield batch
 
 
 def dataframe_to_array(
@@ -304,11 +315,18 @@ def clean_ticker(ticker: str) -> str:
     return storage_ticker(ticker)
 
 
-def download_bars_alpaca(
-    ticker: str, since: datetime, timeframe: str = "1Min"
-) -> pd.DataFrame:
-    # clean ticker
-    ticker = clean_ticker(ticker)
+def download_bars_alpaca_batch(
+    tickers: list[str], since: datetime, timeframe: str = "1Min"
+) -> dict[str, pd.DataFrame]:
+    """Download one shared time range for several symbols.
+
+    Alpaca's multi-symbol endpoint paginates across the combined result. Keeping
+    the page loop here reduces request count without changing the per-symbol
+    validation and atomic storage performed by ``process_ticker``.
+    """
+    cleaned = list(dict.fromkeys(clean_ticker(ticker) for ticker in tickers))
+    if not cleaned:
+        raise ValueError("at least one ticker is required")
     # set date
     dt_start = since
     # The subscription exposes delayed SIP data. Rounding the end up to the
@@ -331,7 +349,7 @@ def download_bars_alpaca(
     }
     base_url = "https://data.alpaca.markets/v2/stocks/bars"
     params = {
-        "symbols": ticker,
+        "symbols": ",".join(cleaned),
         "timeframe": timeframe,
         "limit": 10000,
         "adjustment": "split",
@@ -340,24 +358,40 @@ def download_bars_alpaca(
         "start": dt_start.isoformat(),
         "end": dt_end.isoformat(),
     }
-    bars = []
+    bars: dict[str, list[dict]] = {ticker: [] for ticker in cleaned}
     page_token = None
     with requests.Session() as session:
         while True:
-            res = request_json(session, base_url, params, headers, ticker)
-            page_bars = res.get("bars", {}).get(ticker, [])
-            bars.extend(page_bars)
+            request_label = ",".join(cleaned[:3])
+            if len(cleaned) > 3:
+                request_label += f",... ({len(cleaned)} symbols)"
+            res = request_json(session, base_url, params, headers, request_label)
+            page_bars = res.get("bars", {})
+            if not isinstance(page_bars, dict):
+                raise ValueError("Alpaca response bars must be an object")
+            for ticker, ticker_bars in page_bars.items():
+                symbol = clean_ticker(ticker)
+                if symbol in bars:
+                    bars[symbol].extend(ticker_bars)
             next_page_token = res.get("next_page_token")
             if next_page_token is None:
                 break
             if next_page_token == page_token:
-                raise RuntimeError(f"pagination token repeated for ticker={ticker}")
+                raise RuntimeError(
+                    f"pagination token repeated for symbols={request_label}"
+                )
             page_token = next_page_token
             params["page_token"] = next_page_token
 
-    # to dataframe
-    df = pd.DataFrame(bars)
-    return df
+    return {ticker: pd.DataFrame(rows) for ticker, rows in bars.items()}
+
+
+def download_bars_alpaca(
+    ticker: str, since: datetime, timeframe: str = "1Min"
+) -> pd.DataFrame:
+    """Retain the single-symbol interface for fallbacks and external callers."""
+    symbol = clean_ticker(ticker)
+    return download_bars_alpaca_batch([symbol], since, timeframe)[symbol]
 
 
 def download_bars_polygon(
@@ -428,6 +462,7 @@ def process_ticker(
     update_existing: bool = False,
     overlap_days: int = 30,
     timeframe: str = "1Min",
+    initial_df: pd.DataFrame | None = None,
 ) -> bool:
     ticker = storage_ticker(ticker)
     out_path = f"{out_dir}/{ticker}.npy"
@@ -443,7 +478,11 @@ def process_ticker(
             base_start = ANNO + timedelta(seconds=int(base[0, 0]))
             base_last = ANNO + timedelta(seconds=int(base[-1, 0]))
             update_since = max(base_start, base_last - timedelta(days=overlap_days))
-            update_df = download_ticker(ticker, source, update_since, timeframe)
+            update_df = (
+                initial_df
+                if initial_df is not None
+                else download_ticker(ticker, source, update_since, timeframe)
+            )
             if update_df.empty:
                 logger.warning("No update bars found, ticker=%s", ticker)
                 return False
@@ -491,7 +530,11 @@ def process_ticker(
             )
             return True
 
-        df = download_ticker(ticker, source, since, timeframe)
+        df = (
+            initial_df
+            if initial_df is not None
+            else download_ticker(ticker, source, since, timeframe)
+        )
         if len(df) == 0:
             logger.warning(f"No bars found, ticker={ticker}")
             return False
@@ -499,6 +542,106 @@ def process_ticker(
     except Exception:
         logger.exception("Ticker failed, ticker=%s", ticker)
         return False
+
+
+def initial_request_since(
+    ticker: str,
+    out_dir: str,
+    since: datetime,
+    update_existing: bool,
+    overlap_days: int,
+) -> datetime:
+    """Return the initial range needed for a ticker's incremental request."""
+    out_path = pathlib.Path(out_dir) / f"{storage_ticker(ticker)}.npy"
+    if not update_existing or not out_path.exists():
+        return since
+    try:
+        base = np.load(out_path, mmap_mode="r")
+        if base.ndim != 2 or len(base) == 0:
+            return since
+        base_start = ANNO + timedelta(seconds=int(base[0, 0]))
+        base_last = ANNO + timedelta(seconds=int(base[-1, 0]))
+        return max(base_start, base_last - timedelta(days=overlap_days))
+    except (OSError, ValueError, IndexError):
+        return since
+
+
+def process_alpaca_batch(
+    tasks: list[tuple[int, str, datetime]],
+    out_dir: str,
+    since: datetime,
+    skip_existing: bool,
+    update_existing: bool,
+    overlap_days: int,
+    timeframe: str,
+) -> list[tuple[int, bool]]:
+    """Download a symbol batch once, then apply normal per-symbol persistence.
+
+    A rejected batch is bisected recursively. This preserves batching for healthy
+    symbols while isolating an invalid or temporarily problematic symbol.
+    """
+    if not tasks:
+        return []
+    request_since = min(task[2] for task in tasks)
+    try:
+        frames = download_bars_alpaca_batch(
+            [task[1] for task in tasks], request_since, timeframe
+        )
+    except Exception:
+        if len(tasks) == 1:
+            index, ticker, _ = tasks[0]
+            logger.exception("Alpaca batch failed, ticker=%s", ticker)
+            succeeded = process_ticker(
+                ticker,
+                source="alpaca",
+                out_dir=out_dir,
+                since=since,
+                skip_existing=skip_existing,
+                update_existing=update_existing,
+                overlap_days=overlap_days,
+                timeframe=timeframe,
+            )
+            return [(index, succeeded)]
+        midpoint = len(tasks) // 2
+        logger.warning(
+            "Alpaca batch failed; retrying as groups of %d and %d symbols",
+            midpoint,
+            len(tasks) - midpoint,
+        )
+        return process_alpaca_batch(
+            tasks[:midpoint],
+            out_dir,
+            since,
+            skip_existing,
+            update_existing,
+            overlap_days,
+            timeframe,
+        ) + process_alpaca_batch(
+            tasks[midpoint:],
+            out_dir,
+            since,
+            skip_existing,
+            update_existing,
+            overlap_days,
+            timeframe,
+        )
+
+    outcomes = []
+    for index, ticker, _ in tasks:
+        frame = frames.get(clean_ticker(ticker), pd.DataFrame())
+        succeeded = process_ticker(
+            ticker,
+            source="alpaca",
+            out_dir=out_dir,
+            since=since,
+            skip_existing=skip_existing,
+            update_existing=update_existing,
+            overlap_days=overlap_days,
+            timeframe=timeframe,
+            initial_df=frame,
+        )
+        outcomes.append((index, succeeded))
+    return outcomes
 
 
 def pack_to_archive(arc_dir: str) -> str:
@@ -523,6 +666,24 @@ def rot13(text: str) -> str:
     return text.translate(str.maketrans(abc, cba))
 
 
+def load_tickers(tickers_path: str) -> list[str]:
+    """Load a symbol list from any existing file, including extensionless files."""
+    path = pathlib.Path(tickers_path)
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        values = payload["sample_ids"]
+    elif path.is_file():
+        values = path.read_text(encoding="utf-8").splitlines()
+    elif path.suffix.lower() in {".csv", ".txt"} or os.sep in tickers_path:
+        raise FileNotFoundError(f"ticker list does not exist: {tickers_path}")
+    else:
+        values = [tickers_path]
+    tickers = [str(value).strip() for value in values if str(value).strip()]
+    if not tickers:
+        raise ValueError(f"ticker list is empty: {tickers_path}")
+    return tickers
+
+
 def main(
     source: str,
     tickers_path: str,
@@ -535,7 +696,15 @@ def main(
     overlap_days: int = 30,
     timeframe: str = "1Min",
     rot: bool = False,
+    batch_size: int = ALPACA_BATCH_SIZE,
+    requests_per_minute: int = ALPACA_REQUESTS_PER_MINUTE,
 ) -> None:
+    global ALPACA_RATE_LIMITER
+    if batch_size < 1:
+        raise ValueError("batch size must be positive")
+    if requests_per_minute < 1:
+        raise ValueError("requests per minute must be positive")
+    ALPACA_RATE_LIMITER = RateLimiter(requests_per_minute)
     os.makedirs(out_dir, exist_ok=True)
     manifest_path = pathlib.Path(out_dir) / DATASET_MANIFEST
     if update_existing and manifest_path.exists():
@@ -554,40 +723,89 @@ def main(
 
     t0 = time.perf_counter()
 
-    if tickers_path.endswith(".json"):
-        with open(tickers_path, "r") as f:
-            tickers = json.load(f)["sample_ids"]
-    elif tickers_path.endswith((".csv", ".txt")):
-        with open(tickers_path, "r") as f:
-            tickers = f.read().splitlines()
-    else:
-        tickers = [tickers_path]
+    tickers = load_tickers(tickers_path)
 
     if rot:
         tickers = [rot13(ticker) for ticker in tickers]
     tickers_num = len(tickers)
     assert tickers_num > 0, "No tickers found"
     logger.info(f"Tickers provided, tickers_num={tickers_num}")
+    if source == "alpaca":
+        logger.info(
+            "Alpaca download settings, timeframe=%s, batch_size=%d, workers=%d, "
+            "requests_per_minute=%d",
+            timeframe,
+            batch_size,
+            workers_num,
+            requests_per_minute,
+        )
 
-    fn = partial(
-        process_ticker,
-        source=source,
-        out_dir=out_dir,
-        since=since,
-        skip_existing=skip_existing,
-        update_existing=update_existing,
-        overlap_days=overlap_days,
-        timeframe=timeframe,
-    )
-    if workers_num == 0:
-        res = list(tqdm(map(fn, tickers), total=tickers_num, desc="Processing tickers"))
-    else:
-        with ThreadPoolExecutor(max_workers=workers_num) as pool:
-            res = list(
-                tqdm(
-                    pool.map(fn, tickers), total=tickers_num, desc="Processing tickers"
-                )
+    if source == "alpaca" and batch_size > 1 and not skip_existing:
+        tasks = [
+            (
+                index,
+                ticker,
+                initial_request_since(
+                    ticker, out_dir, since, update_existing, overlap_days
+                ),
             )
+            for index, ticker in enumerate(tickers)
+        ]
+        # Similar start dates share batches so one stale/delisted symbol does not
+        # expand the requested history for a batch of current symbols.
+        tasks.sort(key=lambda task: task[2])
+        task_batches = list(batches(tasks, batch_size))
+        batch_fn = partial(
+            process_alpaca_batch,
+            out_dir=out_dir,
+            since=since,
+            skip_existing=skip_existing,
+            update_existing=update_existing,
+            overlap_days=overlap_days,
+            timeframe=timeframe,
+        )
+        outcomes: list[tuple[int, bool]] = []
+        if workers_num == 0:
+            iterator = map(batch_fn, task_batches)
+            with tqdm(total=tickers_num, desc="Processing tickers") as progress:
+                for batch_outcomes in iterator:
+                    outcomes.extend(batch_outcomes)
+                    progress.update(len(batch_outcomes))
+        else:
+            with (
+                ThreadPoolExecutor(max_workers=workers_num) as pool,
+                tqdm(total=tickers_num, desc="Processing tickers") as progress,
+            ):
+                for batch_outcomes in pool.map(batch_fn, task_batches):
+                    outcomes.extend(batch_outcomes)
+                    progress.update(len(batch_outcomes))
+        res = [False] * tickers_num
+        for index, succeeded in outcomes:
+            res[index] = succeeded
+    else:
+        fn = partial(
+            process_ticker,
+            source=source,
+            out_dir=out_dir,
+            since=since,
+            skip_existing=skip_existing,
+            update_existing=update_existing,
+            overlap_days=overlap_days,
+            timeframe=timeframe,
+        )
+        if workers_num == 0:
+            res = list(
+                tqdm(map(fn, tickers), total=tickers_num, desc="Processing tickers")
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=workers_num) as pool:
+                res = list(
+                    tqdm(
+                        pool.map(fn, tickers),
+                        total=tickers_num,
+                        desc="Processing tickers",
+                    )
+                )
     t1 = time.perf_counter()
 
     success_num = sum(res)
@@ -620,6 +838,8 @@ def main(
         "failed_count": len(failed_tickers),
         "update_existing": update_existing,
         "overlap_days": overlap_days,
+        "batch_size": batch_size if source == "alpaca" else 1,
+        "requests_per_minute": requests_per_minute if source == "alpaca" else None,
     }
     manifest_part = manifest_path.with_suffix(f"{manifest_path.suffix}.part")
     manifest_part.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -672,6 +892,23 @@ parser.add_argument(
     default=30,
     help="calendar days compared during --update_existing (default: 30)",
 )
+parser.add_argument(
+    "--batch_size",
+    type=int,
+    default=int(os.environ.get("ALPACA_BAR_BATCH_SIZE", ALPACA_BATCH_SIZE)),
+    help="symbols per Alpaca request (default: 100; env: ALPACA_BAR_BATCH_SIZE)",
+)
+parser.add_argument(
+    "--requests_per_minute",
+    type=int,
+    default=int(
+        os.environ.get("ALPACA_REQUESTS_PER_MINUTE", ALPACA_REQUESTS_PER_MINUTE)
+    ),
+    help=(
+        "client-side Alpaca request limit (default: 180; env: "
+        "ALPACA_REQUESTS_PER_MINUTE)"
+    ),
+)
 parser.add_argument("--rot", action="store_true", help="Apply rot13?")
 
 if __name__ == "__main__":
@@ -680,6 +917,10 @@ if __name__ == "__main__":
         parser.error("--skip_existing and --update_existing are mutually exclusive")
     if args.overlap_days < 1:
         parser.error("--overlap_days must be positive")
+    if args.batch_size < 1:
+        parser.error("--batch_size must be positive")
+    if args.requests_per_minute < 1:
+        parser.error("--requests_per_minute must be positive")
     if args.days is None and args.since is None and args.update_existing:
         existing_manifest_path = pathlib.Path(args.out_dir) / DATASET_MANIFEST
         if existing_manifest_path.exists():
@@ -708,4 +949,6 @@ if __name__ == "__main__":
         overlap_days=args.overlap_days,
         timeframe=args.timeframe,
         rot=args.rot,
+        batch_size=args.batch_size,
+        requests_per_minute=args.requests_per_minute,
     )

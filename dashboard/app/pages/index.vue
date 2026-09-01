@@ -89,6 +89,7 @@ const recentSessions = computed(() => sessions.value.slice(0, 8))
         <StrategyPipeline
           :strategy="snapshot.strategy"
           :market="snapshot.market"
+          :schedule="snapshot.configuration?.schedule"
         />
       </div>
 

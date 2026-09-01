@@ -1,0 +1,55 @@
+# Single source of truth for live/paper overnight execution. Alpaca credentials stay
+# in environment variables; command-line options may override any value for one run.
+
+schedule:
+  time_zone: "America/New_York"
+  ranking_time: "14:00"
+  entry_time: "15:45"
+  exit_time: "08:00"
+  minimum_ranking_lead_minutes: 20
+  entry_grace_seconds: 75
+
+strategy:
+  top: 12
+  liquidity_scheme: "turnover_stability"
+  ema_span: 10
+  min_history_days: 20
+  minimum_trading_days: 100
+  liquidity_lookback_days: 180
+  exchanges: "NASDAQ"
+
+data:
+  daily_bars_dir: "/data/ppv1/updates/bars_1day_2016-01-01"
+  liquidity_shortlist: "/home/aavetisyan/dev/trading-rl/data/most_liquid.txt"
+  shortlist_since: "2022-01-01"
+  shortlist_daily_top: 50
+  shortlist_lookback_sessions: 250
+  daily_overlap_days: 30
+  feed: "sip"
+  quote_feed: "iex"
+  data_batch_size: 100
+  data_workers: 8
+
+execution:
+  order_submit_workers: 8
+  capital: null
+  capital_fraction: 1.0
+  cash_buffer_fraction: 0.02
+  share_mode: "fractional"
+  quote_max_age_seconds: 120.0
+  fill_timeout_seconds: 45.0
+  poll_seconds: 1.0
+  entry_preflight_seconds: 10.0
+
+runtime:
+  work_dir: "/data/ppv1/live"
+  state_path: null
+  trade_date: null
+  trading_url: "${oc.env:ALPACA_URL,https://paper-api.alpaca.markets/v2}"
+  data_url: "${oc.env:ALPACA_DATA_URL,https://data.alpaca.markets/v2}"
+  request_timeout_seconds: 30.0
+  # Submission and live-endpoint access remain opt-in safety gates. Start the live
+  # daemon with: python live.py run --submit --allow-live-endpoint
+  submit: false
+  allow_live_endpoint: false
+  log_level: "INFO"

@@ -17,6 +17,7 @@ PRICE_INDICES = (1, 2, 3, 4, 7)
 MINUTE_INT32_MAX = np.iinfo(np.int32).max
 DEFAULT_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2016-01-01")
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "data" / "most_liquid.txt"
+DEFAULT_LOOKBACK_SESSIONS = 250
 
 
 def _validate_dataset(bars_dir: Path) -> None:
@@ -49,10 +50,13 @@ def historical_top_symbols(
     since: str,
     top: int = 50,
     metrics: tuple[str, ...] = ("dollar_volume",),
+    lookback_sessions: int | None = DEFAULT_LOOKBACK_SESSIONS,
 ) -> tuple[list[str], int]:
-    """Return symbols appearing in a daily top-N for any requested metric."""
+    """Return the trailing union of daily top-N symbols for requested metrics."""
     if top < 1:
         raise ValueError("top must be positive")
+    if lookback_sessions is not None and lookback_sessions < 1:
+        raise ValueError("lookback sessions must be positive")
     unknown_metrics = set(metrics).difference((*COLUMN_INDEX, "dollar_volume"))
     if unknown_metrics:
         raise ValueError(f"unknown metrics: {sorted(unknown_metrics)}")
@@ -90,6 +94,9 @@ def historical_top_symbols(
         raise ValueError(f"dataset has no rows on or after {since}")
 
     ordered_timestamps = np.asarray(sorted(timestamps), dtype=np.int64)
+    if lookback_sessions is not None:
+        ordered_timestamps = ordered_timestamps[-int(lookback_sessions) :]
+    window_start = int(ordered_timestamps[0])
     timestamp_to_row = {
         int(timestamp): row for row, timestamp in enumerate(ordered_timestamps)
     }
@@ -100,7 +107,7 @@ def historical_top_symbols(
 
     for symbol_index, path in enumerate(paths):
         array = np.load(path, mmap_mode="r")
-        rows = _eligible_rows(array, since_seconds)
+        rows = _eligible_rows(array, window_start)
         row_indices = np.fromiter(
             (timestamp_to_row[int(value)] for value in rows[:, 0]),
             dtype=np.int64,
@@ -155,6 +162,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--since", default="2022-01-01")
     parser.add_argument("--top", type=int, default=50)
     parser.add_argument(
+        "--lookback-sessions",
+        type=int,
+        default=DEFAULT_LOOKBACK_SESSIONS,
+        help=(
+            "union only the most recent completed sessions (default: 250); "
+            "use 0 for every session since --since"
+        ),
+    )
+    parser.add_argument(
         "--metric",
         choices=("dollar-volume", "volume", "trades"),
         default="dollar-volume",
@@ -166,9 +182,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.lookback_sessions < 0:
+        raise ValueError("lookback sessions cannot be negative")
     metrics = (args.metric.replace("-", "_"),)
     symbols, trading_days = historical_top_symbols(
-        args.bars_dir, args.since, args.top, metrics
+        args.bars_dir,
+        args.since,
+        args.top,
+        metrics,
+        args.lookback_sessions or None,
     )
     _write_symbols(args.output, symbols)
     print(
