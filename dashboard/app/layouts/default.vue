@@ -51,7 +51,7 @@ const dashboardMenu: DropdownMenuItem[][] = [[
 <template>
   <div class="min-h-screen min-w-0 overflow-x-clip bg-slate-950 text-slate-100">
     <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/85 backdrop-blur">
-      <div class="mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-2 py-3 sm:px-4 md:flex md:gap-x-6">
+      <div class="mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 p-2 md:flex md:gap-x-6">
         <div class="flex min-w-0 items-center gap-1">
           <UDropdownMenu
             :items="dashboardMenu"
