@@ -12,6 +12,7 @@ from backtest import (
     activity_union_candidate_mask,
     basket_quantities,
     causal_ema_log_liquidity,
+    causal_turnover_stability,
     causal_completed_trading_days,
     company_universe_mask,
     exchange_universe_mask,
@@ -202,6 +203,39 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         # AAPL stays eligible on both sessions; UNH is excluded only where its
         # NYSE print is known, and stays eligible where no auction was recorded.
         self.assertEqual(mask.tolist(), [[True, True], [True, False]])
+
+    def test_turnover_stability_demotes_a_briefly_enormous_name(self):
+        """STEADY and SPIKY average the same turnover; only SPIKY is erratic."""
+        sessions = 40
+        steady = np.full(sessions, 1_000_000.0)
+        # SPIKY trades more on every measure, but a quarter of that arrives in
+        # bursts. It has to out-rank STEADY on the raw level for the test to say
+        # anything -- log1p is concave, so the EMA already discounts burstiness
+        # on its own and an equal-mean burst name loses without any penalty.
+        spiky = np.full(sessions, 1_500_000.0)
+        spiky[::4] = 20_000_000.0
+        volume = np.column_stack((steady, spiky))
+
+        level = causal_ema_log_liquidity(volume, 10, 5)
+        stability = causal_turnover_stability(volume, 10, 5)
+
+        # The burst name leads on the raw level; the dispersion penalty reverses it.
+        self.assertGreater(level[-1, 1], level[-1, 0])
+        self.assertGreater(stability[-1, 0], stability[-1, 1])
+
+    def test_turnover_stability_reads_only_prior_sessions(self):
+        volume = np.full((30, 1), 1_000_000.0)
+        baseline = causal_turnover_stability(volume, 10, 5)
+
+        # Rewriting the final session must not move any score at or before it.
+        volume[-1, 0] = 9_000_000_000.0
+        revised = causal_turnover_stability(volume, 10, 5)
+
+        np.testing.assert_allclose(baseline, revised, equal_nan=True)
+
+    def test_turnover_stability_rejects_a_degenerate_window(self):
+        with self.assertRaises(ValueError):
+            causal_turnover_stability(np.full((10, 1), 1.0), 10, 5, dispersion_window=1)
 
     def test_whole_share_sizing_rounds_down_without_exceeding_budget(self):
         prices = np.array([120.0, 300.0, 700.0])

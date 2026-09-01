@@ -53,6 +53,7 @@ def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
         shortlist_since=date(2022, 1, 1),
         shortlist_daily_top=50,
         shortlist_lookback_sessions=250,
+        liquidity_scheme="dollar_ema",
         daily_overlap_days=30,
         feed="iex",
         quote_feed="iex",
@@ -667,6 +668,43 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertIsNotNone(merged)
         np.testing.assert_array_equal(merged, stored)
+
+    def test_live_ranking_matches_the_simulator_scheme_for_scheme(self):
+        """The live scorer must agree with the simulator on identical input, or a
+        live basket and a backtested one silently diverge."""
+        from backtest import causal_ema_log_liquidity, causal_turnover_stability
+
+        days = [f"2026-06-{d:02d}" for d in range(1, 26)]
+        sessions = [date.fromisoformat(d) for d in days]
+        volumes = {
+            "STEADY": [1_000 for _ in days],
+            "SPIKY": [4_000 if i % 4 == 0 else 200 for i in range(len(days))],
+        }
+        bars = {s: [bar(d, v, 100.0) for d, v in zip(days, vol)]
+                for s, vol in volumes.items()}
+        # completed_liquidity_ranking scores a matrix one row longer than the
+        # session count, so its last row sees every completed session. Match that
+        # shape here or the reference lags the live scorer by one session.
+        matrix = np.column_stack([
+            np.asarray(volumes[s] + [np.nan], dtype=float) * 100.0
+            for s in ("SPIKY", "STEADY")
+        ])
+
+        for scheme, reference in (
+            ("dollar_ema", causal_ema_log_liquidity),
+            ("turnover_stability", causal_turnover_stability),
+        ):
+            ranked = completed_liquidity_ranking(
+                bars, sessions, date(2026, 6, 26), 10, 5, 5, scheme
+            )
+            live = {symbol: score for symbol, score, _ in ranked}
+            expected = reference(matrix, 10, 5)[-1]
+            self.assertAlmostEqual(live["SPIKY"], float(expected[0]), places=9)
+            self.assertAlmostEqual(live["STEADY"], float(expected[1]), places=9)
+
+    def test_live_ranking_rejects_an_unknown_scheme(self):
+        with self.assertRaises(ValueError):
+            completed_liquidity_ranking({}, [date(2026, 6, 1)], date(2026, 6, 2), 10, 5, 5, "nope")
 
     def test_dollar_volume_shortlist_lookback_drops_a_stale_past_leader(self):
         """FADED led on the oldest session only. Unioning every session keeps it

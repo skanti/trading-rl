@@ -38,6 +38,7 @@ from backtest import (
     issuer_key,
     _security_symbol,
     causal_ema_log_liquidity,
+    causal_turnover_stability,
     is_company_security,
     load_nasdaq_security_master,
 )
@@ -216,6 +217,7 @@ class DailyArtifacts:
                 "shortlist_since": config.shortlist_since.isoformat(),
                 "shortlist_daily_top": config.shortlist_daily_top,
                 "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
+                "liquidity_scheme": config.liquidity_scheme,
                 "daily_overlap_days": config.daily_overlap_days,
                 "feed": config.feed,
                 "ranking_feed": config.feed,
@@ -573,6 +575,7 @@ class StrategyConfig:
     shortlist_since: date
     shortlist_daily_top: int
     shortlist_lookback_sessions: int | None
+    liquidity_scheme: str
     daily_overlap_days: int
     feed: str
     quote_feed: str
@@ -1041,13 +1044,20 @@ def completed_liquidity_ranking(
     ema_span: int,
     min_history_days: int,
     minimum_trading_days: int | None = None,
+    scheme: str = "dollar_ema",
 ) -> list[tuple[str, float, int]]:
     """Rank symbols using bars strictly before ``trade_date``.
 
     Dollar volume uses daily VWAP times volume, falling back to close times
     volume only when VWAP is unavailable. Missing sessions decay an existing
     EMA exactly like the backtest and do not count toward minimum history.
+
+    ``scheme`` selects the ranking statistic, and both options call straight into
+    the simulator's implementation so a live basket and a simulated one cannot
+    drift apart.
     """
+    if scheme not in ("dollar_ema", "turnover_stability"):
+        raise ValueError(f"unsupported live liquidity scheme: {scheme}")
     completed = sorted({day for day in session_dates if day < trade_date})
     if not completed:
         raise ValueError("no completed sessions are available for ranking")
@@ -1072,7 +1082,12 @@ def completed_liquidity_ranking(
             if volume > 0.0 and price > 0.0:
                 values[row, column] = price * volume
                 observations[column] += 1
-    latest_scores = causal_ema_log_liquidity(values, ema_span, min_history_days)[-1]
+    score_matrix = (
+        causal_turnover_stability(values, ema_span, min_history_days)
+        if scheme == "turnover_stability"
+        else causal_ema_log_liquidity(values, ema_span, min_history_days)
+    )
+    latest_scores = score_matrix[-1]
     required_sessions = (
         int(min_history_days)
         if minimum_trading_days is None
@@ -1168,6 +1183,7 @@ def rank_for_day(
         if (
             prior.get("trade_date") == trade_date.isoformat()
             and prior.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
+            and prior.get("liquidity_scheme") == config.liquidity_scheme
         ):
             LOGGER.info("ranking for %s already exists; reusing it", trade_date)
             return dict(prior)
@@ -1300,6 +1316,7 @@ def rank_for_day(
             config.ema_span,
             config.min_history_days,
             config.minimum_trading_days,
+            config.liquidity_scheme,
         )
         reserve_count = min(len(ranking), max(config.top * 3, config.top + 20))
         if reserve_count < config.top:
@@ -1326,6 +1343,7 @@ def rank_for_day(
             "liquidity_shortlist": str(config.liquidity_shortlist),
             "shortlist_since": config.shortlist_since.isoformat(),
             "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
+            "liquidity_scheme": config.liquidity_scheme,
             "candidate_diagnostics": candidate_diagnostics,
             "market_data_dump": ticks_metadata,
             "screened_candidate_symbols": symbols,
@@ -2562,6 +2580,14 @@ def build_parser() -> argparse.ArgumentParser:
         "completed sessions strictly before the entry date, so starting earlier "
         "buys headroom for the daily-cache refresh without changing the result",
     )
+    parser.add_argument(
+        "--liquidity-scheme",
+        choices=("dollar_ema", "turnover_stability"),
+        default="dollar_ema",
+        help="dollar_ema ranks on the lagged log-dollar-volume EMA; turnover_stability "
+        "subtracts that name's own dispersion, demoting a stock that is only briefly "
+        "enormous below one that trades heavily every session",
+    )
     parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=20)
     parser.add_argument("--entry-grace-seconds", type=int, default=75)
     parser.add_argument("--ema-span", type=int, default=10)
@@ -2803,6 +2829,7 @@ def _validate_args(
         shortlist_since=args.shortlist_since,
         shortlist_daily_top=args.shortlist_daily_top,
         shortlist_lookback_sessions=args.shortlist_lookback_sessions or None,
+        liquidity_scheme=args.liquidity_scheme,
         daily_overlap_days=args.daily_overlap_days,
         feed=args.feed,
         quote_feed=args.quote_feed,

@@ -427,6 +427,44 @@ def causal_ema_log_liquidity(
     return scores
 
 
+DEFAULT_DISPERSION_WINDOW = 20
+
+
+def causal_turnover_stability(
+    dollar_volume: np.ndarray,
+    ema_span: int,
+    min_history_days: int,
+    dispersion_window: int = DEFAULT_DISPERSION_WINDOW,
+) -> np.ndarray:
+    """Rank on liquidity level less the dispersion of that same liquidity.
+
+    Both terms are log dollars, so the subtraction needs no weighting to be
+    meaningful: a name whose log turnover swings by 1.0 is docked exactly as much
+    as a name with e times less turnover. The penalty demotes a stock that is only
+    briefly enormous -- an earnings day, an index rebalance -- beneath one that
+    trades heavily every session. That matters here because the basket is held
+    through an entire overnight, which is when event risk actually pays out.
+
+    Both terms are causal. The EMA is already lagged, and the dispersion is
+    shifted one session, so row ``t`` sees only sessions strictly before ``t``.
+    """
+    if int(dispersion_window) < 2:
+        raise ValueError("dispersion window must span at least two sessions")
+    level = causal_ema_log_liquidity(dollar_volume, ema_span, min_history_days)
+    values = np.asarray(dollar_volume, dtype=np.float64)
+    logged = np.log1p(np.where(np.isfinite(values) & (values > 0.0), values, np.nan))
+    spread = (
+        pd.DataFrame(logged)
+        .rolling(int(dispersion_window), min_periods=int(dispersion_window) // 2)
+        .std()
+        .shift(1)
+        .to_numpy()
+    )
+    # A name without enough history to measure dispersion is not penalised for it;
+    # the separate minimum-history filter is what keeps such names out of a basket.
+    return level - np.nan_to_num(spread, nan=0.0)
+
+
 def causal_completed_trading_days(dollar_volume: np.ndarray) -> np.ndarray:
     """Count valid completed sessions strictly before every candidate date."""
     values = np.asarray(dollar_volume, dtype=np.float64)
@@ -1089,6 +1127,8 @@ def liquidity_scores(
         raise ValueError("liquidity arrays must have matching date-by-symbol shapes")
     if scheme in ("dollar_ema", "activity_union_ema"):
         return causal_ema_log_liquidity(dollar, ema_span, min_history_days)
+    if scheme == "turnover_stability":
+        return causal_turnover_stability(dollar, ema_span, min_history_days)
     if scheme == "alpaca_volume":
         return np.where(np.isfinite(shares) & (shares > 0.0), shares, np.nan)
     if scheme == "alpaca_trades":
@@ -1106,6 +1146,12 @@ def _metric_text(summary: dict[str, object]) -> str:
     if summary["liquidity_scheme"] == "dollar_ema":
         return (
             f"lagged log-dollar-volume EMA({summary['ema_span_sessions']}), "
+            f"minimum {minimum_trading_days} completed trading days"
+        )
+    if summary["liquidity_scheme"] == "turnover_stability":
+        return (
+            f"lagged log-dollar-volume EMA({summary['ema_span_sessions']}) less its "
+            f"{DEFAULT_DISPERSION_WINDOW}-session dispersion, "
             f"minimum {minimum_trading_days} completed trading days"
         )
     if summary["liquidity_scheme"] == "activity_union_ema":
@@ -1737,6 +1783,7 @@ def run_backtest(
 
     liquidity_descriptions = {
         "dollar_ema": "completed regular-session dollar volume",
+        "turnover_stability": "completed dollar volume less its own dispersion",
         "activity_union_ema": "activity-screened completed-session dollar volume",
         "alpaca_volume": "share volume",
         "alpaca_trades": "trade count",
@@ -1856,6 +1903,7 @@ def main() -> None:
         "--liquidity-scheme",
         choices=(
             "dollar_ema",
+            "turnover_stability",
             "activity_union_ema",
             "alpaca_volume",
             "alpaca_trades",

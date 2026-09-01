@@ -42,7 +42,7 @@ the strongest setting on the first half and the weakest on the second. The best
 full-sample setting is worse than not deferring at all on the first half.
 
 Selection, ACCEPTED. turnover_stability ranks on the same liquidity EMA less a
-penalty for that name'"'"'s own dispersion, preferring dependable turnover to names
+penalty for that name's own dispersion, preferring dependable turnover to names
 that were briefly enormous. At twelve names it leads on both the full sample
 (Sharpe 2.18) and the weaker half (1.91). Baskets of fifteen and twenty are worse
 under every scheme, so the twenty-name cap is not binding -- dilution bites first.
