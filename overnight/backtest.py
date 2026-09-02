@@ -49,8 +49,8 @@ MAX_OVERNIGHT_LEVERAGE = 2.0
 MAINTENANCE_MARGIN = 0.30
 # Alpaca accrues margin interest on a 360-day year, per calendar day.
 MARGIN_INTEREST_DIVISOR = 360.0
-DEFAULT_DATA_DIR = "/data/ppv1/updates/bars_1min_2016-01-01"
-DEFAULT_DAILY_DATA_DIR = "/data/ppv1/updates/bars_1day_2016-01-01"
+DEFAULT_DATA_DIR = "/data/ppv1/updates/bars_1min_2022-01-01"
+DEFAULT_DAILY_DATA_DIR = "/data/ppv1/updates/bars_1day_2022-01-01"
 DEFAULT_AUCTIONS_PATH = "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
 DEFAULT_SECURITY_MASTER_CACHE = "/tmp/trading/baseline_cache/nasdaq_security_master.json"
 NASDAQ_SYMBOL_DIRECTORY_URLS = (

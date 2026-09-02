@@ -15,7 +15,7 @@ COLUMN_INDEX = {"volume": 5, "trades": 6}
 VWAP_INDEX = 7
 PRICE_INDICES = (1, 2, 3, 4, 7)
 MINUTE_INT32_MAX = np.iinfo(np.int32).max
-DEFAULT_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2016-01-01")
+DEFAULT_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2022-01-01")
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "data" / "most_liquid.txt"
 DEFAULT_LOOKBACK_SESSIONS = 250
 
@@ -52,7 +52,7 @@ def historical_top_symbols(
     metrics: tuple[str, ...] = ("dollar_volume",),
     lookback_sessions: int | None = DEFAULT_LOOKBACK_SESSIONS,
 ) -> tuple[list[str], int]:
-    """Return the trailing union of daily top-N symbols for requested metrics."""
+    """Return a liquidity-prioritized trailing union of daily top-N symbols."""
     if top < 1:
         raise ValueError("top must be positive")
     if lookback_sessions is not None and lookback_sessions < 1:
@@ -129,20 +129,36 @@ def historical_top_symbols(
                 values[row_indices, symbol_index] = rows[:, COLUMN_INDEX[metric]]
 
     selected_indices: set[int] = set()
+    top_appearances = np.zeros(len(paths), dtype=np.int64)
+    trailing_liquidity = np.zeros(len(paths), dtype=np.float64)
     daily_count = min(top, len(paths))
     partition_index = len(paths) - daily_count
     for values in metric_values.values():
+        positive = values > 0
+        observations = positive.sum(axis=0)
+        trailing_liquidity += np.divide(
+            np.log1p(values).sum(axis=0),
+            observations,
+            out=np.zeros(len(paths), dtype=np.float64),
+            where=observations > 0,
+        )
         daily_top = np.argpartition(values, partition_index, axis=1)[
             :, partition_index:
         ]
         for day_index, symbol_indices in enumerate(daily_top):
-            selected_indices.update(
-                int(symbol_index)
-                for symbol_index in symbol_indices
-                if values[day_index, symbol_index] > 0
-            )
+            eligible = symbol_indices[values[day_index, symbol_indices] > 0]
+            top_appearances[eligible] += 1
+            selected_indices.update(int(symbol_index) for symbol_index in eligible)
 
-    symbols = sorted(paths[index].stem for index in selected_indices)
+    prioritized = sorted(
+        selected_indices,
+        key=lambda index: (
+            -int(top_appearances[index]),
+            -float(trailing_liquidity[index]),
+            paths[index].stem,
+        ),
+    )
+    symbols = [paths[index].stem for index in prioritized]
     return symbols, len(ordered_timestamps)
 
 

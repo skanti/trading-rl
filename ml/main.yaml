@@ -34,7 +34,7 @@ data:
   horizon_days: 1
   anno: "2010-01-01"
   days_path: "${oc.env:DATA_DIR}/ppv1/updates/full_2026-08-22_10d.csv"
-  data_dir: "${oc.env:DATA_DIR}/ppv1/updates/bars_1min_2016-01-01"
+  data_dir: "${oc.env:DATA_DIR}/ppv1/updates/bars_1min_2022-01-01"
   validation_weeks: 12
   date_val: "2026-06-01"
   price_feature_scale: 100.0

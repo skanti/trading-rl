@@ -180,7 +180,7 @@ then configure `DATA_DIR`, `EXP_DIR`, and the paths in [main.yaml](main.yaml):
 ```bash
 python ../scripts/split.py \
   --sample_ids ../data/tickers_all.txt \
-  --npy_dir "$DATA_DIR/ppv1/updates/bars_1min_2016-01-01" \
+  --npy_dir "$DATA_DIR/ppv1/updates/bars_1min_2022-01-01" \
   --out_path "$DATA_DIR/ppv1/updates/full_2026-08-22_10d.csv" \
   --rollout_size 390
 python train.py --config_path main.yaml
@@ -392,7 +392,7 @@ a single tick would be competing with an ability the policy does not have.
 
 ```bash
 python prepare_pairs.py \
-  --data_dir "$DATA_DIR/ppv1/updates/bars_1min_2016-01-01" \
+  --data_dir "$DATA_DIR/ppv1/updates/bars_1min_2022-01-01" \
   --output_path "$DATA_DIR/ppv1/updates/ppv1_latest_pairs_4k.csv" \
   --window_size 4096 --date_from 2025-06-01
 python pair_train.py --config_path pair.yaml data.use_toy=false \

@@ -258,6 +258,33 @@ class BarUpdateTests(unittest.TestCase):
         self.assertIs(processor.call_args_list[0].kwargs["initial_df"], frames["AAPL"])
         self.assertIs(processor.call_args_list[1].kwargs["initial_df"], frames["MSFT"])
 
+    def test_equal_range_batches_preserve_input_priority(self):
+        scheduled: list[list[str]] = []
+
+        def process(tasks, **_kwargs):
+            scheduled.append([ticker for _index, ticker, _since in tasks])
+            return [(index, True) for index, _ticker, _since in tasks]
+
+        with tempfile.TemporaryDirectory() as directory:
+            tickers_path = Path(directory) / "prioritized.txt"
+            tickers_path.write_text("NVDA\nTSLA\nAAPL\nMSFT\n", encoding="utf-8")
+            output = Path(directory) / "bars"
+            with mock.patch.object(
+                download_bars, "process_alpaca_batch", side_effect=process
+            ):
+                download_bars.main(
+                    source="alpaca",
+                    tickers_path=str(tickers_path),
+                    out_dir=str(output),
+                    since=download_bars.ANNO,
+                    workers_num=0,
+                    update_existing=True,
+                    timeframe="1Min",
+                    batch_size=2,
+                )
+
+        self.assertEqual(scheduled, [["NVDA", "TSLA"], ["AAPL", "MSFT"]])
+
     def test_failed_batch_is_split_to_isolate_a_bad_symbol(self):
         tasks = [
             (0, "AAPL", download_bars.ANNO),

@@ -39,8 +39,8 @@ and news-related volume spikes from dominating the ranking. Use `--ema-span 1`
 to rank strictly by the previous completed session without smoothing.
 
 The first run combines split-adjusted daily bars from
-`/data/ppv1/updates/bars_1day_2016-01-01` with execution prices and intraday
-activity from `/data/ppv1/updates/bars_1min_2016-01-01`, then writes a
+`/data/ppv1/updates/bars_1day_2022-01-01` with execution prices and intraday
+activity from `/data/ppv1/updates/bars_1min_2022-01-01`, then writes a
 date-by-symbol cache under `/tmp/trading/baseline_cache`. The daily bars drive
 the causal liquidity ranking; minute bars are used only for entry/exit prices
 and the optional Alpaca-style same-session activity schemes. Override the two
@@ -153,6 +153,9 @@ retained for backtests. It then loads `overnight/.env` by default and accepts
 environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
 overlap/shortlist settings shown by `--help`. It obtains the auction end date from
 the refreshed daily bars, so a still-forming market session is not requested.
+The shortlist is ordered by consistent daily top-N appearances, then trailing
+average liquidity, so its most persistently liquid symbols enter the concurrent
+minute-download queue first.
 
 ```bash
 python ../scripts/download_bars.py \
@@ -182,7 +185,7 @@ python ../scripts/download_bars.py \
   --source alpaca \
   --timeframe 1Day \
   --tickers_path /home/aavetisyan/dev/trading-rl/data/master.txt \
-  --out_dir /data/ppv1/updates/bars_1day_2016-01-01 \
+  --out_dir /data/ppv1/updates/bars_1day_2022-01-01 \
   --update_existing
 ```
 
@@ -326,7 +329,7 @@ basket at 15:45, and submits its exit at 08:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
 weekends and exchange holidays instead of attempting scheduled actions.
 Before ranking, it refreshes every symbol already present in the broad
-split-adjusted daily cache at `/data/ppv1/updates/bars_1day_2016-01-01` using
+split-adjusted daily cache at `/data/ppv1/updates/bars_1day_2022-01-01` using
 batched SIP requests with 30 days of overlap. An exact overlap is appended;
 any changed bar (including a newly reflected split) triggers a full retained-history
 refresh for that symbol. The rank step fails closed unless Alpaca returns the

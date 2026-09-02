@@ -87,6 +87,37 @@ class MostLiquidTests(unittest.TestCase):
         self.assertEqual(symbols, ["CURRENT", "FADED"])
         self.assertEqual(sessions, 3)
 
+    def test_symbols_are_prioritized_by_consistent_top_n_appearances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            (bars_dir / "_download_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "timeframe": "1Day",
+                        "adjustment": "split",
+                        "columns": [
+                            "seconds",
+                            "open_mills",
+                            "high_mills",
+                            "low_mills",
+                            "close_mills",
+                            "volume",
+                            "trades",
+                            "vwap_mills",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            np.save(bars_dir / "AAA_SPIKE.npy", daily_rows([9_000, 1, 1]))
+            np.save(bars_dir / "ZZZ_STABLE.npy", daily_rows([10, 5_000, 6_000]))
+
+            symbols, _ = build_most_liquid.historical_top_symbols(
+                bars_dir, "2010-01-01", top=1, lookback_sessions=None
+            )
+
+        self.assertEqual(symbols, ["ZZZ_STABLE", "AAA_SPIKE"])
+
     def test_non_positive_explicit_lookback_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             bars_dir = self.make_bars_dir(directory)

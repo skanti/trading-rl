@@ -19,7 +19,7 @@ strategy:
   exchanges: "NASDAQ"
 
 data:
-  daily_bars_dir: "/data/ppv1/updates/bars_1day_2016-01-01"
+  daily_bars_dir: "/data/ppv1/updates/bars_1day_2022-01-01"
   liquidity_shortlist: "/home/aavetisyan/dev/trading-rl/data/most_liquid.txt"
   shortlist_since: "2022-01-01"
   shortlist_daily_top: 50

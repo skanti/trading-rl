@@ -8,15 +8,15 @@ REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 ENV_FILE="${ENV_FILE:-$REPO_DIR/overnight/.env}"
 UPDATES_DIR="${UPDATES_DIR:-/data/ppv1/updates}"
-DAILY_BARS_DIR="${DAILY_BARS_DIR:-$UPDATES_DIR/bars_1day_2016-01-01}"
-MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_2016-01-01}"
+BAR_SINCE="${BAR_SINCE:-2022-01-01}"
+DAILY_BARS_DIR="${DAILY_BARS_DIR:-$UPDATES_DIR/bars_1day_$BAR_SINCE}"
+MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_$BAR_SINCE}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
 MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 MOST_LIQUID_PATH="${MOST_LIQUID_PATH:-$REPO_DIR/data/most_liquid.txt}"
 SHORTLIST_SINCE="${SHORTLIST_SINCE:-2022-01-01}"
 SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-50}"
 SHORTLIST_LOOKBACK_SESSIONS="${SHORTLIST_LOOKBACK_SESSIONS:-250}"
-BAR_SINCE="${BAR_SINCE:-2016-01-01}"
 AUCTION_START="${AUCTION_START:-2022-01-01}"
 BAR_OVERLAP_DAYS="${BAR_OVERLAP_DAYS:-30}"
 AUCTION_OVERLAP_DAYS="${AUCTION_OVERLAP_DAYS:-7}"
@@ -40,6 +40,9 @@ Common environment overrides:
   PYTHON_BIN=/path/to/python
   ENV_FILE=/path/to/.env
   UPDATES_DIR=/data/ppv1/updates
+  BAR_SINCE=2022-01-01
+  DAILY_BARS_DIR=/data/ppv1/updates/bars_1day_2022-01-01
+  MINUTE_BARS_DIR=/data/ppv1/updates/bars_1min_2022-01-01
   WORKERS=8
   DAILY_BAR_BATCH_SIZE=100
   MINUTE_BAR_BATCH_SIZE=10
@@ -140,9 +143,10 @@ log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAI
   --metric dollar-volume \
   --output "$MOST_LIQUID_PATH"
 
-# The minute universe is fully derived from the shortlist, so it lives in a
-# scratch file the exit trap removes. The durable record of what the store holds
-# is _symbols.txt inside the store itself, written once the download succeeds.
+# The minute universe is fully derived from the liquidity-prioritized shortlist,
+# so it lives in a scratch file the exit trap removes. The durable record of what
+# the store holds is _symbols.txt inside the store itself, written once the
+# download succeeds.
 minute_symbols_tmp="$(mktemp -t trading-rl-minute-symbols.XXXXXX)"
 printf 'SPY\n' >"$minute_symbols_tmp"
 while IFS= read -r symbol; do
@@ -151,7 +155,7 @@ while IFS= read -r symbol; do
   fi
 done <"$MOST_LIQUID_PATH"
 
-log "Updating shortlist minute bars in $MINUTE_BARS_DIR"
+log "Updating liquidity-prioritized shortlist minute bars in $MINUTE_BARS_DIR"
 "$PYTHON_BIN" "$SCRIPT_DIR/download_bars.py" \
   --source alpaca \
   --timeframe 1Min \

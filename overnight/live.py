@@ -58,7 +58,7 @@ PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_DATA_URL = "https://data.alpaca.markets/v2"
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_STATE_PATH = str(DEFAULT_WORK_DIR / "state.json")
-DEFAULT_DAILY_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2016-01-01")
+DEFAULT_DAILY_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2022-01-01")
 DEFAULT_LIQUIDITY_SHORTLIST = (
     Path(__file__).resolve().parents[1] / "data" / "most_liquid.txt"
 )
