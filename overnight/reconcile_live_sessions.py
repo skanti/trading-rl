@@ -428,6 +428,36 @@ def _bar_day(value: object) -> date:
     return _timestamp(value, "daily bar timestamp").astimezone(EASTERN).date()
 
 
+def _matches_archived_ranking(
+    replayed: Sequence[tuple[str, float, int]],
+    candidates: object,
+) -> bool:
+    """Return whether archived rank/score evidence identifies this replay."""
+    if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
+        return False
+    comparable = 0
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        try:
+            rank = int(candidate.get("rank"))
+            symbol = str(candidate.get("symbol") or "").upper()
+            score = float(candidate.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if rank < 1 or rank > len(replayed) or not symbol or not math.isfinite(score):
+            return False
+        replayed_symbol, replayed_score, _ = replayed[rank - 1]
+        if symbol != replayed_symbol or not math.isclose(
+            score, replayed_score, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            return False
+        comparable += 1
+    # Several exact ranks and floating-point scores are strong enough to distinguish
+    # the formulas without silently trusting one coincidental top name.
+    return comparable >= 3
+
+
 def replay_ranking(
     summary: Mapping[str, object],
     ticks_path: Path,
@@ -447,18 +477,18 @@ def replay_ranking(
     entry_day = parse_day(str(position.get("entry_date")))
     actual = [str(value).upper() for value in position.get("symbols") or []]
     top = int(configuration.get("top") or len(actual))
-    scheme_value = (
-        liquidity_scheme_override
-        or configuration.get("liquidity_scheme")
-        or ranking.get("liquidity_scheme")
+    configured_scheme = configuration.get("liquidity_scheme") or ranking.get(
+        "liquidity_scheme"
+    )
+    scheme_value = liquidity_scheme_override or configured_scheme
+    scheme_source = (
+        "cli_override"
+        if liquidity_scheme_override
+        else "session_metadata"
+        if configured_scheme
+        else None
     )
     warnings: list[str] = []
-    if not scheme_value:
-        scheme_value = "dollar_ema"
-        warnings.append(
-            "liquidity scheme was absent and was inferred as legacy dollar_ema"
-        )
-    scheme = str(scheme_value)
     ema_span = int(
         configuration.get("ema_span") or ranking.get("ema_span_sessions") or 10
     )
@@ -487,15 +517,45 @@ def replay_ranking(
             session_days.add(_bar_day(row.get("t")))
     if not bars:
         raise ValueError(f"archived ranking bars are empty: {ticks_path}")
-    replayed = completed_liquidity_ranking(
-        bars,
-        sorted(session_days),
-        entry_day,
-        ema_span,
-        min_history,
-        minimum_trading_days,
-        scheme,
-    )
+
+    def rank(scheme_name: str) -> list[tuple[str, float, int]]:
+        return completed_liquidity_ranking(
+            bars,
+            sorted(session_days),
+            entry_day,
+            ema_span,
+            min_history,
+            minimum_trading_days,
+            scheme_name,
+        )
+
+    replayed: list[tuple[str, float, int]]
+    if scheme_value:
+        scheme = str(scheme_value)
+        replayed = rank(scheme)
+    else:
+        possible = {
+            candidate_scheme: rank(candidate_scheme)
+            for candidate_scheme in ("dollar_ema", "turnover_stability")
+        }
+        matches = [
+            candidate_scheme
+            for candidate_scheme, candidate_ranking in possible.items()
+            if _matches_archived_ranking(candidate_ranking, ranking.get("candidates"))
+        ]
+        if len(matches) == 1:
+            scheme = matches[0]
+            replayed = possible[scheme]
+            scheme_source = "archived_ranking_scores"
+        else:
+            scheme = "dollar_ema"
+            replayed = possible[scheme]
+            scheme_source = "legacy_default"
+            warnings.append(
+                "session metadata omitted the liquidity scheme and archived ranking "
+                "scores could not identify it; assumed dollar_ema (override with "
+                "--liquidity-scheme)"
+            )
 
     issuer_by_symbol = {
         str(candidate.get("symbol", "")).upper(): str(
@@ -520,6 +580,7 @@ def replay_ranking(
         "status": "complete",
         "ticks_path": str(ticks_path),
         "liquidity_scheme": scheme,
+        "liquidity_scheme_source": scheme_source,
         "ema_span": ema_span,
         "minimum_history_days": min_history,
         "minimum_trading_days": minimum_trading_days,
@@ -587,12 +648,11 @@ def broker_fees_for_session(
     if cache_path.exists():
         try:
             payload = json.loads(cache_path.read_text())
-            if isinstance(payload, dict) and payload.get(
-                "activity_date"
-            ) == exit_day.isoformat():
-                cached = classify_broker_fee_summary(
-                    payload, exit_day, as_of=as_of
-                )
+            if (
+                isinstance(payload, dict)
+                and payload.get("activity_date") == exit_day.isoformat()
+            ):
+                cached = classify_broker_fee_summary(payload, exit_day, as_of=as_of)
         except (OSError, TypeError, ValueError):
             cached = None
 
@@ -668,6 +728,259 @@ def execution_context(bps: object, *, side: str) -> str:
         f"Simulator {side} price {abs(price_difference):.2f} bps "
         f"{price_direction} than actual"
     )
+
+
+def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Aggregate reconciliations without letting small sessions dominate bps."""
+    if not results:
+        raise ValueError("at least one reconciliation result is required")
+
+    def totals(result: Mapping[str, object]) -> Mapping[str, object]:
+        value = result.get("totals")
+        if not isinstance(value, Mapping):
+            raise TypeError("reconciliation totals must be a mapping")
+        return value
+
+    def total(field: str, selected: Sequence[Mapping[str, object]] = results) -> float:
+        return sum(_number(totals(result).get(field), field) for result in selected)
+
+    def weighted_bps(field: str) -> float:
+        notional = total("actual_entry_notional")
+        if notional <= 0.0:
+            raise ValueError("aggregate entry notional must be positive")
+        return (
+            sum(
+                _number(totals(result).get(field), field)
+                * _number(
+                    totals(result).get("actual_entry_notional"),
+                    "actual entry notional",
+                )
+                for result in results
+            )
+            / notional
+        )
+
+    fee_confirmed = [
+        result
+        for result in results
+        if isinstance(result.get("broker_fees"), Mapping)
+        and result["broker_fees"].get("status") == "complete"  # type: ignore[index,union-attr]
+        and totals(result).get("actual_broker_fee_cost") is not None
+    ]
+    account_observed = [
+        result
+        for result in results
+        if totals(result).get("broker_equity_pnl") is not None
+    ]
+    residual_observed = [
+        result
+        for result in fee_confirmed
+        if totals(result).get("broker_minus_fee_adjusted_fill_pnl") is not None
+    ]
+    ranking_observed = [
+        result
+        for result in results
+        if isinstance(result.get("ranking_replay"), Mapping)
+        and result["ranking_replay"].get("status") == "complete"  # type: ignore[index,union-attr]
+    ]
+
+    count = len(results)
+    entry_notional = total("actual_entry_notional")
+    actual_gross = total("actual_gross_pnl")
+    simulator_gross = total("simulator_gross_pnl")
+    gross_difference = actual_gross - simulator_gross
+    summary: dict[str, object] = {
+        "sessions": count,
+        "trades": sum(len(result.get("symbols") or []) for result in results),
+        "first_entry_date": min(str(result["entry_date"]) for result in results),
+        "last_exit_date": max(str(result["exit_date"]) for result in results),
+        "actual_entry_notional_total": entry_notional,
+        "actual_gross_pnl_total": actual_gross,
+        "simulator_gross_pnl_total": simulator_gross,
+        "actual_minus_simulator_gross_pnl_total": gross_difference,
+        "actual_minus_simulator_gross_bps": gross_difference
+        / entry_notional
+        * 10_000.0,
+        "entry_execution_slippage_bps": weighted_bps("entry_execution_slippage_bps"),
+        "exit_execution_slippage_bps": weighted_bps("exit_execution_slippage_bps"),
+        "fee_confirmed_sessions": len(fee_confirmed),
+        "account_observed_sessions": len(account_observed),
+        "residual_observed_sessions": len(residual_observed),
+        "transaction_cost_bps_per_side": sorted(
+            {
+                _number(
+                    result.get("transaction_cost_bps_per_side"),
+                    "transaction cost bps per side",
+                )
+                for result in results
+            }
+        ),
+    }
+    if fee_confirmed:
+        actual_net = total("actual_net_pnl_after_broker_fees", fee_confirmed)
+        simulator_net = total("simulator_net_pnl", fee_confirmed)
+        net_difference = actual_net - simulator_net
+        confirmed_notional = total("actual_entry_notional", fee_confirmed)
+        summary.update(
+            {
+                "actual_broker_fee_cost_total": total(
+                    "actual_broker_fee_cost", fee_confirmed
+                ),
+                "simulator_transaction_cost_total": total(
+                    "simulator_transaction_cost", fee_confirmed
+                ),
+                "actual_net_pnl_total": actual_net,
+                "simulator_net_pnl_total": simulator_net,
+                "actual_minus_simulator_net_pnl_total": net_difference,
+                "actual_minus_simulator_net_bps": net_difference
+                / confirmed_notional
+                * 10_000.0,
+            }
+        )
+    else:
+        summary["simulator_transaction_cost_total"] = total(
+            "simulator_transaction_cost"
+        )
+        summary["simulator_net_pnl_total"] = total("simulator_net_pnl")
+    if account_observed:
+        summary["broker_equity_pnl_total"] = total(
+            "broker_equity_pnl", account_observed
+        )
+    if residual_observed:
+        summary["unexplained_residual_total"] = total(
+            "broker_minus_fee_adjusted_fill_pnl", residual_observed
+        )
+    if ranking_observed:
+        compared_symbols = sum(
+            len(result.get("symbols") or []) for result in ranking_observed
+        )
+        overlap = sum(
+            int(result["ranking_replay"]["overlap_count"])  # type: ignore[index]
+            for result in ranking_observed
+        )
+        summary["ranking_observed_sessions"] = len(ranking_observed)
+        summary["ranking_overlap_fraction"] = (
+            overlap / compared_symbols if compared_symbols else 0.0
+        )
+    return summary
+
+
+def print_overview(results: Sequence[Mapping[str, object]]) -> None:
+    summary = summarize_results(results)
+    sessions = int(summary["sessions"])
+    fee_sessions = int(summary["fee_confirmed_sessions"])
+    comparison = Table(
+        title="Reconciliation overview",
+        caption=f"{summary['first_entry_date']} → {summary['last_exit_date']}",
+        caption_justify="left",
+    )
+    comparison.add_column("Total")
+    comparison.add_column("Actual", justify="right")
+    comparison.add_column("Simulator", justify="right")
+    comparison.add_column("Difference / context", justify="right")
+    comparison.add_row(
+        "Gross P&L",
+        format_usd(summary["actual_gross_pnl_total"], signed=True),
+        format_usd(summary["simulator_gross_pnl_total"], signed=True),
+        pnl_comparison_context(
+            summary["actual_minus_simulator_gross_pnl_total"],
+            label="gross P&L",
+            bps=summary["actual_minus_simulator_gross_bps"],
+        ),
+    )
+    comparison.add_row(
+        f"Costs ({fee_sessions}/{sessions} confirmed)",
+        (
+            f"-{format_usd(summary['actual_broker_fee_cost_total'])}"
+            if summary.get("actual_broker_fee_cost_total")
+            else "$0.00"
+            if summary.get("actual_broker_fee_cost_total") == 0.0
+            else "Unavailable"
+        ),
+        (
+            f"-{format_usd(summary['simulator_transaction_cost_total'])}"
+            if summary.get("simulator_transaction_cost_total")
+            else "$0.00"
+        ),
+        "Actual: Fees*, Simulator: "
+        + "/".join(
+            f"{value:g}bps" for value in summary["transaction_cost_bps_per_side"]
+        )
+        + " per side",
+    )
+    comparison.add_row(
+        f"Net P&L ({fee_sessions}/{sessions} confirmed)",
+        format_usd(summary["actual_net_pnl_total"], signed=True)
+        if summary.get("actual_net_pnl_total") is not None
+        else "Unavailable",
+        format_usd(summary["simulator_net_pnl_total"], signed=True),
+        pnl_comparison_context(
+            summary["actual_minus_simulator_net_pnl_total"],
+            label="net P&L",
+            bps=summary["actual_minus_simulator_net_bps"],
+        )
+        if summary.get("actual_minus_simulator_net_pnl_total") is not None
+        else "Actual fees unavailable",
+    )
+    comparison.add_row(
+        "Entry price",
+        "Fills",
+        "Minute-bar open",
+        execution_context(summary["entry_execution_slippage_bps"], side="entry"),
+    )
+    comparison.add_row(
+        "Exit price",
+        "Fills",
+        "Opening auction",
+        execution_context(summary["exit_execution_slippage_bps"], side="exit"),
+    )
+    account_sessions = int(summary["account_observed_sessions"])
+    if account_sessions:
+        comparison.add_row(
+            f"Account change ({account_sessions}/{sessions})",
+            format_usd(summary["broker_equity_pnl_total"], signed=True),
+            "—",
+            "Total account equity change",
+        )
+    residual_sessions = int(summary["residual_observed_sessions"])
+    if residual_sessions:
+        comparison.add_row(
+            f"Unexplained residual ({residual_sessions}/{sessions})",
+            format_usd(summary["unexplained_residual_total"], signed=True),
+            "—",
+            "Account change minus fee-adjusted fill P&L",
+        )
+    if summary.get("ranking_observed_sessions"):
+        ranking_sessions = int(summary["ranking_observed_sessions"])
+        comparison.add_row(
+            f"Ranking replay ({ranking_sessions}/{sessions})",
+            "Actual basket",
+            "Replayed basket",
+            f"{float(summary['ranking_overlap_fraction']):.1%} symbol overlap",
+        )
+    comparison.add_row(
+        "Sessions",
+        str(sessions),
+        str(sessions),
+        "100% matched baskets",
+    )
+    comparison.add_row(
+        "Trades",
+        str(summary["trades"]),
+        str(summary["trades"]),
+        "100% matched trades",
+    )
+    CONSOLE.print(comparison)
+    CONSOLE.print(
+        "[dim]Dollar values are cumulative totals over the displayed coverage. "
+        "Execution differences and P&L bps are weighted by deployed capital. "
+        "Gross P&L and execution differences exclude transaction costs.[/dim]"
+    )
+    if fee_sessions:
+        CONSOLE.print(
+            f"[dim]* Actual costs use Alpaca FEE activities for {fee_sessions}/{sessions} "
+            "fee-confirmed sessions. Net comparisons use only those same sessions.[/dim]"
+        )
 
 
 def print_result(
@@ -876,6 +1189,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print per-symbol entry/exit price differences and P&L impacts",
     )
+    parser.add_argument(
+        "--show-session-details",
+        action="store_true",
+        help="print the legacy reconciliation table for every individual session",
+    )
     return parser
 
 
@@ -925,6 +1243,7 @@ def main() -> None:
 
     output_dir = args.output_dir or args.work_dir / "reconciliations"
     failures = 0
+    completed_results: list[dict[str, object]] = []
     for entry_day in selected_days:
         summary_path, summary = summaries[entry_day]
         try:
@@ -975,11 +1294,28 @@ def main() -> None:
             csv_path = output_dir / f"{entry_day.isoformat()}.csv"
             _atomic_json(json_path, result)
             _atomic_csv(csv_path, result["rows"])
-            print_result(result, show_symbol_breakdown=args.show_symbol_breakdown)
-            CONSOLE.print(f"Wrote {json_path} and {csv_path}")
+            completed_results.append(result)
+            if args.show_session_details or args.show_symbol_breakdown:
+                print_result(result, show_symbol_breakdown=args.show_symbol_breakdown)
         except (OSError, TypeError, ValueError) as error:
             failures += 1
             CONSOLE.print(f"[red]{entry_day}: reconciliation failed:[/red] {error}")
+    if completed_results:
+        print_overview(completed_results)
+        if not (args.show_session_details or args.show_symbol_breakdown):
+            for result in completed_results:
+                ranking = result.get("ranking_replay") or {}
+                warnings = list(result.get("warnings") or [])
+                if isinstance(ranking, Mapping):
+                    warnings.extend(ranking.get("warnings") or [])
+                for warning in warnings:
+                    CONSOLE.print(
+                        f"[yellow]Warning ({result['entry_date']}):[/yellow] {warning}"
+                    )
+        CONSOLE.print(
+            f"Wrote {len(completed_results)} reconciliation"
+            f"{'s' if len(completed_results) != 1 else ''} to {output_dir}"
+        )
     if failures:
         raise SystemExit(1)
 

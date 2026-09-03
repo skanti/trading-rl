@@ -526,11 +526,11 @@ simulator can observe: the split-adjusted minute-bar open at the scheduled entry
 and the next session's primary condition-O opening auction. It compares those prices
 with the actual filled quantities and prices, separately reports the configured
 transaction-cost assumption and the broker-equity residual, and re-runs the shared
-liquidity ranker from that entry day's archived `ticks.jsonl`. The console report also
-shows aggregate actual-versus-model entry and exit price differences in basis points;
-the optional symbol table gives the same attribution for every symbol. Entry-fill,
-exit-fill, and quantity-mismatch P&L impacts form an exact attribution of the gross
-actual-minus-simulator difference.
+liquidity ranker from that entry day's archived `ticks.jsonl`. The default console
+report is one overview table across the selected period: dollar values are cumulative
+totals and execution differences are deployed-capital-weighted basis points. Fee-based
+actual net results use only fee-confirmed sessions and show their coverage. Entry-fill,
+exit-fill, and quantity-mismatch P&L impacts remain available in the detailed artifacts.
 
 With no date it reconciles the latest closed session. Select one session or a range with:
 
@@ -538,11 +538,12 @@ With no date it reconciles the latest closed session. Select one session or a ra
 python reconcile_live_sessions.py --entry-date 2026-08-28
 python reconcile_live_sessions.py --since 2026-08-01
 python reconcile_live_sessions.py --entry-date 2026-08-28 --show-symbol-breakdown
+python reconcile_live_sessions.py --since 2026-08-01 --show-session-details
 ```
 
 Results are written to `WORK_DIR/reconciliations/YYYY-MM-DD.json` and `.csv`. Use
-`--show-symbol-breakdown` to print the per-symbol execution table; the aggregate
-entry/exit attribution is always shown. Use
+`--show-session-details` for the former per-session tables and
+`--show-symbol-breakdown` for per-symbol execution attribution. Use
 `--entry-time` or `--liquidity-scheme` only to reconstruct legacy summaries that lack
 those fields; normal sessions retain their original schedule and ranking snapshot so a
 later daemon restart or configuration change cannot rewrite the audit inputs.

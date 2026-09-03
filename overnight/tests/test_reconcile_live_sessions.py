@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +17,7 @@ from reconcile_live_sessions import (
     pnl_comparison_context,
     reconcile_execution,
     replay_ranking,
+    summarize_results,
 )
 
 
@@ -206,6 +207,67 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertEqual(summary["status"], "complete")
         self.assertEqual(summary["cost"], 0.0)
 
+    def test_overview_uses_dollar_totals_and_notional_weighted_bps(self):
+        results = [
+            {
+                "entry_date": "2026-08-28",
+                "exit_date": "2026-08-31",
+                "symbols": ["A", "B"],
+                "transaction_cost_bps_per_side": 1.0,
+                "broker_fees": {"status": "complete"},
+                "ranking_replay": {"status": "complete", "overlap_count": 1},
+                "totals": {
+                    "actual_entry_notional": 1_000.0,
+                    "actual_gross_pnl": 10.0,
+                    "simulator_gross_pnl": 8.0,
+                    "entry_execution_slippage_bps": 2.0,
+                    "exit_execution_slippage_bps": -1.0,
+                    "actual_broker_fee_cost": 1.0,
+                    "simulator_transaction_cost": 2.0,
+                    "actual_net_pnl_after_broker_fees": 9.0,
+                    "simulator_net_pnl": 6.0,
+                    "broker_equity_pnl": 9.5,
+                    "broker_minus_fee_adjusted_fill_pnl": 0.5,
+                },
+            },
+            {
+                "entry_date": "2026-08-31",
+                "exit_date": "2026-09-01",
+                "symbols": ["C"],
+                "transaction_cost_bps_per_side": 1.0,
+                "broker_fees": {"status": "pending"},
+                "totals": {
+                    "actual_entry_notional": 3_000.0,
+                    "actual_gross_pnl": 30.0,
+                    "simulator_gross_pnl": 33.0,
+                    "entry_execution_slippage_bps": 6.0,
+                    "exit_execution_slippage_bps": 3.0,
+                    "simulator_transaction_cost": 6.0,
+                    "simulator_net_pnl": 27.0,
+                    "broker_equity_pnl": None,
+                },
+            },
+        ]
+
+        summary = summarize_results(results)
+
+        self.assertEqual(summary["sessions"], 2)
+        self.assertEqual(summary["trades"], 3)
+        self.assertAlmostEqual(summary["actual_gross_pnl_total"], 40.0)
+        self.assertAlmostEqual(summary["simulator_gross_pnl_total"], 41.0)
+        self.assertAlmostEqual(summary["actual_minus_simulator_gross_pnl_total"], -1.0)
+        self.assertAlmostEqual(summary["actual_minus_simulator_gross_bps"], -2.5)
+        self.assertAlmostEqual(summary["entry_execution_slippage_bps"], 5.0)
+        self.assertAlmostEqual(summary["exit_execution_slippage_bps"], 2.0)
+        self.assertEqual(summary["fee_confirmed_sessions"], 1)
+        self.assertAlmostEqual(summary["actual_broker_fee_cost_total"], 1.0)
+        self.assertAlmostEqual(summary["simulator_transaction_cost_total"], 2.0)
+        self.assertAlmostEqual(summary["actual_net_pnl_total"], 9.0)
+        self.assertAlmostEqual(summary["simulator_net_pnl_total"], 6.0)
+        self.assertAlmostEqual(summary["actual_minus_simulator_net_pnl_total"], 3.0)
+        self.assertAlmostEqual(summary["unexplained_residual_total"], 0.5)
+        self.assertAlmostEqual(summary["ranking_overlap_fraction"], 0.5)
+
     def test_entry_time_prefers_archived_configuration(self):
         summary = {
             "configuration": {"entry_time": "15:45"},
@@ -259,6 +321,54 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             self.assertEqual(replay["replayed_symbols"], ["A"])
             self.assertEqual(replay["overlap_count"], 1)
             self.assertEqual(replay["jaccard"], 1.0)
+
+    def test_infers_missing_scheme_from_archived_ranking_scores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ticks = Path(directory) / "ticks.jsonl"
+            rows = []
+            for day_index in range(15):
+                day = (date(2026, 8, 1) + timedelta(days=day_index)).isoformat()
+                for symbol in ("A", "B", "C"):
+                    volume = {
+                        "A": 10_000 if day_index % 2 else 100,
+                        "B": 3_000,
+                        "C": 5_000,
+                    }[symbol]
+                    rows.append(
+                        {
+                            "symbol": symbol,
+                            "t": f"{day}T04:00:00Z",
+                            "v": volume,
+                            "vw": 100,
+                            "c": 100,
+                        }
+                    )
+            ticks.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            summary = {
+                "configuration": {
+                    "top": 2,
+                    "ema_span": 2,
+                    "min_history_days": 2,
+                    "minimum_trading_days": 2,
+                },
+                "ranking": {},
+                "position": {
+                    "entry_date": "2026-08-20",
+                    "symbols": ["C", "B"],
+                },
+            }
+            explicit = replay_ranking(
+                summary, ticks, liquidity_scheme_override="dollar_ema"
+            )
+            summary["ranking"]["candidates"] = explicit["top_ranking"]
+
+            inferred = replay_ranking(summary, ticks)
+
+            self.assertEqual(inferred["liquidity_scheme"], "dollar_ema")
+            self.assertEqual(
+                inferred["liquidity_scheme_source"], "archived_ranking_scores"
+            )
+            self.assertEqual(inferred["warnings"], [])
 
 
 if __name__ == "__main__":
