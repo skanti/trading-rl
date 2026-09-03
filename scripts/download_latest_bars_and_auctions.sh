@@ -13,7 +13,9 @@ DAILY_BARS_DIR="${DAILY_BARS_DIR:-$UPDATES_DIR/bars_1day_$BAR_SINCE}"
 MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_$BAR_SINCE}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
 MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
-MOST_LIQUID_PATH="${MOST_LIQUID_PATH:-$REPO_DIR/data/most_liquid.txt}"
+# Keep the mutable download universe beside the market-data stores, not in the
+# tracked repository. MOST_LIQUID_PATH remains a compatibility override.
+LIQUIDITY_CANDIDATES_PATH="${LIQUIDITY_CANDIDATES_PATH:-${MOST_LIQUID_PATH:-$UPDATES_DIR/liquidity_candidates.txt}}"
 SHORTLIST_SINCE="${SHORTLIST_SINCE:-2022-01-01}"
 SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-50}"
 SHORTLIST_LOOKBACK_SESSIONS="${SHORTLIST_LOOKBACK_SESSIONS:-250}"
@@ -53,6 +55,7 @@ Common environment overrides:
   SHORTLIST_SINCE=2022-01-01
   SHORTLIST_DAILY_TOP=50
   SHORTLIST_LOOKBACK_SESSIONS=250
+  LIQUIDITY_CANDIDATES_PATH=/data/ppv1/updates/liquidity_candidates.txt
 EOF
 }
 
@@ -141,7 +144,7 @@ log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAI
   --top "$SHORTLIST_DAILY_TOP" \
   --lookback-sessions "$SHORTLIST_LOOKBACK_SESSIONS" \
   --metric dollar-volume \
-  --output "$MOST_LIQUID_PATH"
+  --output "$LIQUIDITY_CANDIDATES_PATH"
 
 # The minute universe is fully derived from the liquidity-prioritized shortlist,
 # so it lives in a scratch file the exit trap removes. The durable record of what
@@ -153,7 +156,7 @@ while IFS= read -r symbol; do
   if [[ -n "$symbol" && "$symbol" != "SPY" ]]; then
     printf '%s\n' "$symbol" >>"$minute_symbols_tmp"
   fi
-done <"$MOST_LIQUID_PATH"
+done <"$LIQUIDITY_CANDIDATES_PATH"
 
 log "Updating liquidity-prioritized shortlist minute bars in $MINUTE_BARS_DIR"
 "$PYTHON_BIN" "$SCRIPT_DIR/download_bars.py" \
@@ -201,13 +204,13 @@ if [[ -f "$AUCTIONS_PATH" && -f "${AUCTIONS_PATH%.npz}.json" ]]; then
     --update \
     --end "$auction_end" \
     --overlap-days "$AUCTION_OVERLAP_DAYS" \
-    --symbols-file "$MOST_LIQUID_PATH" \
+    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
     --output "$AUCTIONS_PATH"
 else
   "$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
     --start "$AUCTION_START" \
     --end "$auction_end" \
-    --symbols-file "$MOST_LIQUID_PATH" \
+    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
     --output "$AUCTIONS_PATH"
 fi
 

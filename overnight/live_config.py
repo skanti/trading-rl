@@ -33,7 +33,7 @@ CONFIG_FIELDS = {
     ),
     "data": (
         "daily_bars_dir",
-        "liquidity_shortlist",
+        "liquidity_candidates",
         "shortlist_since",
         "shortlist_daily_top",
         "shortlist_lookback_sessions",
@@ -92,7 +92,7 @@ class StrategySettings:
 @dataclass
 class DataSettings:
     daily_bars_dir: str = MISSING
-    liquidity_shortlist: str = MISSING
+    liquidity_candidates: str = MISSING
     shortlist_since: str = MISSING
     shortlist_daily_top: int = MISSING
     shortlist_lookback_sessions: int = MISSING

@@ -16,7 +16,7 @@ VWAP_INDEX = 7
 PRICE_INDICES = (1, 2, 3, 4, 7)
 MINUTE_INT32_MAX = np.iinfo(np.int32).max
 DEFAULT_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2022-01-01")
-DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "data" / "most_liquid.txt"
+DEFAULT_OUTPUT = DEFAULT_BARS_DIR.parent / "liquidity_candidates.txt"
 DEFAULT_LOOKBACK_SESSIONS = 250
 
 

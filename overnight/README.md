@@ -190,9 +190,10 @@ so their full retained history is refreshed and reapplied to every raw auction r
 before the NPZ is atomically replaced. Pass `--overlap-days` to change the
 overlap, or `--symbols`, `--symbols-file`, or `--symbols-from-trades` to add
 symbols; only a newly added symbol receives a full-history download. Use
-`--symbols-file data/most_liquid.txt` to align the auction universe with the
-complete liquidity shortlist. Use the last completed trading date for `--end`
-when the Alpaca plan does not permit querying the most recent SIP data.
+`--symbols-file /data/ppv1/updates/liquidity_candidates.txt` to align the auction
+universe with the complete liquidity candidate set. Use the last completed
+trading date for `--end` when the Alpaca plan does not permit querying the most
+recent SIP data.
 
 Then run the comparison:
 
@@ -275,15 +276,21 @@ immediately preceding completed session, and it never uses the unfinished entry-
 Active eligible companies missing from the cache are first seeded with split-adjusted
 history from the shortlist epoch, so new listings can enter later shortlist rebuilds.
 
-The refreshed cache rebuilds `data/most_liquid.txt` as the union of each
-session's top 50 stocks by `volume * VWAP`, over the most recent 250 completed
-sessions on or after 2022-01-01. Symbols whose split-adjusted prices cannot fit
-the compact `int32` minute schema are excluded. The live rank then recomputes
-this shortlist in memory and considers every currently eligible company in it,
-instead of relying on Alpaca's top-share-volume or top-trade-count activity feed.
-`most_liquid.txt` is an output of that rebuild, not an input: editing it by hand
-changes nothing, because the next rank overwrites it. The file exists so the
-minute-bar and auction downloads can follow the same universe.
+The refreshed cache rebuilds
+`/data/ppv1/updates/liquidity_candidates.txt` as the union of each session's top
+50 stocks by `volume * VWAP`, over the most recent 250 completed sessions on or
+after 2022-01-01. Symbols whose split-adjusted prices cannot fit the compact
+`int32` minute schema are excluded. The live rank then recomputes this candidate
+set in memory and considers every currently eligible company in it, instead of
+relying on Alpaca's top-share-volume or top-trade-count activity feed. The file is
+an output of that rebuild, not an input: editing it by hand changes nothing because
+the next rank overwrites it. Its stable copy lives beside the market-data stores so
+the minute-bar and auction downloads can follow the same universe. Each rank also
+snapshots it under `/data/ppv1/live/YYYY-MM-DD/liquidity_candidates.txt`; that
+day's fresh nominal top 12 is `ranking.ranked_top_symbols` in `summary.json`.
+The longer ranked reserve remains in `ranking.candidates`, while
+`position.symbols` records the actual basket after entry-time conflict and
+duplicate-share-class filtering.
 
 `--shortlist-lookback-sessions` bounds the union to a trailing window so the
 shortlist tracks current liquidity. Without it, one session in the daily top 50
