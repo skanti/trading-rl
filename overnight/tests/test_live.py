@@ -58,7 +58,6 @@ def config(top=2, fill_timeout_seconds=1.0, share_mode="fractional"):
         minimum_trading_days=2,
         lookback_calendar_days=90,
         daily_bars_dir=Path("/unused/daily-bars"),
-        liquidity_candidates=Path("/unused/liquidity-candidates.txt"),
         shortlist_since=date(2022, 1, 1),
         shortlist_daily_top=50,
         shortlist_lookback_sessions=250,
@@ -426,10 +425,6 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertEqual(settings.schedule.entry_time, "15:45")
         self.assertEqual(settings.strategy.top, 12)
         self.assertEqual(settings.strategy.liquidity_scheme, "turnover_stability")
-        self.assertEqual(
-            settings.data.liquidity_candidates,
-            "/data/ppv1/updates/liquidity_candidates.txt",
-        )
         self.assertEqual(settings.execution.share_mode, "fractional")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -437,18 +432,6 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             config_path.write_text(DEFAULT_LIVE_CONFIG_PATH.read_text() + "\nunknown: true\n")
             with self.assertRaises(ConfigKeyError):
                 load_live_settings(config_path)
-
-    def test_liquidity_candidates_cli_keeps_legacy_alias(self):
-        parser = build_parser()
-        current = parser.parse_args(
-            ["status", "--liquidity-candidates", "/tmp/current.txt"]
-        )
-        legacy = parser.parse_args(
-            ["status", "--liquidity-shortlist", "/tmp/legacy.txt"]
-        )
-
-        self.assertEqual(current.liquidity_candidates, Path("/tmp/current.txt"))
-        self.assertEqual(legacy.liquidity_candidates, Path("/tmp/legacy.txt"))
 
     def test_preopen_exit_clock_allows_queued_orders(self):
         preopen = FakeClockBroker("2026-08-25T09:00:00-04:00", False)

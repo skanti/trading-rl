@@ -276,18 +276,19 @@ immediately preceding completed session, and it never uses the unfinished entry-
 Active eligible companies missing from the cache are first seeded with split-adjusted
 history from the shortlist epoch, so new listings can enter later shortlist rebuilds.
 
-The refreshed cache rebuilds
+The market-data download script rebuilds
 `/data/ppv1/updates/liquidity_candidates.txt` as the union of each session's top
 50 stocks by `volume * VWAP`, over the most recent 250 completed sessions on or
 after 2022-01-01. Symbols whose split-adjusted prices cannot fit the compact
-`int32` minute schema are excluded. The live rank then recomputes this candidate
-set in memory and considers every currently eligible company in it, instead of
-relying on Alpaca's top-share-volume or top-trade-count activity feed. The file is
-an output of that rebuild, not an input: editing it by hand changes nothing because
-the next rank overwrites it. Its stable copy lives beside the market-data stores so
-the minute-bar and auction downloads can follow the same universe. Each rank also
-snapshots it under `/data/ppv1/live/YYYY-MM-DD/liquidity_candidates.txt`; that
-day's fresh nominal top 12 is `ranking.ranked_top_symbols` in `summary.json`.
+`int32` minute schema are excluded. This downloader-owned file lets the minute-bar
+and auction downloads follow the same universe.
+
+The live rank independently recomputes the same candidate set in memory and
+considers every currently eligible company in it, instead of relying on Alpaca's
+top-share-volume or top-trade-count activity feed. It never reads or writes the
+shared downloader artifact. Each rank only snapshots its own candidate set under
+`/data/ppv1/live/YYYY-MM-DD/liquidity_candidates.txt`; that day's fresh nominal
+top 12 is `ranking.ranked_top_symbols` in `summary.json`.
 The longer ranked reserve remains in `ranking.candidates`, while
 `position.symbols` records the actual basket after entry-time conflict and
 duplicate-share-class filtering.

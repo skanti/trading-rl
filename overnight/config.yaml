@@ -20,7 +20,6 @@ strategy:
 
 data:
   daily_bars_dir: "/data/ppv1/updates/bars_1day_2022-01-01"
-  liquidity_candidates: "/data/ppv1/updates/liquidity_candidates.txt"
   shortlist_since: "2022-01-01"
   shortlist_daily_top: 50
   shortlist_lookback_sessions: 250

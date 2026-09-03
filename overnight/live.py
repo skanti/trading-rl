@@ -59,7 +59,6 @@ DEFAULT_DATA_URL = "https://data.alpaca.markets/v2"
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_STATE_PATH = str(DEFAULT_WORK_DIR / "state.json")
 DEFAULT_DAILY_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2022-01-01")
-DEFAULT_LIQUIDITY_CANDIDATES = Path("/data/ppv1/updates/liquidity_candidates.txt")
 DEFAULT_SHORTLIST_SINCE = date(2022, 1, 1)
 # One session in the daily top-N used to buy permanent candidacy, so the shortlist
 # only ever grew. A trailing year keeps it tracking current liquidity; measured over
@@ -231,7 +230,6 @@ class DailyArtifacts:
             "minimum_trading_days": config.minimum_trading_days,
             "liquidity_lookback_calendar_days": config.lookback_calendar_days,
             "daily_bars_dir": str(config.daily_bars_dir),
-            "liquidity_candidates": str(config.liquidity_candidates),
             "shortlist_since": config.shortlist_since.isoformat(),
             "shortlist_daily_top": config.shortlist_daily_top,
             "shortlist_lookback_sessions": config.shortlist_lookback_sessions,
@@ -672,7 +670,6 @@ class StrategyConfig:
     minimum_trading_days: int
     lookback_calendar_days: int
     daily_bars_dir: Path
-    liquidity_candidates: Path
     shortlist_since: date
     shortlist_daily_top: int
     shortlist_lookback_sessions: int | None
@@ -1379,7 +1376,6 @@ def rank_for_day(
             config.shortlist_daily_top,
             config.shortlist_lookback_sessions,
         )
-        _atomic_write_symbols(config.liquidity_candidates, shortlist)
         candidate_snapshot = (
             artifacts.write_liquidity_candidates(trade_date, shortlist)
             if artifacts is not None
@@ -1448,7 +1444,7 @@ def rank_for_day(
             "feed": config.feed,
             "ranking_pipeline_version": RANKING_PIPELINE_VERSION,
             "candidate_method": (
-                "liquidity_candidates.txt daily top-N dollar-volume union over a trailing "
+                "daily top-N dollar-volume union over a trailing "
                 "session window, then strictly lagged causal EMA(log1p(dollar volume))"
                 + (
                     " less same-span dispersion"
@@ -1458,7 +1454,6 @@ def rank_for_day(
             ),
             "ranking_price": "split-adjusted daily VWAP, falling back to close",
             "daily_bars_dir": str(bars_dir),
-            "liquidity_candidates": str(config.liquidity_candidates),
             "liquidity_candidates_snapshot": str(candidate_snapshot)
             if candidate_snapshot is not None
             else None,
@@ -2761,14 +2756,6 @@ def build_parser(
         help="broad split-adjusted 1Day cache refreshed before ranking",
     )
     parser.add_argument(
-        "--liquidity-candidates",
-        "--liquidity-shortlist",
-        dest="liquidity_candidates",
-        type=Path,
-        default=DEFAULT_LIQUIDITY_CANDIDATES,
-        help="stable output file for the rebuilt historical dollar-volume candidate universe",
-    )
-    parser.add_argument(
         "--shortlist-since",
         type=date.fromisoformat,
         default=DEFAULT_SHORTLIST_SINCE,
@@ -3008,7 +2995,6 @@ def _validate_args(
         minimum_trading_days=args.minimum_trading_days,
         lookback_calendar_days=args.liquidity_lookback_days,
         daily_bars_dir=args.daily_bars_dir,
-        liquidity_candidates=args.liquidity_candidates,
         shortlist_since=args.shortlist_since,
         shortlist_daily_top=args.shortlist_daily_top,
         shortlist_lookback_sessions=args.shortlist_lookback_sessions or None,

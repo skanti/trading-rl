@@ -32,8 +32,8 @@ LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 usage() {
   cat <<'EOF'
 Refresh the current eligible company-stock universe, update its split-adjusted
-daily bars, rebuild the dollar-volume shortlist, update minute bars for the
-shortlist plus SPY, and update auctions. Historical bar files are retained.
+daily bars, rebuild the dollar-volume shortlist, update auctions, and then update
+minute bars for the shortlist plus SPY. Historical bar files are retained.
 
 Usage:
   scripts/download_latest_bars_and_auctions.sh
@@ -146,35 +146,6 @@ log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAI
   --metric dollar-volume \
   --output "$LIQUIDITY_CANDIDATES_PATH"
 
-# The minute universe is fully derived from the liquidity-prioritized shortlist,
-# so it lives in a scratch file the exit trap removes. The durable record of what
-# the store holds is _symbols.txt inside the store itself, written once the
-# download succeeds.
-minute_symbols_tmp="$(mktemp -t trading-rl-minute-symbols.XXXXXX)"
-printf 'SPY\n' >"$minute_symbols_tmp"
-while IFS= read -r symbol; do
-  if [[ -n "$symbol" && "$symbol" != "SPY" ]]; then
-    printf '%s\n' "$symbol" >>"$minute_symbols_tmp"
-  fi
-done <"$LIQUIDITY_CANDIDATES_PATH"
-
-log "Updating liquidity-prioritized shortlist minute bars in $MINUTE_BARS_DIR"
-"$PYTHON_BIN" "$SCRIPT_DIR/download_bars.py" \
-  --source alpaca \
-  --timeframe 1Min \
-  --tickers_path "$minute_symbols_tmp" \
-  --out_dir "$MINUTE_BARS_DIR" \
-  --since "$BAR_SINCE" \
-  --workers_num "$WORKERS" \
-  --batch_size "$MINUTE_BAR_BATCH_SIZE" \
-  --requests_per_minute "$ALPACA_REQUESTS_PER_MINUTE" \
-  --update_existing \
-  --overlap_days "$BAR_OVERLAP_DAYS"
-check_failures "$MINUTE_BARS_DIR"
-
-cp -- "$minute_symbols_tmp" "$MINUTE_BARS_DIR/_symbols.txt.part"
-mv -- "$MINUTE_BARS_DIR/_symbols.txt.part" "$MINUTE_BARS_DIR/_symbols.txt"
-
 calendar_path="$DAILY_BARS_DIR/$CALENDAR_SYMBOL.npy"
 require_file "$calendar_path"
 auction_end="$(
@@ -213,5 +184,34 @@ else
     --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
     --output "$AUCTIONS_PATH"
 fi
+
+# The minute universe is fully derived from the liquidity-prioritized shortlist,
+# so it lives in a scratch file the exit trap removes. The durable record of what
+# the store holds is _symbols.txt inside the store itself, written once the
+# download succeeds.
+minute_symbols_tmp="$(mktemp -t trading-rl-minute-symbols.XXXXXX)"
+printf 'SPY\n' >"$minute_symbols_tmp"
+while IFS= read -r symbol; do
+  if [[ -n "$symbol" && "$symbol" != "SPY" ]]; then
+    printf '%s\n' "$symbol" >>"$minute_symbols_tmp"
+  fi
+done <"$LIQUIDITY_CANDIDATES_PATH"
+
+log "Updating liquidity-prioritized shortlist minute bars in $MINUTE_BARS_DIR"
+"$PYTHON_BIN" "$SCRIPT_DIR/download_bars.py" \
+  --source alpaca \
+  --timeframe 1Min \
+  --tickers_path "$minute_symbols_tmp" \
+  --out_dir "$MINUTE_BARS_DIR" \
+  --since "$BAR_SINCE" \
+  --workers_num "$WORKERS" \
+  --batch_size "$MINUTE_BAR_BATCH_SIZE" \
+  --requests_per_minute "$ALPACA_REQUESTS_PER_MINUTE" \
+  --update_existing \
+  --overlap_days "$BAR_OVERLAP_DAYS"
+check_failures "$MINUTE_BARS_DIR"
+
+cp -- "$minute_symbols_tmp" "$MINUTE_BARS_DIR/_symbols.txt.part"
+mv -- "$MINUTE_BARS_DIR/_symbols.txt.part" "$MINUTE_BARS_DIR/_symbols.txt"
 
 log "Market-data update complete through $auction_end"

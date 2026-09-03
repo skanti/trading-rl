@@ -5,6 +5,7 @@ import pathlib
 import random
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from itertools import islice
@@ -42,6 +43,103 @@ BAR_COLUMNS = {
         "vwap_mills",
     ),
 }
+
+
+class DeferredDownloadSummary(logging.Filter):
+    """Collapse repetitive per-ticker logs into a compact end-of-run summary."""
+
+    DEFERRED_INFO_PREFIXES = (
+        "Ticker exists already - skip",
+        "Incremental update complete",
+        "Full refresh complete",
+    )
+
+    def __init__(self, logger_name: str, example_limit: int = 5):
+        super().__init__()
+        self.logger_name = logger_name
+        self.example_limit = example_limit
+        self.counts: Counter[tuple[int, str]] = Counter()
+        self.examples: dict[tuple[int, str], set[str]] = {}
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _category(message: str) -> str:
+        if message.startswith("Alpaca batch failed; retrying"):
+            return "Alpaca batch failed; split and retried"
+        return message.split(",", 1)[0]
+
+    @staticmethod
+    def _example(message: str) -> str | None:
+        for marker in ("ticker=", "name="):
+            if marker in message:
+                return message.split(marker, 1)[1].split(", ", 1)[0]
+        return None
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != self.logger_name:
+            return True
+        message = record.getMessage()
+        should_defer = record.levelno >= logging.WARNING or (
+            record.levelno == logging.INFO
+            and message.startswith(self.DEFERRED_INFO_PREFIXES)
+        )
+        if not should_defer:
+            return True
+
+        key = (record.levelno, self._category(message))
+        example = self._example(message)
+        with self.lock:
+            self.counts[key] += 1
+            if example:
+                values = self.examples.setdefault(key, set())
+                if len(values) < self.example_limit:
+                    values.add(example)
+        return False
+
+    def write(self, destination: logging.Logger) -> None:
+        with self.lock:
+            counts = dict(self.counts)
+            examples = {key: sorted(values) for key, values in self.examples.items()}
+
+        if not counts:
+            destination.info(
+                "Download event summary: no warnings or per-ticker updates"
+            )
+            return
+
+        info_count = sum(
+            count
+            for (level, _category), count in counts.items()
+            if level < logging.WARNING
+        )
+        warning_count = sum(
+            count
+            for (level, _category), count in counts.items()
+            if level == logging.WARNING
+        )
+        error_count = sum(
+            count
+            for (level, _category), count in counts.items()
+            if level > logging.WARNING
+        )
+        destination.info(
+            "Download event summary: updates=%d, warnings=%d, errors=%d",
+            info_count,
+            warning_count,
+            error_count,
+        )
+        for (level, category), count in sorted(
+            counts.items(), key=lambda item: (-item[0][0], item[0][1])
+        ):
+            sample = examples.get((level, category), [])
+            example_text = f" (e.g. {', '.join(sample)})" if sample else ""
+            destination.info(
+                "  %s %s: %d%s",
+                logging.getLevelName(level),
+                category,
+                count,
+                example_text,
+            )
 
 
 class RateLimiter:
@@ -740,6 +838,8 @@ def main(
             requests_per_minute,
         )
 
+    deferred_summary = DeferredDownloadSummary(logger.name)
+    logger.addFilter(deferred_summary)
     if source == "alpaca" and batch_size > 1 and not skip_existing:
         tasks = [
             (
@@ -807,6 +907,7 @@ def main(
                     )
                 )
     t1 = time.perf_counter()
+    logger.removeFilter(deferred_summary)
 
     success_num = sum(res)
     failed_tickers = [
@@ -848,6 +949,7 @@ def main(
     duration = t1 - t0
     if archive:
         pack_to_archive(out_dir)
+    deferred_summary.write(logger)
     logger.info(f"Done, duration={duration:0.2f}s")
 
 
