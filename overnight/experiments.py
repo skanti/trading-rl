@@ -177,14 +177,14 @@ def build_panel(
     # liquidity matrix is taken from it; prices come from the sweep below.
     metadata = _cache_metadata(
         minute_dir, daily_dir, pd.Timestamp(dates[0]), pd.Timestamp(dates[-1]),
-        15 * 60 + 59, 9 * 60 + 30, 9 * 60 + 15,
+        15 * 60 + 59, 9 * 60 + 30,
     )
     cache_path = cache_dir / (
-        f"liquidity_{dates[0]:%Y%m%d}_{dates[-1]:%Y%m%d}_r0915_e0959_x0570_v5.npz"
+        f"liquidity_{dates[0]:%Y%m%d}_{dates[-1]:%Y%m%d}_e0959_x0570_v6.npz"
     )
-    symbols, dollar_volume, _, _, _, _, _, _ = load_or_build_cache(
+    symbols, dollar_volume, _, _, _, _ = load_or_build_cache(
         cache_path, metadata, minute_dir, daily_dir, dates, context,
-        15 * 60 + 59, 9 * 60 + 30, 9 * 60 + 15, workers, False,
+        15 * 60 + 59, 9 * 60 + 30, workers, False,
     )
 
     master = load_nasdaq_security_master(Path(DEFAULT_SECURITY_MASTER_CACHE))
@@ -279,7 +279,7 @@ def rank_baskets(panel: Panel, selection: Selection, entry_minute: int) -> list[
         )
         try:
             local = top_liquid_indices(
-                eligible, executable, selection.top, stock_symbols, 0,
+                eligible, executable, selection.top, stock_symbols,
                 issuers=panel.issuers if selection.dedupe else None,
             )
         except ValueError:

@@ -70,10 +70,7 @@ OPERATING_TRUST_PATTERN = re.compile(
 
 
 def _security_symbol(sample_id: str) -> str:
-    symbol = str(sample_id)
-    if symbol.startswith("ST-"):
-        symbol = symbol[3:]
-    return symbol.replace("-", ".").upper()
+    return str(sample_id).replace("-", ".").upper()
 
 
 def _official_opening_auctions(
@@ -486,7 +483,6 @@ def top_liquid_indices(
     entry_prices: np.ndarray,
     top: int,
     symbols: np.ndarray,
-    exclude_top: int = 0,
     issuers: Mapping[str, str] | None = None,
 ) -> np.ndarray:
     """Select the highest causal scores with a price available at entry.
@@ -502,8 +498,6 @@ def top_liquid_indices(
         raise ValueError("scores, entry_prices, and symbols must be matching vectors")
     if int(top) < 1:
         raise ValueError("top must be positive")
-    if not 0 <= int(exclude_top) < int(top):
-        raise ValueError("exclude_top must be in [0, top)")
     eligible = np.flatnonzero(np.isfinite(score) & np.isfinite(prices) & (prices > 0.0))
     if eligible.size < int(top):
         raise ValueError(f"only {eligible.size} causally eligible symbols are available for top={top}")
@@ -513,7 +507,7 @@ def top_liquid_indices(
             eligible = eligible[local]
         # A lexical secondary key makes exact score ties reproducible.
         order = np.lexsort((names[eligible], -score[eligible]))
-        return eligible[order][int(exclude_top) :]
+        return eligible[order]
 
     # Deduplicating needs the whole ranking, not a top-N partition: a skipped duplicate
     # is replaced from below, so the cut cannot be taken before the walk.
@@ -534,32 +528,7 @@ def top_liquid_indices(
         raise ValueError(
             f"only {len(chosen)} distinct issuers are causally eligible for top={top}"
         )
-    return np.asarray(chosen, dtype=np.int64)[int(exclude_top) :]
-
-
-def activity_union_candidate_mask(
-    share_volume: np.ndarray,
-    trade_count: np.ndarray,
-    symbols: np.ndarray,
-    candidates_per_metric: int = 100,
-) -> np.ndarray:
-    """Return each day's top-activity union without carrying symbols across days."""
-    shares = np.asarray(share_volume, dtype=np.float64)
-    trades = np.asarray(trade_count, dtype=np.float64)
-    names = np.asarray(symbols, dtype=str)
-    if shares.ndim != 2 or trades.shape != shares.shape or names.shape != (shares.shape[1],):
-        raise ValueError("activity arrays must be date-by-symbol and match symbols")
-    if int(candidates_per_metric) < 1:
-        raise ValueError("candidates_per_metric must be positive")
-
-    mask = np.zeros(shares.shape, dtype=bool)
-    for date_index in range(shares.shape[0]):
-        for activity in (shares[date_index], trades[date_index]):
-            eligible = np.flatnonzero(np.isfinite(activity) & (activity > 0.0))
-            order = np.lexsort((names[eligible], -activity[eligible]))
-            selected = eligible[order[: int(candidates_per_metric)]]
-            mask[date_index, selected] = True
-    return mask
+    return np.asarray(chosen, dtype=np.int64)
 
 
 def _parse_clock(value: str) -> int:
@@ -575,6 +544,15 @@ def _parse_clock(value: str) -> int:
     if not REGULAR_OPEN_MINUTE <= result <= REGULAR_CLOSE_MINUTE:
         raise argparse.ArgumentTypeError("time must be inside 09:30..16:00 Eastern")
     return result
+
+
+def _parse_day(value: str) -> pd.Timestamp:
+    """Parse a calendar date without accepting ambiguous timestamp formats."""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD") from error
+    return pd.Timestamp(parsed.date())
 
 
 def _parse_percentage(value: str) -> float:
@@ -722,17 +700,15 @@ def _cache_metadata(
     end_date: pd.Timestamp,
     entry_minute: int,
     exit_minute: int,
-    ranking_minute: int,
 ) -> dict[str, object]:
     return {
-        "version": 5,
+        "version": 6,
         "minute_data": _manifest_fingerprint(minute_data_dir, "1Min"),
         "daily_data": _manifest_fingerprint(daily_data_dir, "1Day"),
         "start_date": str(start_date.date()),
         "end_date": str(end_date.date()),
         "entry_minute": int(entry_minute),
         "exit_minute": int(exit_minute),
-        "ranking_minute": int(ranking_minute),
     }
 
 
@@ -744,7 +720,6 @@ def _symbol_daily_arrays(
     daily_data_dir: Path,
     entry_minute: int,
     exit_minute: int,
-    ranking_minute: int,
     date_count: int,
 ) -> tuple[
     str,
@@ -753,12 +728,8 @@ def _symbol_daily_arrays(
     np.ndarray,
     np.ndarray,
     np.ndarray,
-    np.ndarray,
-    np.ndarray,
 ]:
     dollar_liquidity = np.full(date_count, np.nan, dtype=np.float64)
-    alpaca_share_volume = np.full(date_count, np.nan, dtype=np.float64)
-    alpaca_trade_count = np.full(date_count, np.nan, dtype=np.float64)
     entry_prices = np.full(date_count, np.nan, dtype=np.float64)
     morning_prices = np.full(date_count, np.nan, dtype=np.float64)
     entry_staleness = np.full(date_count, np.inf, dtype=np.float64)
@@ -815,8 +786,6 @@ def _symbol_daily_arrays(
         return (
             sample_id,
             dollar_liquidity,
-            alpaca_share_volume,
-            alpaca_trade_count,
             entry_prices,
             morning_prices,
             entry_staleness,
@@ -824,62 +793,11 @@ def _symbol_daily_arrays(
         )
 
     source = np.load(source_path, mmap_mode="r")
-    if source.ndim != 2 or source.shape[1] < 3:
-        raise ValueError(f"{sample_id} must contain seconds, price_mills, and volume")
+    if source.ndim != 2 or source.shape[1] < 2:
+        raise ValueError(f"{sample_id} must contain seconds and price_mills")
     source_seconds = np.asarray(source[:, 0], dtype=np.int64)
     if len(source) and not np.all(source_seconds[:-1] < source_seconds[1:]):
         raise ValueError(f"{source_path} timestamps must be strictly increasing")
-
-    regular_starts = context_sod + (REGULAR_OPEN_MINUTE - EXTENDED_OPEN_MINUTE) * 60
-    regular_ends = context_sod + (REGULAR_CLOSE_MINUTE - EXTENDED_OPEN_MINUTE) * 60
-    starts = np.searchsorted(source_seconds, regular_starts, side="left")
-    stops = np.searchsorted(source_seconds, regular_ends, side="right")
-    valid_ranges = (starts < len(source)) & (stops > starts)
-    candidates = np.flatnonzero(valid_ranges)
-    if candidates.size:
-        first_observed = source_seconds[starts[candidates]]
-        last_observed = source_seconds[stops[candidates] - 1]
-        valid_ranges[candidates] &= (
-            (stops[candidates] - starts[candidates] >= MIN_USABLE_SESSION_BARS)
-            & (first_observed <= regular_starts[candidates] + 30 * 60)
-            & (last_observed >= regular_ends[candidates] - 30 * 60)
-        )
-    if valid_ranges.any():
-        low = int(starts[valid_ranges].min())
-        high = int((stops[valid_ranges] - 1).max())
-        block = np.asarray(source[low : high + 1, 1:3], dtype=np.float64)
-        valid_volume = np.isfinite(block[:, 1]) & (block[:, 1] > 0.0)
-        share_volume = np.where(valid_volume, block[:, 1], 0.0)
-        trade_count = None
-        if source.shape[1] >= 4:
-            raw_trade_count = np.asarray(source[low : high + 1, 3], dtype=np.float64)
-            trade_count = np.where(
-                np.isfinite(raw_trade_count) & (raw_trade_count > 0.0), raw_trade_count, 0.0
-            )
-        share_prefix = np.concatenate(([0.0], np.cumsum(share_volume, dtype=np.float64)))
-        trade_prefix = (
-            np.concatenate(([0.0], np.cumsum(trade_count, dtype=np.float64)))
-            if trade_count is not None
-            else None
-        )
-        local_start = starts[valid_ranges] - low
-        # Alpaca's real-time most-actives endpoint ranks cumulative activity in
-        # the current session. Use bars strictly before the ranking minute so
-        # a 15:15 decision cannot see the completed 15:15--15:16 bar.
-        ranking_secs = (
-            context_sod[valid_ranges]
-            + (int(ranking_minute) - EXTENDED_OPEN_MINUTE) * 60
-        )
-        activity_end = np.searchsorted(source_seconds, ranking_secs, side="left")
-        activity_end = np.minimum(activity_end, stops[valid_ranges])
-        activity_end = np.maximum(activity_end, starts[valid_ranges]) - low
-        alpaca_share_volume[valid_ranges] = (
-            share_prefix[activity_end] - share_prefix[local_start]
-        )
-        if trade_prefix is not None:
-            alpaca_trade_count[valid_ranges] = (
-                trade_prefix[activity_end] - trade_prefix[local_start]
-            )
 
     # Prices are requested for every exchange session, including a selected
     # stock's first missing session. Keeping the last observable mark is causal;
@@ -911,8 +829,6 @@ def _symbol_daily_arrays(
     return (
         sample_id,
         dollar_liquidity,
-        alpaca_share_volume,
-        alpaca_trade_count,
         entry_prices,
         morning_prices,
         entry_staleness,
@@ -927,11 +843,8 @@ def build_daily_cache(
     context_sod: np.ndarray,
     entry_minute: int,
     exit_minute: int,
-    ranking_minute: int,
     workers: int,
 ) -> tuple[
-    np.ndarray,
-    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -946,8 +859,6 @@ def build_daily_cache(
     if context_sod.shape != (len(dates),):
         raise ValueError("context session timestamps must match cache dates")
     dollar_liquidity = np.full((len(dates), len(symbols)), np.nan, dtype=np.float64)
-    alpaca_share_volume = np.full_like(dollar_liquidity, np.nan)
-    alpaca_trade_count = np.full_like(dollar_liquidity, np.nan)
     entry_prices = np.full_like(dollar_liquidity, np.nan)
     morning_prices = np.full_like(dollar_liquidity, np.nan)
     entry_staleness = np.full_like(dollar_liquidity, np.inf)
@@ -962,7 +873,6 @@ def build_daily_cache(
             daily_data_dir,
             entry_minute,
             exit_minute,
-            ranking_minute,
             len(dates),
         )
 
@@ -975,16 +885,12 @@ def build_daily_cache(
             (
                 _,
                 symbol_dollar_liquidity,
-                symbol_share_volume,
-                symbol_trade_count,
                 symbol_entry,
                 symbol_morning,
                 symbol_entry_staleness,
                 symbol_morning_staleness,
             ) = future.result()
             dollar_liquidity[:, column] = symbol_dollar_liquidity
-            alpaca_share_volume[:, column] = symbol_share_volume
-            alpaca_trade_count[:, column] = symbol_trade_count
             entry_prices[:, column] = symbol_entry
             morning_prices[:, column] = symbol_morning
             entry_staleness[:, column] = symbol_entry_staleness
@@ -992,8 +898,6 @@ def build_daily_cache(
     return (
         symbols,
         dollar_liquidity,
-        alpaca_share_volume,
-        alpaca_trade_count,
         entry_prices,
         morning_prices,
         entry_staleness,
@@ -1010,12 +914,9 @@ def load_or_build_cache(
     context_sod: np.ndarray,
     entry_minute: int,
     exit_minute: int,
-    ranking_minute: int,
     workers: int,
     rebuild: bool,
 ) -> tuple[
-    np.ndarray,
-    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -1032,8 +933,6 @@ def load_or_build_cache(
                 return (
                     cache["symbols"],
                     cache["dollar_volume"],
-                    cache["alpaca_share_volume"],
-                    cache["alpaca_trade_count"],
                     cache["entry_prices"],
                     cache["morning_prices"],
                     cache["entry_staleness"],
@@ -1047,7 +946,6 @@ def load_or_build_cache(
         context_sod,
         entry_minute,
         exit_minute,
-        ranking_minute,
         workers,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1059,12 +957,10 @@ def load_or_build_cache(
             dates=dates.to_numpy(dtype="datetime64[D]"),
             symbols=arrays[0],
             dollar_volume=arrays[1],
-            alpaca_share_volume=arrays[2],
-            alpaca_trade_count=arrays[3],
-            entry_prices=arrays[4],
-            morning_prices=arrays[5],
-            entry_staleness=arrays[6],
-            morning_staleness=arrays[7],
+            entry_prices=arrays[2],
+            morning_prices=arrays[3],
+            entry_staleness=arrays[4],
+            morning_staleness=arrays[5],
         )
     os.replace(temporary_path, cache_path)
     return arrays
@@ -1119,36 +1015,23 @@ def strategy_metrics(returns: pd.Series) -> dict[str, float | int]:
 
 def liquidity_scores(
     dollar_volume: np.ndarray,
-    alpaca_share_volume: np.ndarray,
-    alpaca_trade_count: np.ndarray,
     scheme: str,
     ema_span: int,
     min_history_days: int,
 ) -> np.ndarray:
-    """Build causal ranking scores for one of the supported liquidity schemes."""
+    """Build causal scores for a liquidity scheme supported by live trading."""
     dollar = np.asarray(dollar_volume, dtype=np.float64)
-    shares = np.asarray(alpaca_share_volume, dtype=np.float64)
-    trades = np.asarray(alpaca_trade_count, dtype=np.float64)
-    if not (dollar.shape == shares.shape == trades.shape) or dollar.ndim != 2:
-        raise ValueError("liquidity arrays must have matching date-by-symbol shapes")
-    if scheme in ("dollar_ema", "activity_union_ema"):
+    if dollar.ndim != 2:
+        raise ValueError("dollar_volume must have shape (dates, symbols)")
+    if scheme == "dollar_ema":
         return causal_ema_log_liquidity(dollar, ema_span, min_history_days)
     if scheme == "turnover_stability":
         return causal_turnover_stability(dollar, ema_span, min_history_days)
-    if scheme == "alpaca_volume":
-        return np.where(np.isfinite(shares) & (shares > 0.0), shares, np.nan)
-    if scheme == "alpaca_trades":
-        return np.where(np.isfinite(trades) & (trades > 0.0), trades, np.nan)
     raise ValueError(f"unknown liquidity scheme: {scheme}")
 
 
 def _metric_text(summary: dict[str, object]) -> str:
-    minimum_trading_days = int(
-        summary.get(
-            "minimum_completed_trading_days",
-            summary["minimum_liquidity_history_sessions"],
-        )
-    )
+    minimum_trading_days = int(summary["minimum_completed_trading_days"])
     if summary["liquidity_scheme"] == "dollar_ema":
         return (
             f"lagged log-dollar-volume EMA({summary['ema_span_sessions']}), "
@@ -1160,17 +1043,7 @@ def _metric_text(summary: dict[str, object]) -> str:
             f"{DEFAULT_DISPERSION_WINDOW}-session dispersion, "
             f"minimum {minimum_trading_days} completed trading days"
         )
-    if summary["liquidity_scheme"] == "activity_union_ema":
-        return (
-            f"daily top-{summary['activity_candidates_per_metric']} share-volume/trade-count "
-            f"union, reranked by lagged log-dollar-volume EMA({summary['ema_span_sessions']}); "
-            f"minimum {minimum_trading_days} completed days; no carry-forward"
-        )
-    return (
-        f"same-session cumulative {summary['liquidity_metric']} through "
-        f"{summary['ranking_time_eastern']} (completed minute bars only); "
-        f"minimum {minimum_trading_days} completed days"
-    )
+    raise ValueError(f"unknown liquidity scheme: {summary['liquidity_scheme']}")
 
 
 def print_summary_table(summary: dict[str, object], console: Console | None = None) -> None:
@@ -1184,12 +1057,7 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
 
     comparison = Table(title="Overnight liquidity baseline", show_header=True, header_style="bold")
     comparison.add_column("Metric")
-    strategy_label = (
-        f"Ranks {int(summary['exclude_top']) + 1}-{summary['top']}"
-        if int(summary["exclude_top"])
-        else f"Top {summary['top']}"
-    )
-    comparison.add_column(strategy_label, justify="right")
+    comparison.add_column(f"Top {summary['top']}", justify="right")
     comparison.add_column("SPY overnight", justify="right")
     comparison.add_column("SPY buy & hold", justify="right")
     strategy_trades = int(summary["trades"])
@@ -1288,13 +1156,6 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         f"daily at {str(summary['exit_time_eastern']).split()[0]}; "
         "buy-and-hold SPY remains continuously invested",
     )
-    if summary["liquidity_scheme"] == "activity_union_ema":
-        details.add_row(
-            "Activity union size",
-            f"mean {summary['average_daily_activity_union_size']:.1f}, "
-            f"minimum {summary['minimum_daily_activity_union_size']}, "
-            f"maximum {summary['maximum_daily_activity_union_size']}; no carry-forward",
-        )
     if float(summary.get("leverage", 1.0)) > 1.0:
         unlevered = summary["unlevered_metrics"]
         details.add_row(
@@ -1353,123 +1214,29 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
     output.print(details)
 
 
-def print_scheme_comparison(
-    summaries: dict[str, dict[str, object]], console: Console | None = None
-) -> None:
-    """Compare liquidity definitions and emphasize the winner in each KPI."""
-    output = console or Console()
-    order = ("dollar_ema", "activity_union_ema", "alpaca_volume", "alpaca_trades")
-    labels = {
-        "dollar_ema": "Lagged $ EMA",
-        "activity_union_ema": "Activity union → $ EMA",
-        "alpaca_volume": "Alpaca volume",
-        "alpaca_trades": "Alpaca trades",
-    }
-    available = [scheme for scheme in order if scheme in summaries]
-    table = Table(title="Liquidity-scheme robustness comparison", header_style="bold")
-    table.add_column("Metric")
-    for scheme in available:
-        table.add_column(labels[scheme], justify="right")
-
-    rows = (
-        ("Total return", "strategy_metrics", "total_return", 100.0, "%", True),
-        ("Annualized return", "strategy_metrics", "annualized_return", 100.0, "%", True),
-        ("Profit factor", "strategy_metrics", "profit_factor", 1.0, "", True),
-        ("Sharpe", "strategy_metrics", "sharpe_zero_cash_rate", 1.0, "", True),
-        ("Sortino", "strategy_metrics", "sortino_zero_cash_rate", 1.0, "", True),
-        ("Maximum drawdown", "strategy_metrics", "max_drawdown", 100.0, "%", False),
-        ("Win rate", "strategy_metrics", "win_rate", 100.0, "%", True),
-        ("Annualized volatility", "strategy_metrics", "annualized_volatility", 100.0, "%", False),
-        ("Mean daily replacements", None, "average_daily_membership_replacements", 1.0, "", False),
-        ("Membership retention", None, "average_daily_membership_retention", 100.0, "%", True),
-        ("Membership Jaccard", None, "average_daily_membership_jaccard", 1.0, "", True),
-        ("Unique symbols", None, "unique_symbols_traded", 1.0, "", False),
-    )
-    for label, group, key, scale, suffix, higher_is_better in rows:
-        values = []
-        for scheme in available:
-            source = summaries[scheme][group] if group else summaries[scheme]
-            values.append(float(source[key]) * scale)
-        finite = [value for value in values if np.isfinite(value)]
-        winner = (max(finite) if higher_is_better else min(finite)) if finite else float("nan")
-        formatted = []
-        for value in values:
-            text = f"{value:.2f}{suffix}"
-            if np.isfinite(value) and np.isclose(value, winner):
-                text = f"[bold]{text}[/bold]"
-            formatted.append(text)
-        table.add_row(label, *formatted)
-    output.print(table)
-
-    details = Table(show_header=False, box=None, padding=(0, 1))
-    details.add_column(style="bold")
-    details.add_column()
-    first = summaries[available[0]]
-    details.add_row(
-        "Period",
-        f"{first['first_entry_date']} through {first['last_exit_date']}; "
-        f"top {first['basket_size']} basket",
-    )
-    for scheme in available:
-        details.add_row(labels[scheme], _metric_text(summaries[scheme]))
-    details.add_row(
-        "Stability reading",
-        "higher retention/Jaccard and fewer replacements/unique symbols are more stable",
-    )
-    output.print(details)
-
-
 def print_symbol_trade_counts(
-    trades_by_scheme: dict[str, pd.DataFrame], console: Console | None = None
+    trades: pd.DataFrame, console: Console | None = None
 ) -> None:
-    """Print how many entry sessions selected each symbol in every strategy variant."""
+    """Print each symbol's selection frequency and average net return."""
     output = console or Console()
-    scheme_order = ("dollar_ema", "activity_union_ema", "alpaca_volume", "alpaca_trades")
-    scheme_labels = {
-        "dollar_ema": "Lagged $ EMA",
-        "activity_union_ema": "Activity union → $ EMA",
-        "alpaca_volume": "Alpaca volume",
-        "alpaca_trades": "Alpaca trades",
-    }
-    available = [scheme for scheme in scheme_order if scheme in trades_by_scheme]
-    available.extend(sorted(set(trades_by_scheme) - set(available)))
-    counts: dict[str, pd.Series] = {}
-    average_returns: dict[str, pd.Series] = {}
-    session_counts: dict[str, int] = {}
-    for scheme in available:
-        trades = trades_by_scheme[scheme]
-        counts[scheme] = trades.groupby("sample_id").size().astype(int)
-        average_returns[scheme] = trades.groupby("sample_id")["net_return"].mean()
-        session_counts[scheme] = int(trades["entry_date"].nunique())
-
+    counts = trades.groupby("sample_id").size().astype(int)
+    average_returns = trades.groupby("sample_id")["net_return"].mean()
+    session_count = int(trades["entry_date"].nunique())
     symbols = sorted(
-        set().union(*(set(series.index) for series in counts.values())),
-        key=lambda symbol: (
-            -max(int(counts[scheme].get(symbol, 0)) for scheme in available),
-            _security_symbol(str(symbol)),
-        ),
+        counts.index,
+        key=lambda symbol: (-int(counts[symbol]), _security_symbol(str(symbol))),
     )
     table = Table(title="Per-symbol trade frequency", header_style="bold")
     table.add_column("Symbol")
-    for scheme in available:
-        label = scheme_labels.get(scheme, scheme)
-        table.add_column(f"{label} (trades / nights)", justify="right")
-        table.add_column(f"{label} avg net/trade", justify="right")
+    table.add_column("Trades / nights", justify="right")
+    table.add_column("Average net/trade", justify="right")
     for symbol in symbols:
-        cells = []
-        for scheme in available:
-            count = int(counts[scheme].get(symbol, 0))
-            sessions = session_counts[scheme]
-            if count:
-                cells.extend(
-                    (
-                        f"{count:,} / {count / sessions:.1%}",
-                        f"{float(average_returns[scheme][symbol]):+.3%}",
-                    )
-                )
-            else:
-                cells.extend(("—", "—"))
-        table.add_row(_security_symbol(str(symbol)), *cells)
+        count = int(counts[symbol])
+        table.add_row(
+            _security_symbol(str(symbol)),
+            f"{count:,} / {count / session_count:.1%}",
+            f"{float(average_returns[symbol]):+.3%}",
+        )
     output.print(table)
 
 
@@ -1505,8 +1272,6 @@ def run_backtest(
     dates: pd.DatetimeIndex,
     symbols: np.ndarray,
     dollar_volume: np.ndarray,
-    alpaca_share_volume: np.ndarray,
-    alpaca_trade_count: np.ndarray,
     entry_prices: np.ndarray,
     morning_prices: np.ndarray,
     entry_staleness: np.ndarray,
@@ -1514,19 +1279,15 @@ def run_backtest(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
     top: int,
-    exclude_top: int,
     ema_span: int,
     min_history_days: int,
     minimum_trading_days: int,
     transaction_cost_bps: float,
     max_entry_staleness_minutes: int,
     max_exit_staleness_minutes: int,
-    liquidity_scheme: str = "dollar_ema",
-    activity_candidates_per_metric: int = 100,
-    activity_candidate_mask: np.ndarray | None = None,
-    ranking_minute: int = 15 * 60 + 15,
-    entry_minute: int = 15 * 60 + 55,
-    exit_minute: int = 9 * 60 + 45,
+    liquidity_scheme: str = "turnover_stability",
+    entry_minute: int = 15 * 60 + 45,
+    exit_minute: int = 9 * 60 + 30,
     issuers: Mapping[str, str] | None = None,
     dedupe_share_classes: bool = True,
     leverage: float = 1.0,
@@ -1535,7 +1296,7 @@ def run_backtest(
     reference_symbol: str = REFERENCE_SYMBOL,
     share_mode: str = "fractional",
     budget: float | None = None,
-    exit_price_source: str = "minute",
+    exit_price_source: str = "opening-auction",
     execution_exchange_mask: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if transaction_cost_bps < 0.0:
@@ -1551,30 +1312,12 @@ def run_backtest(
     if share_mode == "whole" and budget is None:
         raise ValueError("whole-share sizing requires a budget")
     simulation_budget = float(budget) if budget is not None else 1.0
-    scores = liquidity_scores(
-        dollar_volume,
-        alpaca_share_volume,
-        alpaca_trade_count,
-        liquidity_scheme,
-        ema_span,
-        min_history_days,
-    )
+    scores = liquidity_scores(dollar_volume, liquidity_scheme, ema_span, min_history_days)
     completed_trading_days = causal_completed_trading_days(dollar_volume)
     if execution_exchange_mask is not None:
         execution_exchange_mask = np.asarray(execution_exchange_mask, dtype=bool)
         if execution_exchange_mask.shape != scores.shape:
             raise ValueError("execution_exchange_mask must match the liquidity arrays")
-    if liquidity_scheme == "activity_union_ema":
-        if activity_candidate_mask is None:
-            activity_candidate_mask = activity_union_candidate_mask(
-                alpaca_share_volume,
-                alpaca_trade_count,
-                symbols,
-                activity_candidates_per_metric,
-            )
-        activity_candidate_mask = np.asarray(activity_candidate_mask, dtype=bool)
-        if activity_candidate_mask.shape != scores.shape:
-            raise ValueError("activity_candidate_mask must match the liquidity arrays")
     entries = np.flatnonzero((dates >= start_date) & (dates < end_date))
     if not entries.size:
         raise ValueError("the requested interval contains no entry sessions")
@@ -1608,20 +1351,15 @@ def run_backtest(
             date_scores = np.where(
                 execution_exchange_mask[date_index + 1, stock_mask], date_scores, np.nan
             )
-        if liquidity_scheme == "activity_union_ema":
-            date_scores = np.where(
-                activity_candidate_mask[date_index, stock_mask], date_scores, np.nan
-            )
         selected_local = top_liquid_indices(
             date_scores,
             executable_entries,
             top,
             stock_symbols,
-            exclude_top,
             issuers=issuers if dedupe_share_classes else None,
         )
         selected = stock_indices[selected_local]
-        selected_ranks = np.arange(int(exclude_top) + 1, int(top) + 1)
+        selected_ranks = np.arange(1, int(top) + 1)
         selected_entries = entry_prices[date_index, selected]
         session_budget = current_equity
         quantities = basket_quantities(selected_entries, session_budget, share_mode)
@@ -1671,7 +1409,7 @@ def run_backtest(
                     "liquidity_score": scores[date_index, selected],
                     "share_mode": share_mode,
                     "budget": session_budget,
-                    "target_notional": session_budget / (int(top) - int(exclude_top)),
+                    "target_notional": session_budget / int(top),
                     "portfolio_start_equity": session_budget,
                     "portfolio_end_equity": current_equity,
                     "portfolio_return": session_return,
@@ -1790,14 +1528,10 @@ def run_backtest(
     liquidity_descriptions = {
         "dollar_ema": "completed regular-session dollar volume",
         "turnover_stability": "completed dollar volume less its own dispersion",
-        "activity_union_ema": "activity-screened completed-session dollar volume",
-        "alpaca_volume": "share volume",
-        "alpaca_trades": "trade count",
     }
     summary: dict[str, object] = {
         "strategy": f"causal_{liquidity_scheme}_overnight_long",
         "liquidity_scheme": liquidity_scheme,
-        "ranking_time_eastern": f"{ranking_minute // 60:02d}:{ranking_minute % 60:02d}",
         "entry_time_eastern": f"{entry_minute // 60:02d}:{entry_minute % 60:02d}",
         "exit_time_eastern": f"{exit_minute // 60:02d}:{exit_minute % 60:02d} next trading session",
         "exit_price_source": exit_price_source,
@@ -1805,8 +1539,7 @@ def run_backtest(
         "last_entry_date": str(pd.Timestamp(daily.index[-1]).date()),
         "last_exit_date": str(trades.exit_date.iloc[-1]),
         "top": int(top),
-        "exclude_top": int(exclude_top),
-        "basket_size": int(top) - int(exclude_top),
+        "basket_size": int(top),
         "share_mode": share_mode,
         "budget": float(budget) if budget is not None else None,
         "ending_equity": float(simulation_budget * np.prod(1.0 + daily.to_numpy())),
@@ -1822,7 +1555,6 @@ def run_backtest(
         "ema_span_sessions": int(ema_span),
         "minimum_liquidity_history_sessions": int(min_history_days),
         "minimum_completed_trading_days": int(minimum_trading_days),
-        "activity_candidates_per_metric": int(activity_candidates_per_metric),
         "transaction_cost_bps_per_side": float(transaction_cost_bps),
         "deduped_share_classes": bool(dedupe_share_classes and issuers is not None),
         "sessions_with_two_classes_of_one_issuer": int(same_issuer_days),
@@ -1867,31 +1599,36 @@ def run_backtest(
             "daily_return_correlation": float(daily.corr(spy_buy_hold_daily)),
         },
     }
-    if liquidity_scheme == "activity_union_ema":
-        union_sizes = activity_candidate_mask[entries][:, stock_mask].sum(axis=1)
-        summary["average_daily_activity_union_size"] = float(np.mean(union_sizes))
-        summary["minimum_daily_activity_union_size"] = int(np.min(union_sizes))
-        summary["maximum_daily_activity_union_size"] = int(np.max(union_sizes))
-        summary["carries_previous_candidates"] = False
     return trades, summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare causal overnight baskets ranked by smoothed dollar liquidity or Alpaca activity."
+            "Backtest the causal overnight basket used by live trading."
         )
     )
-    parser.add_argument("--top", type=int, default=100, help="daily basket size, e.g. 50 or 100")
-    parser.add_argument(
-        "--exclude-top",
+    parser.add_argument("--top", type=int, default=12, help="daily basket size")
+    period = parser.add_mutually_exclusive_group()
+    period.add_argument(
+        "--months",
         type=int,
-        default=0,
-        help="exclude this many highest-ranked names; --top 100 --exclude-top 50 trades ranks 51-100",
+        default=None,
+        help="trailing calendar months (default: 12 when --since is omitted)",
     )
-    parser.add_argument("--months", type=int, default=12, help="trailing calendar months")
-    parser.add_argument("--start-date", default=None, help="optional YYYY-MM-DD override for --months")
-    parser.add_argument("--end-date", default=None, help="final exit date, default: latest data date")
+    period.add_argument(
+        "--since",
+        type=_parse_day,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="anchor the first eligible entry session on or after this date",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=_parse_day,
+        default=None,
+        help="final exit date, default: latest data date",
+    )
     parser.add_argument(
         "--ema-span",
         type=int,
@@ -1907,28 +1644,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--liquidity-scheme",
-        choices=(
-            "dollar_ema",
-            "turnover_stability",
-            "activity_union_ema",
-            "alpaca_volume",
-            "alpaca_trades",
-            "compare",
-        ),
+        choices=("dollar_ema", "turnover_stability"),
         default="turnover_stability",
-        help="compare runs all schemes on identical dates and execution prices",
-    )
-    parser.add_argument(
-        "--activity-candidates",
-        type=int,
-        default=100,
-        help="same-day top share-volume and trade-count symbols unioned before EMA reranking",
-    )
-    parser.add_argument(
-        "--ranking-time",
-        type=_parse_clock,
-        default=_parse_clock("15:15"),
-        help="causal cutoff for same-day Alpaca activity rankings",
+        help="completed-session liquidity formula shared with live trading",
     )
     parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:45"))
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:30"))
@@ -1974,7 +1692,7 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         default=DEFAULT_DATA_DIR,
-        help="split-adjusted 1-minute bars used for execution prices and intraday activity",
+        help="split-adjusted 1-minute bars used for execution prices",
     )
     parser.add_argument(
         "--daily-bars-dir",
@@ -2059,22 +1777,18 @@ def main() -> None:
         parser.error("--budget is required when --share-mode whole")
 
     if (
-        args.months < 1
+        (args.months is not None and args.months < 1)
         or args.ema_span < 1
         or args.min_history_days < 1
         or args.minimum_trading_days < 1
-        or args.activity_candidates < 1
     ):
         parser.error(
-            "months, ema-span, min-history-days, minimum-trading-days, "
-            "and activity-candidates must be positive"
+            "months, ema-span, min-history-days, and minimum-trading-days must be positive"
         )
     if args.security_master_max_age_days < 1:
         parser.error("security-master-max-age-days must be positive")
-    if not 0 <= args.exclude_top < args.top:
-        parser.error("exclude-top must be in [0, top)")
-    if not 9 * 60 + 30 <= args.ranking_time < args.entry_time:
-        parser.error("ranking-time must be during regular hours and strictly before entry-time")
+    if args.top < 1:
+        parser.error("top must be positive")
     if args.exit_price_source == "opening-auction" and args.exit_time != 9 * 60 + 30:
         parser.error("--exit-price-source opening-auction requires --exit-time 09:30")
     if (
@@ -2089,19 +1803,19 @@ def main() -> None:
     all_dates, all_context_sod = reference_session_calendar(
         data_dir / f"{REFERENCE_SYMBOL}.npy"
     )
-    requested_end = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp(all_dates[-1])
+    requested_end = args.end_date if args.end_date is not None else pd.Timestamp(all_dates[-1])
     eligible_end = all_dates[all_dates <= requested_end]
     if eligible_end.empty:
         parser.error("end-date precedes the local dataset")
     end_date = pd.Timestamp(eligible_end[-1])
     requested_start = (
-        pd.Timestamp(args.start_date)
-        if args.start_date
-        else end_date - pd.DateOffset(months=int(args.months))
+        args.since
+        if args.since is not None
+        else end_date - pd.DateOffset(months=int(args.months or 12))
     )
     first_entry_candidates = np.flatnonzero(all_dates >= requested_start)
     if not first_entry_candidates.size:
-        parser.error("start-date follows the local dataset")
+        parser.error("--since follows the local dataset")
     first_entry_index = int(first_entry_candidates[0])
     end_index = int(np.searchsorted(all_dates.to_numpy(), np.datetime64(end_date)))
     if first_entry_index >= end_index:
@@ -2122,18 +1836,15 @@ def main() -> None:
         pd.Timestamp(cache_dates[-1]),
         args.entry_time,
         args.exit_time,
-        args.ranking_time,
     )
     cache_name = (
         f"liquidity_{cache_dates[0]:%Y%m%d}_{cache_dates[-1]:%Y%m%d}_"
-        f"r{args.ranking_time:04d}_e{args.entry_time:04d}_x{args.exit_time:04d}_v5.npz"
+        f"e{args.entry_time:04d}_x{args.exit_time:04d}_v6.npz"
     )
     cache_path = Path(args.cache_dir) / cache_name
     (
         symbols,
         dollar_volume,
-        alpaca_share_volume,
-        alpaca_trade_count,
         entry_prices,
         morning_prices,
         entry_staleness,
@@ -2147,21 +1858,9 @@ def main() -> None:
         cache_context_sod,
         args.entry_time,
         args.exit_time,
-        args.ranking_time,
         args.workers,
         args.rebuild_cache,
     )
-    activity_candidate_mask = None
-    if args.liquidity_scheme in ("activity_union_ema", "compare"):
-        # Screen the raw Alpaca-like activity universe first. The subsequent
-        # company mask then removes ETFs and other non-company securities,
-        # matching the live two-stage funnel.
-        activity_candidate_mask = activity_union_candidate_mask(
-            alpaca_share_volume,
-            alpaca_trade_count,
-            symbols,
-            args.activity_candidates,
-        )
     unfiltered_candidates = int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum()))
     excluded_asset_reasons: dict[str, int] = {}
     unclassified_asset_symbols = 0
@@ -2180,14 +1879,10 @@ def main() -> None:
         )
         symbols = symbols[company_mask]
         dollar_volume = dollar_volume[:, company_mask]
-        alpaca_share_volume = alpaca_share_volume[:, company_mask]
-        alpaca_trade_count = alpaca_trade_count[:, company_mask]
         entry_prices = entry_prices[:, company_mask]
         morning_prices = morning_prices[:, company_mask]
         entry_staleness = entry_staleness[:, company_mask]
         morning_staleness = morning_staleness[:, company_mask]
-        if activity_candidate_mask is not None:
-            activity_candidate_mask = activity_candidate_mask[:, company_mask]
         retained_candidates = int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum()))
         print(
             f"company universe: retained {retained_candidates:,}/{unfiltered_candidates:,} "
@@ -2213,14 +1908,10 @@ def main() -> None:
         )
         symbols = symbols[exchange_mask]
         dollar_volume = dollar_volume[:, exchange_mask]
-        alpaca_share_volume = alpaca_share_volume[:, exchange_mask]
-        alpaca_trade_count = alpaca_trade_count[:, exchange_mask]
         entry_prices = entry_prices[:, exchange_mask]
         morning_prices = morning_prices[:, exchange_mask]
         entry_staleness = entry_staleness[:, exchange_mask]
         morning_staleness = morning_staleness[:, exchange_mask]
-        if activity_candidate_mask is not None:
-            activity_candidate_mask = activity_candidate_mask[:, exchange_mask]
         retained_exchange_candidates = int(
             len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())
         )
@@ -2264,92 +1955,65 @@ def main() -> None:
             f"auction exits: loaded {official_opens:,} primary opening prices from "
             f"{auction_path}"
         )
-    schemes = (
-        ("dollar_ema", "turnover_stability", "activity_union_ema", "alpaca_volume", "alpaca_trades")
-        if args.liquidity_scheme == "compare"
-        else (args.liquidity_scheme,)
+    trades, summary = run_backtest(
+        dates=cache_dates,
+        symbols=symbols,
+        dollar_volume=dollar_volume,
+        entry_prices=entry_prices,
+        morning_prices=morning_prices,
+        entry_staleness=entry_staleness,
+        morning_staleness=morning_staleness,
+        start_date=requested_start,
+        end_date=end_date,
+        top=args.top,
+        ema_span=args.ema_span,
+        min_history_days=args.min_history_days,
+        minimum_trading_days=args.minimum_trading_days,
+        transaction_cost_bps=args.transaction_cost_bps,
+        issuers=build_issuer_map(symbols, security_master),
+        dedupe_share_classes=args.dedupe_share_classes,
+        leverage=args.leverage,
+        margin_interest_rate=args.margin_interest_rate or 0.0,
+        max_entry_staleness_minutes=args.max_entry_staleness_minutes,
+        max_exit_staleness_minutes=args.max_exit_staleness_minutes,
+        liquidity_scheme=args.liquidity_scheme,
+        entry_minute=args.entry_time,
+        exit_minute=args.exit_time,
+        share_mode=args.share_mode,
+        budget=args.budget,
+        exit_price_source=args.exit_price_source,
+        execution_exchange_mask=execution_exchange_mask,
     )
-    trades_by_scheme: dict[str, pd.DataFrame] = {}
-    summaries: dict[str, dict[str, object]] = {}
-    for scheme in schemes:
-        scheme_trades, scheme_summary = run_backtest(
-            dates=cache_dates,
-            symbols=symbols,
-            dollar_volume=dollar_volume,
-            alpaca_share_volume=alpaca_share_volume,
-            alpaca_trade_count=alpaca_trade_count,
-            entry_prices=entry_prices,
-            morning_prices=morning_prices,
-            entry_staleness=entry_staleness,
-            morning_staleness=morning_staleness,
-            start_date=requested_start,
-            end_date=end_date,
-            top=args.top,
-            exclude_top=args.exclude_top,
-            ema_span=args.ema_span,
-            min_history_days=args.min_history_days,
-            minimum_trading_days=args.minimum_trading_days,
-            transaction_cost_bps=args.transaction_cost_bps,
-            issuers=build_issuer_map(symbols, security_master),
-            dedupe_share_classes=args.dedupe_share_classes,
-            leverage=args.leverage,
-            margin_interest_rate=args.margin_interest_rate or 0.0,
-            max_entry_staleness_minutes=args.max_entry_staleness_minutes,
-            max_exit_staleness_minutes=args.max_exit_staleness_minutes,
-            liquidity_scheme=scheme,
-            activity_candidates_per_metric=args.activity_candidates,
-            activity_candidate_mask=activity_candidate_mask
-            if scheme == "activity_union_ema"
-            else None,
-            ranking_minute=args.ranking_time,
-            entry_minute=args.entry_time,
-            exit_minute=args.exit_time,
-            share_mode=args.share_mode,
-            budget=args.budget,
-            exit_price_source=args.exit_price_source,
-            execution_exchange_mask=execution_exchange_mask,
-        )
-        scheme_summary["cache_path"] = str(cache_path)
-        scheme_summary["asset_filter"] = args.asset_filter
-        scheme_summary["exchange_filter"] = args.exchange_filter
-        scheme_summary["unclassified_asset_policy"] = args.unclassified_asset_policy
-        scheme_summary["unclassified_asset_symbols"] = unclassified_asset_symbols
-        scheme_summary["unfiltered_candidate_symbols"] = unfiltered_candidates
-        scheme_summary["excluded_asset_reasons"] = excluded_asset_reasons
-        scheme_summary["candidate_symbols"] = int(
-            len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())
-        )
-        scheme_summary["symbol_trade_counts"] = {
-            _security_symbol(str(symbol)): int(count)
-            for symbol, count in scheme_trades.groupby("sample_id").size().items()
-        }
-        scheme_summary["symbol_average_net_return"] = {
-            _security_symbol(str(symbol)): float(mean_return)
-            for symbol, mean_return in scheme_trades.groupby("sample_id")["net_return"].mean().items()
-        }
-        trades_by_scheme[scheme] = scheme_trades
-        summaries[scheme] = scheme_summary
-    if args.liquidity_scheme == "compare":
-        print_scheme_comparison(summaries)
-    else:
-        print_summary_table(summaries[args.liquidity_scheme])
+    summary["cache_path"] = str(cache_path)
+    summary["asset_filter"] = args.asset_filter
+    summary["exchange_filter"] = args.exchange_filter
+    summary["unclassified_asset_policy"] = args.unclassified_asset_policy
+    summary["unclassified_asset_symbols"] = unclassified_asset_symbols
+    summary["unfiltered_candidate_symbols"] = unfiltered_candidates
+    summary["excluded_asset_reasons"] = excluded_asset_reasons
+    summary["candidate_symbols"] = int(
+        len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())
+    )
+    summary["symbol_trade_counts"] = {
+        _security_symbol(str(symbol)): int(count)
+        for symbol, count in trades.groupby("sample_id").size().items()
+    }
+    summary["symbol_average_net_return"] = {
+        _security_symbol(str(symbol)): float(mean_return)
+        for symbol, mean_return in trades.groupby("sample_id")["net_return"].mean().items()
+    }
+    print_summary_table(summary)
     if args.show_symbol_trade_frequency:
-        print_symbol_trade_counts(trades_by_scheme)
+        print_symbol_trade_counts(trades)
 
     if args.output_csv:
         output_csv = Path(args.output_csv)
         output_csv.parent.mkdir(parents=True, exist_ok=True)
-        trades = pd.concat(trades_by_scheme.values(), ignore_index=True)
         trades.to_csv(output_csv, index=False)
         print(f"wrote {len(trades)} trades to {output_csv}")
     if args.summary_json:
         summary_json = Path(args.summary_json)
         summary_json.parent.mkdir(parents=True, exist_ok=True)
-        summary: dict[str, object] = (
-            {"liquidity_scheme_comparison": summaries}
-            if args.liquidity_scheme == "compare"
-            else summaries[args.liquidity_scheme]
-        )
         summary_json.write_text(json.dumps(summary, indent=2, allow_nan=True) + "\n")
         print(f"wrote summary to {summary_json}")
 

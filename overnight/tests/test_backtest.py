@@ -9,7 +9,6 @@ from rich.console import Console
 from backtest import (
     DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
-    activity_union_candidate_mask,
     basket_quantities,
     causal_ema_log_liquidity,
     causal_turnover_stability,
@@ -20,7 +19,6 @@ from backtest import (
     liquidity_scores,
     load_opening_auction_prices,
     load_primary_auction_exchange_mask,
-    print_scheme_comparison,
     print_symbol_trade_counts,
     print_summary_table,
     reference_session_calendar,
@@ -259,7 +257,6 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
                 [1_000.0, 3_300.0, 2_300.0],
             ]
         )
-        activity = np.ones_like(dollar_volume)
         entry_prices = np.array([[100.0, 100.0, 300.0]] * 4)
         morning_prices = entry_prices.copy()
         morning_prices[3] = [100.0, 110.0, 270.0]
@@ -269,8 +266,6 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             dates=dates,
             symbols=symbols,
             dollar_volume=dollar_volume,
-            alpaca_share_volume=activity,
-            alpaca_trade_count=activity,
             entry_prices=entry_prices,
             morning_prices=morning_prices,
             entry_staleness=staleness,
@@ -278,7 +273,6 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             start_date=dates[2],
             end_date=dates[3],
             top=2,
-            exclude_top=0,
             ema_span=1,
             min_history_days=1,
             minimum_trading_days=1,
@@ -358,11 +352,9 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         metrics = strategy_metrics(np.array([0.01, -0.005]))
         summary = {
             "top": 50,
-            "exclude_top": 0,
             "basket_size": 50,
             "liquidity_scheme": "dollar_ema",
             "liquidity_metric": "completed regular-session dollar volume",
-            "ranking_time_eastern": "15:15",
             "entry_time_eastern": "15:55",
             "exit_time_eastern": "09:45 next trading session",
             "first_entry_date": "2026-08-19",
@@ -370,6 +362,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             "trades": 100,
             "ema_span_sessions": 20,
             "minimum_liquidity_history_sessions": 20,
+            "minimum_completed_trading_days": 100,
             "transaction_cost_bps_per_side": 1.0,
             "unique_symbols_traded": 51,
             "average_daily_membership_replacements": 1.0,
@@ -392,108 +385,17 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertIn("SPY buy & hold", rendered)
         self.assertNotIn('"strategy_metrics"', rendered)
 
-    def test_alpaca_activity_schemes_use_same_day_raw_rankings(self):
-        dollar = np.array([[1_000.0, 10.0], [1_000.0, 10.0]])
-        shares = np.array([[10.0, 100.0], [20.0, 200.0]])
-        trades = np.array([[50.0, 5.0], [60.0, 6.0]])
-
-        volume_scores = liquidity_scores(dollar, shares, trades, "alpaca_volume", 20, 1)
-        trade_scores = liquidity_scores(dollar, shares, trades, "alpaca_trades", 20, 1)
-
-        self.assertEqual(volume_scores.tolist(), shares.tolist())
-        self.assertEqual(trade_scores.tolist(), trades.tolist())
-        self.assertGreater(volume_scores[0, 1], volume_scores[0, 0])
-        self.assertGreater(trade_scores[0, 0], trade_scores[0, 1])
-
-    def test_activity_union_is_rebuilt_each_day_without_carry_forward(self):
-        shares = np.array(
-            [
-                [100.0, 90.0, 1.0, 1.0],
-                [1.0, 1.0, 90.0, 100.0],
-            ]
-        )
-        trades = np.array(
-            [
-                [1.0, 1.0, 100.0, 90.0],
-                [1.0, 100.0, 1.0, 90.0],
-            ]
-        )
-        mask = activity_union_candidate_mask(
-            shares, trades, np.array(["A", "B", "C", "D"]), candidates_per_metric=1
-        )
-
-        self.assertEqual(mask[0].tolist(), [True, False, True, False])
-        self.assertEqual(mask[1].tolist(), [False, True, False, True])
-
-    def test_activity_union_ema_uses_lagged_dollar_history(self):
+    def test_liquidity_scores_support_only_live_ranking_schemes(self):
         dollar = np.array([[100.0, 1_000.0], [110.0, 900.0], [120.0, 800.0]])
-        activity = np.ones_like(dollar)
-
-        union_scores = liquidity_scores(
-            dollar, activity, activity, "activity_union_ema", ema_span=2, min_history_days=1
-        )
-        full_scores = liquidity_scores(
-            dollar, activity, activity, "dollar_ema", ema_span=2, min_history_days=1
+        ema = liquidity_scores(dollar, "dollar_ema", ema_span=2, min_history_days=1)
+        stable = liquidity_scores(
+            dollar, "turnover_stability", ema_span=2, min_history_days=1
         )
 
-        np.testing.assert_allclose(union_scores, full_scores, equal_nan=True)
-        self.assertTrue(np.isnan(union_scores[0]).all())
-
-    def test_activity_cutoff_excludes_the_ranking_minute_bar(self):
-        context_start = int(
-            (
-                pd.Timestamp("2026-08-24 04:00", tz="America/New_York").tz_convert("UTC")
-                - pd.Timestamp("2010-01-01", tz="UTC")
-            ).total_seconds()
-        )
-        regular_start = context_start + (9 * 60 + 30 - 4 * 60) * 60
-        ranking_second = context_start + (15 * 60 + 15 - 4 * 60) * 60
-        seconds = np.arange(regular_start, regular_start + 391 * 60, 60, dtype=np.int64)
-        source = np.column_stack(
-            (
-                seconds,
-                np.full(391, 100_000, dtype=np.int64),
-                np.ones(391, dtype=np.int64),
-                np.ones(391, dtype=np.int64),
-            )
-        )
-        ranking_row = int(np.flatnonzero(seconds == ranking_second)[0])
-        source[ranking_row, 2:] = (1_000, 100)
-        source[ranking_row + 1, 2:] = (2_000, 200)
-        with tempfile.TemporaryDirectory() as directory:
-            minute_dir = Path(directory) / "minute"
-            daily_dir = Path(directory) / "daily"
-            minute_dir.mkdir()
-            daily_dir.mkdir()
-            np.save(minute_dir / "X.npy", source)
-            daily_second = int(
-                (
-                    pd.Timestamp("2026-08-24", tz="America/New_York").tz_convert("UTC")
-                    - pd.Timestamp("2010-01-01", tz="UTC")
-                ).total_seconds()
-            )
-            np.save(
-                daily_dir / "X.npy",
-                np.array(
-                    [[daily_second, 90_000, 110_000, 80_000, 95_000, 50, 10, 100_000]],
-                    dtype=np.int64,
-                ),
-            )
-            result = _symbol_daily_arrays(
-                "X",
-                {pd.Timestamp("2026-08-24"): 0},
-                np.array([context_start]),
-                minute_dir,
-                daily_dir,
-                15 * 60 + 55,
-                9 * 60 + 45,
-                15 * 60 + 15,
-                1,
-            )
-
-        self.assertEqual(result[2][0], 345.0)
-        self.assertEqual(result[3][0], 345.0)
-        self.assertEqual(result[1][0], 5_000.0)
+        self.assertEqual(ema.shape, dollar.shape)
+        self.assertEqual(stable.shape, dollar.shape)
+        with self.assertRaisesRegex(ValueError, "unknown liquidity scheme"):
+            liquidity_scores(dollar, "alpaca_volume", ema_span=2, min_history_days=1)
 
     def test_daily_dollar_volume_falls_back_to_close_when_vwap_is_zero(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -522,11 +424,42 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
                 daily_dir,
                 15 * 60 + 55,
                 9 * 60 + 45,
-                15 * 60 + 15,
                 1,
             )
 
         self.assertEqual(result[1][0], 4_750.0)
+
+    def test_symbol_execution_prices_need_only_timestamp_and_price_columns(self):
+        session = pd.Timestamp("2026-01-05 04:00", tz="America/New_York")
+        origin = pd.Timestamp("2010-01-01", tz="UTC")
+        context_start = int((session.tz_convert("UTC") - origin).total_seconds())
+        morning = context_start + (9 * 60 + 30 - 4 * 60) * 60
+        entry = context_start + (15 * 60 + 45 - 4 * 60) * 60
+        with tempfile.TemporaryDirectory() as directory:
+            minute_dir = Path(directory) / "minute"
+            daily_dir = Path(directory) / "daily"
+            minute_dir.mkdir()
+            daily_dir.mkdir()
+            np.save(
+                minute_dir / "X.npy",
+                np.array([[morning, 99_000], [entry, 100_000]], dtype=np.int64),
+            )
+
+            result = _symbol_daily_arrays(
+                "X",
+                {pd.Timestamp("2026-01-05"): 0},
+                np.array([context_start]),
+                minute_dir,
+                daily_dir,
+                15 * 60 + 45,
+                9 * 60 + 30,
+                1,
+            )
+
+        self.assertEqual(result[2][0], 100.0)
+        self.assertEqual(result[3][0], 99.0)
+        self.assertEqual(result[4][0], 0.0)
+        self.assertEqual(result[5][0], 0.0)
 
     def test_reference_calendar_is_derived_from_complete_minute_sessions(self):
         def session_seconds(day: str, close: str) -> np.ndarray:
@@ -558,39 +491,6 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         ).tz_convert("America/New_York")
         self.assertEqual(context_times.strftime("%H:%M").tolist(), ["04:00", "04:00"])
 
-    def test_scheme_comparison_reports_stability_kpis(self):
-        metrics = strategy_metrics(np.array([0.01, -0.005]))
-        summaries = {}
-        for index, scheme in enumerate(("dollar_ema", "alpaca_volume", "alpaca_trades")):
-            summaries[scheme] = {
-                "first_entry_date": "2026-08-19",
-                "last_exit_date": "2026-08-21",
-                "basket_size": 10,
-                "liquidity_scheme": scheme,
-                "liquidity_metric": {
-                    "dollar_ema": "completed regular-session dollar volume",
-                    "alpaca_volume": "share volume",
-                    "alpaca_trades": "trade count",
-                }[scheme],
-                "ranking_time_eastern": "15:15",
-                "ema_span_sessions": 20,
-                "minimum_liquidity_history_sessions": 20,
-                "strategy_metrics": metrics,
-                "average_daily_membership_replacements": float(index),
-                "average_daily_membership_retention": 1.0 - index * 0.1,
-                "average_daily_membership_jaccard": 1.0 - index * 0.2,
-                "unique_symbols_traded": 10 + index,
-            }
-        console = Console(record=True, width=120, color_system=None)
-
-        print_scheme_comparison(summaries, console)
-        rendered = console.export_text()
-
-        self.assertIn("Lagged $ EMA", rendered)
-        self.assertIn("Alpaca volume", rendered)
-        self.assertIn("Alpaca trades", rendered)
-        self.assertIn("Membership retention", rendered)
-
     def test_company_filter_rejects_funds_and_non_common_instruments(self):
         cases = (
             ({"name": "Example Technology Inc. - Common Stock", "etf": "N"}, True),
@@ -608,22 +508,13 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
                 self.assertEqual(is_company_security(record)[0], expected)
 
     def test_symbol_trade_frequency_shows_counts_and_session_percentages(self):
-        trades = {
-            "dollar_ema": pd.DataFrame(
-                {
-                    "entry_date": ["2026-08-20", "2026-08-21", "2026-08-21"],
-                    "sample_id": ["AAPL", "AAPL", "MSFT"],
-                    "net_return": [0.01, 0.02, -0.01],
-                }
-            ),
-            "alpaca_volume": pd.DataFrame(
-                {
-                    "entry_date": ["2026-08-20", "2026-08-21"],
-                    "sample_id": ["MSFT", "MSFT"],
-                    "net_return": [0.03, 0.01],
-                }
-            ),
-        }
+        trades = pd.DataFrame(
+            {
+                "entry_date": ["2026-08-20", "2026-08-21", "2026-08-21"],
+                "sample_id": ["AAPL", "AAPL", "MSFT"],
+                "net_return": [0.01, 0.02, -0.01],
+            }
+        )
         console = Console(record=True, width=120, color_system=None)
 
         print_symbol_trade_counts(trades, console)
@@ -672,17 +563,6 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         mask = exchange_universe_mask(symbols, security_master, "nasdaq")
 
         self.assertEqual(mask.tolist(), [True, True, False, False])
-
-    def test_rank_segment_can_exclude_the_most_liquid_names(self):
-        selected = top_liquid_indices(
-            scores=np.array([5.0, 4.0, 3.0, 2.0]),
-            entry_prices=np.full(4, 100.0),
-            top=4,
-            symbols=np.array(["A", "B", "C", "D"]),
-            exclude_top=2,
-        )
-        self.assertEqual(selected.tolist(), [2, 3])
-
 
 if __name__ == "__main__":
     unittest.main()

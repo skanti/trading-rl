@@ -34,39 +34,33 @@ sessions before it can be selected. The current session is not counted. Change
 this causal listing-history filter with `--minimum-trading-days`; the default
 excludes recent IPOs such as SPCX until they establish 100 sessions.
 
-The log transform and default 20-session EMA keep earnings, index-rebalance,
+The log transform and default 10-session EMA keep earnings, index-rebalance,
 and news-related volume spikes from dominating the ranking. Use `--ema-span 1`
 to rank strictly by the previous completed session without smoothing.
 
 The first run combines split-adjusted daily bars from
-`/data/ppv1/updates/bars_1day_2022-01-01` with execution prices and intraday
-activity from `/data/ppv1/updates/bars_1min_2022-01-01`, then writes a
-date-by-symbol cache under `/tmp/trading/baseline_cache`. The daily bars drive
-the causal liquidity ranking; minute bars are used only for entry/exit prices
-and the optional Alpaca-style same-session activity schemes. Override the two
-stores with `--daily-bars-dir` and `--data-dir`, respectively. Subsequent runs
-with the same inputs and date range reuse the cache.
+`/data/ppv1/updates/bars_1day_2022-01-01` with execution prices from
+`/data/ppv1/updates/bars_1min_2022-01-01`, then writes a date-by-symbol cache
+under `/tmp/trading/baseline_cache`. The daily bars drive the causal liquidity
+ranking; minute bars are used only for entry/exit prices. Override the two stores
+with `--daily-bars-dir` and `--data-dir`, respectively. Subsequent runs with the
+same inputs and date range reuse the cache.
+
+Use `--since YYYY-MM-DD` instead of `--months` to anchor the first eligible entry
+session to a fixed date. The two options are mutually exclusive; for example:
+
+```bash
+python backtest.py --since 2024-01-01
+```
 
 The simulator does not require a generated day-index CSV. It derives complete
 New York sessions from `SPY.npy`, discovers the tradable universe from symbols
-present in both bar stores, and locates activity and execution timestamps
-directly in each minute array. Updating the bar directories therefore makes new
-symbols and sessions available without rebuilding separate metadata.
+present in both bar stores, and locates execution timestamps directly in each
+minute array. Updating the bar directories therefore makes new symbols and
+sessions available without rebuilding separate metadata.
 
-To compare the original stable dollar-liquidity ranking with Alpaca's
-real-time most-actives definitions in one run:
-
-```bash
-python backtest.py \
-  --top 10 \
-  --months 12 \
-  --ranking-time 15:15 \
-  --exit-time 09:35 \
-  --liquidity-scheme compare \
-  --transaction-cost-bps 1
-```
-
-The comparison includes four schemes on identical entry and exit prices:
+The backtester supports the same two completed-session liquidity schemes as live
+trading:
 
 - `dollar_ema`: lagged EMA of `log1p` completed-session dollar volume.
 - `turnover_stability`: that same EMA less the 20-session dispersion of the same
@@ -75,40 +69,9 @@ The comparison includes four schemes on identical entry and exit prices:
   name with `e` times less turnover. It demotes a stock that is only briefly
   enormous -- an earnings day, an index rebalance -- beneath one that trades
   heavily every session, which matters because the basket is held through an
-  entire overnight. Over the trailing 24 months at twelve names it changes about
-  one holding every three sessions (97% basket overlap) and improves annualised
-  return 55.8% -> 58.7%, profit factor 1.44 -> 1.46 and Sharpe 2.08 -> 2.17.
   `live.py --liquidity-scheme` selects the same implementation, so a live basket
   and a simulated one cannot drift apart. This is the default in both; pass
   `--liquidity-scheme dollar_ema` for the level-only ranking.
-- `activity_union_ema`: each day, union the top 100 current-session symbols by
-  share volume and trade count, remove non-company assets, then rerank the
-  remaining candidates using their recent lagged dollar-volume EMA. The union
-  is rebuilt from scratch daily with no prior-day carry-forward.
-- `alpaca_volume`: current-session cumulative SIP share volume.
-- `alpaca_trades`: current-session cumulative SIP trade count.
-
-The two Alpaca modes match the ranking fields used by Alpaca's most-actives
-screener. They include only complete one-minute bars strictly before
-`--ranking-time`; the ranking-minute bar itself is excluded. The table reports
-membership retention, Jaccard similarity, replacements, and unique symbols in
-addition to return, profit factor, drawdown, volatility, and Sharpe. Higher
-retention/Jaccard and lower replacement counts indicate a more stable universe.
-Use one scheme name instead of `compare` to run it alone.
-
-For the fast dynamic approximation directly:
-
-```bash
-python backtest.py \
-  --liquidity-scheme activity_union_ema \
-  --activity-candidates 100 \
-  --minimum-trading-days 100 \
-  --top 10 \
-  --months 12 \
-  --ranking-time 15:15 \
-  --exit-time 09:35 \
-  --transaction-cost-bps 1
-```
 
 By default, the simulator restricts the tradable universe to company equity. It
 uses Nasdaq's current symbol directory to remove positively identified ETFs and
@@ -136,8 +99,7 @@ stale path, since a session either produced a condition-O cross or did not.
 ### Incremental minute-bar updates
 
 Existing `.npy` bar files can be extended without redownloading every ticker's full
-history. Filenames use plain symbols such as `AAPL.npy` and `BRK.B.npy`; legacy
-asset-class prefixes such as `ST-` are stripped when old input lists are encountered:
+history. Filenames use plain symbols such as `AAPL.npy` and `BRK.B.npy`.
 
 To refresh the broad daily store, rebuild the dollar-volume shortlist, update
 the shortlist's minute bars, and extend auction data in one pass, run:
@@ -266,19 +228,6 @@ opening cross under both `Q` and `T`, and on sessions such as 2023-01-30 only th
 `T` copy is present, so matching `Q` alone would drop the entire Nasdaq universe
 for that date.
 
-```bash
-python backtest.py \
-  --top 100 \
-  --months 12 \
-  --ema-span 20 \
-  --min-history-days 20 \
-  --transaction-cost-bps 1 \
-  --output-csv /tmp/trading/liquidity_top100_overnight.csv \
-  --summary-json /tmp/trading/liquidity_top100_overnight_summary.json
-```
-
-Change only `--top 50` to run the top-50 basket. The liquidity cache is shared.
-
 ### Fractional versus whole-share sizing
 
 The default `--share-mode fractional` preserves the original exact equal-notional
@@ -310,21 +259,10 @@ shares for that session. The report includes deployed capital, utilization, exec
 basket size, skipped selections, and the spread between the largest and smallest
 position weights.
 
-To trade only liquidity ranks 51--100, excluding the 50 most-liquid stocks:
-
-```bash
-python backtest.py \
-  --top 100 \
-  --exclude-top 50 \
-  --months 12 \
-  --ema-span 20 \
-  --transaction-cost-bps 1
-```
-
 ## Alpaca paper execution
 
 `live.py` applies the same causal liquidity idea to an
-Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-10
+Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-12
 basket at 15:45, and submits its exit at 08:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
 weekends and exchange holidays instead of attempting scheduled actions.
