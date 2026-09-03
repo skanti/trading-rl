@@ -231,9 +231,49 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
 
         np.testing.assert_allclose(baseline, revised, equal_nan=True)
 
-    def test_turnover_stability_rejects_a_degenerate_window(self):
+    def test_turnover_stability_rejects_a_degenerate_span(self):
         with self.assertRaises(ValueError):
-            causal_turnover_stability(np.full((10, 1), 1.0), 10, 5, dispersion_window=1)
+            causal_turnover_stability(np.full((10, 1), 1.0), 1, 5)
+
+    def test_turnover_stability_uses_ema_span_for_dispersion(self):
+        volume = np.array(
+            [[100.0], [200.0], [400.0], [800.0], [1_600.0], [3_200.0]]
+        )
+        span = 4
+        level = causal_ema_log_liquidity(volume, span, min_history_days=1)
+        expected_spread = (
+            pd.DataFrame(np.log1p(volume))
+            .rolling(span, min_periods=span // 2)
+            .std()
+            .shift(1)
+            .to_numpy()
+        )
+
+        actual = causal_turnover_stability(volume, span, min_history_days=1)
+
+        np.testing.assert_allclose(
+            actual,
+            level - np.nan_to_num(expected_spread, nan=0.0),
+            equal_nan=True,
+        )
+
+    def test_turnover_stability_can_replay_the_legacy_dispersion_span(self):
+        sessions = np.arange(30, dtype=np.float64)[:, None]
+        volume = 1_000.0 * np.exp(np.sin(sessions / 3.0))
+
+        legacy = causal_turnover_stability(
+            volume,
+            ema_span=10,
+            min_history_days=5,
+            dispersion_span=20,
+        )
+        current = causal_turnover_stability(
+            volume,
+            ema_span=10,
+            min_history_days=5,
+        )
+
+        self.assertFalse(np.allclose(legacy, current, equal_nan=True))
 
     def test_whole_share_sizing_rounds_down_without_exceeding_budget(self):
         prices = np.array([120.0, 300.0, 700.0])
@@ -279,6 +319,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             transaction_cost_bps=0.0,
             max_entry_staleness_minutes=0,
             max_exit_staleness_minutes=0,
+            liquidity_scheme="dollar_ema",
             budget=1_000.0,
         )
 

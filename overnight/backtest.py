@@ -430,14 +430,12 @@ def causal_ema_log_liquidity(
     return scores
 
 
-DEFAULT_DISPERSION_WINDOW = 20
-
-
 def causal_turnover_stability(
     dollar_volume: np.ndarray,
     ema_span: int,
     min_history_days: int,
-    dispersion_window: int = DEFAULT_DISPERSION_WINDOW,
+    *,
+    dispersion_span: int | None = None,
 ) -> np.ndarray:
     """Rank on liquidity level less the dispersion of that same liquidity.
 
@@ -451,14 +449,23 @@ def causal_turnover_stability(
     Both terms are causal. The EMA is already lagged, and the dispersion is
     shifted one session, so row ``t`` sees only sessions strictly before ``t``.
     """
-    if int(dispersion_window) < 2:
-        raise ValueError("dispersion window must span at least two sessions")
+    # Production uses one horizon for both terms. The optional override exists only
+    # so reconciliation can faithfully replay sessions produced by the former
+    # fixed-20-session model.
+    effective_dispersion_span = (
+        int(ema_span) if dispersion_span is None else int(dispersion_span)
+    )
+    if effective_dispersion_span < 2:
+        raise ValueError("turnover stability span must cover at least two sessions")
     level = causal_ema_log_liquidity(dollar_volume, ema_span, min_history_days)
     values = np.asarray(dollar_volume, dtype=np.float64)
     logged = np.log1p(np.where(np.isfinite(values) & (values > 0.0), values, np.nan))
     spread = (
         pd.DataFrame(logged)
-        .rolling(int(dispersion_window), min_periods=int(dispersion_window) // 2)
+        .rolling(
+            effective_dispersion_span,
+            min_periods=effective_dispersion_span // 2,
+        )
         .std()
         .shift(1)
         .to_numpy()
@@ -1040,7 +1047,7 @@ def _metric_text(summary: dict[str, object]) -> str:
     if summary["liquidity_scheme"] == "turnover_stability":
         return (
             f"lagged log-dollar-volume EMA({summary['ema_span_sessions']}) less its "
-            f"{DEFAULT_DISPERSION_WINDOW}-session dispersion, "
+            f"{summary['ema_span_sessions']}-session dispersion, "
             f"minimum {minimum_trading_days} completed trading days"
         )
     raise ValueError(f"unknown liquidity scheme: {summary['liquidity_scheme']}")
@@ -1633,7 +1640,7 @@ def main() -> None:
         "--ema-span",
         type=int,
         default=10,
-        help="liquidity EMA span; 1 uses only the prior day",
+        help="liquidity EMA span; also the turnover-stability dispersion span",
     )
     parser.add_argument("--min-history-days", type=int, default=20)
     parser.add_argument(
@@ -1785,6 +1792,8 @@ def main() -> None:
         parser.error(
             "months, ema-span, min-history-days, and minimum-trading-days must be positive"
         )
+    if args.liquidity_scheme == "turnover_stability" and args.ema_span < 2:
+        parser.error("--ema-span must be at least 2 for turnover stability")
     if args.security_master_max_age_days < 1:
         parser.error("security-master-max-age-days must be positive")
     if args.top < 1:

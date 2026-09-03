@@ -81,7 +81,7 @@ TERMINAL_ORDER_STATUSES = frozenset(
 )
 LOGGER = logging.getLogger("overnight-liquidity-live")
 CONSOLE = Console()
-RANKING_PIPELINE_VERSION = 6
+RANKING_PIPELINE_VERSION = 7
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -1142,6 +1142,8 @@ def completed_liquidity_ranking(
     min_history_days: int,
     minimum_trading_days: int | None = None,
     scheme: str = "dollar_ema",
+    *,
+    dispersion_span: int | None = None,
 ) -> list[tuple[str, float, int]]:
     """Rank symbols using bars strictly before ``trade_date``.
 
@@ -1180,7 +1182,12 @@ def completed_liquidity_ranking(
                 values[row, column] = price * volume
                 observations[column] += 1
     score_matrix = (
-        causal_turnover_stability(values, ema_span, min_history_days)
+        causal_turnover_stability(
+            values,
+            ema_span,
+            min_history_days,
+            dispersion_span=dispersion_span,
+        )
         if scheme == "turnover_stability"
         else causal_ema_log_liquidity(values, ema_span, min_history_days)
     )
@@ -1434,6 +1441,11 @@ def rank_for_day(
             "candidate_method": (
                 "most_liquid.txt daily top-N dollar-volume union over a trailing "
                 "session window, then strictly lagged causal EMA(log1p(dollar volume))"
+                + (
+                    " less same-span dispersion"
+                    if config.liquidity_scheme == "turnover_stability"
+                    else ""
+                )
             ),
             "ranking_price": "split-adjusted daily VWAP, falling back to close",
             "daily_bars_dir": str(bars_dir),
@@ -2708,7 +2720,12 @@ def build_parser(
     )
     parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=20)
     parser.add_argument("--entry-grace-seconds", type=int, default=75)
-    parser.add_argument("--ema-span", type=int, default=10)
+    parser.add_argument(
+        "--ema-span",
+        type=int,
+        default=10,
+        help="liquidity EMA span; also the turnover-stability dispersion span",
+    )
     parser.add_argument("--min-history-days", type=int, default=20)
     parser.add_argument(
         "--minimum-trading-days",
@@ -2891,6 +2908,8 @@ def _validate_args(
         parser.error(
             "top, ema-span, min-history-days, and minimum-trading-days must be positive"
         )
+    if args.liquidity_scheme == "turnover_stability" and args.ema_span < 2:
+        parser.error("ema-span must be at least 2 for turnover stability")
     if args.liquidity_lookback_days < 30:
         parser.error("liquidity-lookback-days must be at least 30")
     if args.shortlist_daily_top < 1 or args.daily_overlap_days < 1:
@@ -3022,7 +3041,9 @@ def _print_effective_configuration(
     )
     table.add_row(
         "Ranking",
-        f"top {args.top} · {args.liquidity_scheme} · EMA {args.ema_span} · "
+        f"top {args.top} · {args.liquidity_scheme} · "
+        f"{'EMA/dispersion' if args.liquidity_scheme == 'turnover_stability' else 'EMA'} "
+        f"{args.ema_span} · "
         f"minimum {args.minimum_trading_days} sessions",
     )
     capital = (

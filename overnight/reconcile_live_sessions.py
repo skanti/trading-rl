@@ -492,6 +492,10 @@ def replay_ranking(
     ema_span = int(
         configuration.get("ema_span") or ranking.get("ema_span_sessions") or 10
     )
+    pipeline_version = ranking.get("ranking_pipeline_version")
+    dispersion_span = (
+        20 if pipeline_version is None or int(pipeline_version) <= 6 else ema_span
+    )
     min_history = int(
         configuration.get("min_history_days")
         or ranking.get("minimum_history_sessions")
@@ -527,6 +531,7 @@ def replay_ranking(
             min_history,
             minimum_trading_days,
             scheme_name,
+            dispersion_span=dispersion_span,
         )
 
     replayed: list[tuple[str, float, int]]
@@ -582,6 +587,7 @@ def replay_ranking(
         "liquidity_scheme": scheme,
         "liquidity_scheme_source": scheme_source,
         "ema_span": ema_span,
+        "dispersion_span": dispersion_span,
         "minimum_history_days": min_history,
         "minimum_trading_days": minimum_trading_days,
         "candidate_symbols": len(bars),

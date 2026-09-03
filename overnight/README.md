@@ -5,7 +5,7 @@
 1. Read each stock's completed daily dollar volume as split-adjusted daily
    `VWAP * volume` (falling back to the daily close when VWAP is unavailable).
 2. Smooth `log1p(dollar_volume)` with a causal EMA, then subtract that series'
-   own 20-session dispersion so steady turnover outranks episodic turnover.
+   dispersion over the same span so steady turnover outranks episodic turnover.
 3. Before each 15:45 entry, rank using the EMA state through the previous
    session only. The current session never contributes to its own rank.
 4. Equal-weight the selected stocks, then close them in the next session's
@@ -35,8 +35,8 @@ this causal listing-history filter with `--minimum-trading-days`; the default
 excludes recent IPOs such as SPCX until they establish 100 sessions.
 
 The log transform and default 10-session EMA keep earnings, index-rebalance,
-and news-related volume spikes from dominating the ranking. Use `--ema-span 1`
-to rank strictly by the previous completed session without smoothing.
+and news-related volume spikes from dominating the ranking. Turnover stability
+uses that same span for its dispersion window, keeping the two horizons aligned.
 
 The first run combines split-adjusted daily bars from
 `/data/ppv1/updates/bars_1day_2022-01-01` with execution prices from
@@ -63,7 +63,7 @@ The backtester supports the same two completed-session liquidity schemes as live
 trading:
 
 - `dollar_ema`: lagged EMA of `log1p` completed-session dollar volume.
-- `turnover_stability`: that same EMA less the 20-session dispersion of the same
+- `turnover_stability`: that same EMA less the same-span dispersion of the
   log-dollar-volume series. Both terms are log dollars, so the subtraction needs
   no weighting: a name whose log turnover swings by 1.0 is docked as much as a
   name with `e` times less turnover. It demotes a stock that is only briefly
