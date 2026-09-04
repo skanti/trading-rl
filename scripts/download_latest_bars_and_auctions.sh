@@ -26,7 +26,6 @@ WORKERS="${WORKERS:-4}"
 DAILY_BAR_BATCH_SIZE="${DAILY_BAR_BATCH_SIZE:-100}"
 MINUTE_BAR_BATCH_SIZE="${MINUTE_BAR_BATCH_SIZE:-10}"
 ALPACA_REQUESTS_PER_MINUTE="${ALPACA_REQUESTS_PER_MINUTE:-180}"
-CALENDAR_SYMBOL="${CALENDAR_SYMBOL:-AAPL}"
 LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 
 usage() {
@@ -86,13 +85,6 @@ log() {
   printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
 }
 
-require_file() {
-  if [[ ! -f "$1" ]]; then
-    echo "Required file does not exist: $1" >&2
-    exit 1
-  fi
-}
-
 check_failures() {
   local dataset_dir="$1"
   local failed_path="$dataset_dir/_failed_tickers.txt"
@@ -146,30 +138,23 @@ log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAI
   --metric dollar-volume \
   --output "$LIQUIDITY_CANDIDATES_PATH"
 
-calendar_path="$DAILY_BARS_DIR/$CALENDAR_SYMBOL.npy"
-require_file "$calendar_path"
+# Daily bars intentionally exclude the unfinished session, but today's opening
+# auction becomes usable after the SIP delay. Do not derive this bound from the
+# daily cache or same-day reconciliation will remain one session behind.
 auction_end="$(
-  "$PYTHON_BIN" - "$calendar_path" <<'PY'
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import sys
+  "$PYTHON_BIN" - <<'PY'
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import numpy as np
-
-path = Path(sys.argv[1])
-bars = np.load(path, mmap_mode="r", allow_pickle=False)
-if bars.ndim != 2 or bars.shape[1] < 1 or not len(bars):
-    raise SystemExit(f"invalid daily calendar bars: {path}")
-origin = datetime(2010, 1, 1, tzinfo=timezone.utc)
-print((origin + timedelta(seconds=int(bars[-1, 0]))).date().isoformat())
+print(datetime.now(ZoneInfo("America/New_York")).date().isoformat())
 PY
 )"
 if [[ ! "$auction_end" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  echo "Could not determine the latest completed daily-bar session: $auction_end" >&2
+  echo "Could not determine the current New York date: $auction_end" >&2
   exit 1
 fi
 
-log "Updating auctions through $auction_end"
+log "Updating auctions through the current New York date $auction_end"
 if [[ -f "$AUCTIONS_PATH" && -f "${AUCTIONS_PATH%.npz}.json" ]]; then
   "$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
     --update \
@@ -197,7 +182,7 @@ while IFS= read -r symbol; do
   fi
 done <"$LIQUIDITY_CANDIDATES_PATH"
 
-log "Updating liquidity-prioritized shortlist minute bars in $MINUTE_BARS_DIR"
+log "Updating liquidity-prioritized shortlist minute bars through Alpaca's delayed SIP cutoff in $MINUTE_BARS_DIR"
 "$PYTHON_BIN" "$SCRIPT_DIR/download_bars.py" \
   --source alpaca \
   --timeframe 1Min \

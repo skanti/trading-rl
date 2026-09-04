@@ -11,6 +11,7 @@ from broker_fees import summarize_broker_fees
 from reconcile_live_sessions import (
     attach_broker_fees,
     broker_fees_for_session,
+    execution_timing,
     execution_context,
     format_usd,
     infer_entry_minute,
@@ -26,12 +27,18 @@ def seconds(day: date, clock: time) -> int:
     return int((stamp - BAR_ORIGIN).total_seconds())
 
 
-def order(quantity: float, price: float, filled_at: str) -> dict[str, object]:
+def order(
+    quantity: float,
+    price: float,
+    filled_at: str,
+    submitted_at: str | None = None,
+) -> dict[str, object]:
     return {
         "status": "filled",
         "filled_qty": str(quantity),
         "filled_avg_price": str(price),
         "filled_at": filled_at,
+        "submitted_at": submitted_at or filled_at,
     }
 
 
@@ -94,7 +101,14 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                     "entry_orders": {
                         "AAPL": order(10, 100.5, "2026-08-28T19:59:00.2Z")
                     },
-                    "exit_orders": {"AAPL": order(10, 110, "2026-08-31T13:30:00.2Z")},
+                    "exit_orders": {
+                        "AAPL": order(
+                            10,
+                            110,
+                            "2026-08-31T13:30:00.2Z",
+                            "2026-08-31T12:00:00Z",
+                        )
+                    },
                     "entry_account_snapshot": {"equity": "1000"},
                     "exit_account_snapshot": {"equity": "1095"},
                 },
@@ -128,6 +142,116 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 totals["actual_minus_simulator_gross_pnl"],
             )
             self.assertAlmostEqual(totals["broker_minus_actual_fill_pnl"], 0.0)
+            self.assertTrue(result["timing"]["schedule_comparable"])
+            self.assertTrue(result["timing"]["exit"]["opening_auction_comparable"])
+            self.assertEqual(result["warnings"], [])
+
+    def test_off_schedule_exit_warns_and_adds_actual_time_minute_benchmark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            minute_dir = root / "minute"
+            minute_dir.mkdir()
+            entry_day = date(2026, 8, 28)
+            exit_day = date(2026, 8, 31)
+            np.save(
+                minute_dir / "AAPL.npy",
+                np.asarray(
+                    [
+                        [seconds(entry_day, time(15, 59)), 100_000, 100, 10],
+                        [seconds(exit_day, time(12, 45)), 109_000, 100, 10],
+                    ],
+                    dtype=np.int32,
+                ),
+            )
+            auctions = root / "auctions.npz"
+            np.savez_compressed(
+                auctions,
+                format_version=np.asarray(1, dtype=np.int16),
+                split_adjusted=np.asarray(True),
+                symbol=np.asarray(["AAPL"]),
+                date=np.asarray([exit_day.isoformat()], dtype="datetime64[D]"),
+                session=np.asarray([0], dtype=np.uint8),
+                condition=np.asarray(["O"]),
+                price=np.asarray([110.0]),
+                raw_price=np.asarray([110.0]),
+                size=np.asarray([1_000.0]),
+                exchange=np.asarray(["Q"]),
+            )
+            summary = {
+                "configuration": {"entry_time": "15:59"},
+                "position": {
+                    "status": "closed",
+                    "entry_date": entry_day.isoformat(),
+                    "exit_date": exit_day.isoformat(),
+                    "symbols": ["AAPL"],
+                    "entry_orders": {
+                        "AAPL": order(10, 100.0, "2026-08-28T19:59:00.2Z")
+                    },
+                    "exit_orders": {
+                        "AAPL": order(
+                            10,
+                            109.1,
+                            "2026-08-31T16:45:03Z",
+                            "2026-08-31T16:45:00Z",
+                        )
+                    },
+                },
+            }
+
+            result = reconcile_execution(summary, minute_dir, auctions)
+
+        timing = result["timing"]
+        self.assertFalse(timing["schedule_comparable"])
+        self.assertFalse(timing["exit"]["submitted_before_auction_cutoff"])
+        self.assertFalse(timing["exit"]["opening_auction_comparable"])
+        self.assertAlmostEqual(timing["exit"]["minimum_offset_minutes"], 195.05)
+        self.assertEqual(
+            timing["exit"]["actual_time_minute_benchmark"],
+            {
+                "date": "2026-08-31",
+                "time": "12:45",
+                "price_source": "minute_bar_open",
+            },
+        )
+        warning = result["warnings"][0]
+        self.assertIn("not opening-auction comparable", warning)
+        self.assertIn("1/1 orders were submitted", warning)
+        self.assertIn("1/1 symbols exceed the 1-minute tolerance", warning)
+        self.assertNotIn("AAPL", warning)
+        row = result["rows"][0]
+        self.assertEqual(row["actual_time_exit_price"], 109.0)
+        self.assertAlmostEqual(
+            result["totals"]["actual_time_exit_slippage_bps"],
+            (109.1 / 109.0 - 1.0) * 10_000.0,
+        )
+
+    def test_off_schedule_entry_is_not_schedule_comparable(self):
+        entry_day = date(2026, 8, 28)
+        exit_day = date(2026, 8, 31)
+        timing, warnings = execution_timing(
+            {"AAPL": order(10, 100, "2026-08-28T20:02:00Z")},
+            {
+                "AAPL": order(
+                    10,
+                    110,
+                    "2026-08-31T13:30:00.2Z",
+                    "2026-08-31T12:00:00Z",
+                )
+            },
+            ["AAPL"],
+            entry_day,
+            exit_day,
+            15 * 60 + 59,
+            1.0,
+        )
+
+        self.assertFalse(timing["schedule_comparable"])
+        self.assertFalse(timing["entry"]["comparable"])
+        self.assertTrue(timing["exit"]["opening_auction_comparable"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1/1 symbols exceed the 1-minute tolerance", warnings[0])
+        self.assertIn("3.0–3.0 minutes after the scheduled 15:59 ET entry", warnings[0])
+        self.assertNotIn("AAPL", warnings[0])
 
     def test_uses_exit_date_fee_activities_for_actual_net_pnl(self):
         fees = summarize_broker_fees(

@@ -477,6 +477,13 @@ report is one overview table across the selected period: dollar values are cumul
 totals and execution differences are deployed-capital-weighted basis points. Fee-based
 actual net results use only fee-confirmed sessions and show their coverage. Entry-fill,
 exit-fill, and quantity-mismatch P&L impacts remain available in the detailed artifacts.
+Reconciliation also checks fill timestamps against the scheduled entry minute and the
+09:30 opening cross, and verifies that exit orders were submitted before the 09:28
+auction cutoff. A deviation beyond one minute marks the session as not schedule
+comparable and emits a warning; configure the tolerance with
+`--schedule-tolerance-minutes`. For an off-schedule exit, the auction remains the
+scheduled-strategy counterfactual and a separate minute-bar-open benchmark is recorded
+at the median actual fill minute.
 
 With no date it reconciles the latest closed session. Select one session or a range with:
 

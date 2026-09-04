@@ -34,12 +34,19 @@ from backtest import (
     _security_symbol,
 )
 from broker_fees import classify_broker_fee_summary, summarize_broker_fees
-from live import AlpacaClient, completed_liquidity_ranking, load_credentials
+from live import (
+    OPENING_AUCTION_CUTOFF,
+    REGULAR_MARKET_OPEN,
+    AlpacaClient,
+    completed_liquidity_ranking,
+    load_credentials,
+)
 from price_utils import forward_fill_positions
 
 
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_TRANSACTION_COST_BPS = 1.0
+DEFAULT_SCHEDULE_TOLERANCE_MINUTES = 1.0
 DATE_DIRECTORY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONSOLE = Console()
 
@@ -241,6 +248,226 @@ def _filled_order(
     return quantity, price
 
 
+def _order_timestamps(
+    orders: Mapping[str, object],
+    symbols: Sequence[str],
+    side: str,
+    field: str,
+) -> tuple[dict[str, datetime], list[str]]:
+    observed: dict[str, datetime] = {}
+    missing: list[str] = []
+    for symbol in symbols:
+        order = orders.get(symbol)
+        if not isinstance(order, Mapping):
+            raise ValueError(f"missing {side} order for {symbol}")
+        value = order.get(field)
+        if not value:
+            missing.append(symbol)
+            continue
+        observed[symbol] = _timestamp(value, f"{symbol} {side} {field}")
+    return observed, missing
+
+
+def _offset_range_text(low: float, high: float) -> str:
+    if low >= 0.0:
+        return f"{low:.1f}–{high:.1f} minutes after"
+    if high <= 0.0:
+        return f"{abs(high):.1f}–{abs(low):.1f} minutes before"
+    return f"{abs(low):.1f} minutes before to {high:.1f} minutes after"
+
+
+def execution_timing(
+    entry_orders: Mapping[str, object],
+    exit_orders: Mapping[str, object],
+    symbols: Sequence[str],
+    entry_day: date,
+    exit_day: date,
+    entry_minute: int,
+    tolerance_minutes: float,
+) -> tuple[dict[str, object], list[str]]:
+    """Classify whether live fills are comparable to the modeled schedule."""
+    if tolerance_minutes < 0.0:
+        raise ValueError("schedule tolerance must be non-negative")
+    entry_target = datetime.combine(
+        entry_day,
+        time(entry_minute // 60, entry_minute % 60),
+        tzinfo=EASTERN,
+    )
+    exit_target = datetime.combine(exit_day, REGULAR_MARKET_OPEN, tzinfo=EASTERN)
+    auction_cutoff = datetime.combine(exit_day, OPENING_AUCTION_CUTOFF, tzinfo=EASTERN)
+    entry_fills, missing_entry_fills = _order_timestamps(
+        entry_orders, symbols, "entry", "filled_at"
+    )
+    exit_fills, missing_exit_fills = _order_timestamps(
+        exit_orders, symbols, "exit", "filled_at"
+    )
+    exit_submissions, missing_exit_submissions = _order_timestamps(
+        exit_orders, symbols, "exit", "submitted_at"
+    )
+
+    entry_offset_by_symbol = {
+        symbol: (stamp.astimezone(EASTERN) - entry_target).total_seconds() / 60.0
+        for symbol, stamp in entry_fills.items()
+    }
+    exit_offset_by_symbol = {
+        symbol: (stamp.astimezone(EASTERN) - exit_target).total_seconds() / 60.0
+        for symbol, stamp in exit_fills.items()
+    }
+    entry_offsets = list(entry_offset_by_symbol.values())
+    exit_offsets = list(exit_offset_by_symbol.values())
+    entry_exceeded = [
+        symbol
+        for symbol, offset in entry_offset_by_symbol.items()
+        if abs(offset) > tolerance_minutes
+    ]
+    exit_exceeded = [
+        symbol
+        for symbol, offset in exit_offset_by_symbol.items()
+        if abs(offset) > tolerance_minutes
+    ]
+    late_exit_submissions = [
+        symbol
+        for symbol, stamp in exit_submissions.items()
+        if stamp.astimezone(EASTERN) >= auction_cutoff
+    ]
+    entry_fill_comparable = (
+        not missing_entry_fills and bool(entry_offsets) and not entry_exceeded
+    )
+    exit_fill_comparable = (
+        not missing_exit_fills and bool(exit_offsets) and not exit_exceeded
+    )
+    submitted_before_cutoff = (
+        None
+        if missing_exit_submissions
+        else all(
+            stamp.astimezone(EASTERN) < auction_cutoff
+            for stamp in exit_submissions.values()
+        )
+    )
+    opening_auction_comparable = bool(
+        exit_fill_comparable and submitted_before_cutoff is True
+    )
+
+    representative_exit = None
+    if exit_fills and not opening_auction_comparable:
+        ordered_exit_fills = sorted(exit_fills.values())
+        representative_exit = ordered_exit_fills[
+            len(ordered_exit_fills) // 2
+        ].astimezone(EASTERN)
+
+    timing: dict[str, object] = {
+        "tolerance_minutes": float(tolerance_minutes),
+        "schedule_comparable": bool(
+            entry_fill_comparable and opening_auction_comparable
+        ),
+        "entry": {
+            "benchmark": "scheduled_minute_open",
+            "scheduled_at": entry_target.isoformat(),
+            "first_fill_at": min(entry_fills.values()).astimezone(EASTERN).isoformat()
+            if entry_fills
+            else None,
+            "last_fill_at": max(entry_fills.values()).astimezone(EASTERN).isoformat()
+            if entry_fills
+            else None,
+            "minimum_offset_minutes": min(entry_offsets) if entry_offsets else None,
+            "maximum_offset_minutes": max(entry_offsets) if entry_offsets else None,
+            "missing_fill_timestamp_count": len(missing_entry_fills),
+            "exceeding_tolerance_count": len(entry_exceeded),
+            "comparable": entry_fill_comparable,
+        },
+        "exit": {
+            "benchmark": "primary_opening_auction",
+            "auction_cutoff_at": auction_cutoff.isoformat(),
+            "opening_cross_at": exit_target.isoformat(),
+            "first_submission_at": min(exit_submissions.values())
+            .astimezone(EASTERN)
+            .isoformat()
+            if exit_submissions
+            else None,
+            "last_submission_at": max(exit_submissions.values())
+            .astimezone(EASTERN)
+            .isoformat()
+            if exit_submissions
+            else None,
+            "first_fill_at": min(exit_fills.values()).astimezone(EASTERN).isoformat()
+            if exit_fills
+            else None,
+            "last_fill_at": max(exit_fills.values()).astimezone(EASTERN).isoformat()
+            if exit_fills
+            else None,
+            "minimum_offset_minutes": min(exit_offsets) if exit_offsets else None,
+            "maximum_offset_minutes": max(exit_offsets) if exit_offsets else None,
+            "missing_submission_timestamp_count": len(missing_exit_submissions),
+            "late_submission_count": len(late_exit_submissions),
+            "missing_fill_timestamp_count": len(missing_exit_fills),
+            "exceeding_tolerance_count": len(exit_exceeded),
+            "submitted_before_auction_cutoff": submitted_before_cutoff,
+            "opening_auction_comparable": opening_auction_comparable,
+            "actual_time_minute_benchmark": (
+                {
+                    "date": representative_exit.date().isoformat(),
+                    "time": representative_exit.strftime("%H:%M"),
+                    "price_source": "minute_bar_open",
+                }
+                if representative_exit is not None
+                else None
+            ),
+        },
+    }
+
+    warnings: list[str] = []
+    if not entry_fill_comparable:
+        details: list[str] = []
+        if missing_entry_fills:
+            details.append(
+                f"{len(missing_entry_fills)}/{len(symbols)} symbols lack fill timestamps"
+            )
+        if entry_exceeded:
+            details.append(
+                f"{len(entry_exceeded)}/{len(symbols)} symbols exceed the "
+                f"{tolerance_minutes:g}-minute tolerance; fills span "
+                f"{_offset_range_text(min(entry_offsets), max(entry_offsets))} "
+                f"the scheduled {_clock_text(entry_minute)} ET entry"
+            )
+        warnings.append(
+            "entry is off schedule: "
+            + "; ".join(details)
+            + "; actual-versus-simulator differences "
+            "include timing drift, not only execution slippage"
+        )
+
+    if not opening_auction_comparable:
+        reasons: list[str] = []
+        if missing_exit_submissions:
+            reasons.append(
+                f"{len(missing_exit_submissions)}/{len(symbols)} symbols lack "
+                "submission timestamps"
+            )
+        if late_exit_submissions:
+            reasons.append(
+                f"{len(late_exit_submissions)}/{len(symbols)} orders were submitted "
+                f"at or after the {OPENING_AUCTION_CUTOFF.strftime('%H:%M')} ET cutoff"
+            )
+        if missing_exit_fills:
+            reasons.append(
+                f"{len(missing_exit_fills)}/{len(symbols)} symbols lack fill timestamps"
+            )
+        if exit_exceeded:
+            reasons.append(
+                f"{len(exit_exceeded)}/{len(symbols)} symbols exceed the "
+                f"{tolerance_minutes:g}-minute tolerance; fills span "
+                f"{_offset_range_text(min(exit_offsets), max(exit_offsets))} "
+                "the 09:30 ET opening cross"
+            )
+        warnings.append(
+            "exit is not opening-auction comparable: "
+            + "; ".join(reasons)
+            + "; the auction result remains a scheduled-strategy counterfactual, "
+            "not ordinary execution slippage"
+        )
+    return timing, warnings
+
+
 def _equity(position: Mapping[str, object], side: str) -> float | None:
     snapshot = position.get(f"{side}_account_snapshot") or {}
     if not isinstance(snapshot, Mapping) or snapshot.get("equity") is None:
@@ -259,6 +486,7 @@ def reconcile_execution(
     entry_minute_override: int | None = None,
     transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS,
     max_entry_staleness_minutes: float = 10.0,
+    schedule_tolerance_minutes: float = DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
 ) -> dict[str, object]:
     position = summary.get("position") or {}
     if not isinstance(position, Mapping) or position.get("status") != "closed":
@@ -273,10 +501,31 @@ def reconcile_execution(
     if not isinstance(entry_orders, Mapping) or not isinstance(exit_orders, Mapping):
         raise ValueError("position orders must be mappings")
     entry_minute = infer_entry_minute(summary, entry_minute_override)
+    timing, timing_warnings = execution_timing(
+        entry_orders,
+        exit_orders,
+        symbols,
+        entry_day,
+        exit_day,
+        entry_minute,
+        schedule_tolerance_minutes,
+    )
     auctions = opening_auction_rows(auctions_path, exit_day, symbols)
+    exit_timing = timing["exit"]
+    if not isinstance(exit_timing, Mapping):
+        raise TypeError("exit timing must be a mapping")
+    actual_time_benchmark = exit_timing.get("actual_time_minute_benchmark")
+    if isinstance(actual_time_benchmark, Mapping):
+        actual_time_exit_day = parse_day(str(actual_time_benchmark["date"]))
+        actual_time_exit_minute = parse_clock(str(actual_time_benchmark["time"]))
+    else:
+        actual_time_exit_day = None
+        actual_time_exit_minute = None
 
     rows: list[dict[str, object]] = []
-    warnings: list[str] = []
+    warnings = list(timing_warnings)
+    actual_time_benchmark_failures = 0
+    quantity_mismatch_count = 0
     for symbol in symbols:
         entry_qty, actual_entry = _filled_order(entry_orders, symbol, "entry")
         exit_qty, actual_exit = _filled_order(exit_orders, symbol, "exit")
@@ -297,6 +546,29 @@ def reconcile_execution(
         raw_auction = float(auction["raw_price"])
         adjustment = raw_auction / simulated_exit
         comparable_entry = simulated_entry * adjustment
+        actual_time_exit = None
+        actual_time_exit_comparable = None
+        actual_time_exit_staleness = None
+        actual_time_exit_slippage = None
+        if actual_time_exit_day is not None and actual_time_exit_minute is not None:
+            try:
+                actual_time_exit, actual_time_exit_staleness = minute_open_price(
+                    data_dir,
+                    symbol,
+                    actual_time_exit_day,
+                    actual_time_exit_minute,
+                )
+                if actual_time_exit_staleness > max_entry_staleness_minutes:
+                    raise ValueError(
+                        f"actual-time exit mark is {actual_time_exit_staleness:.1f} "
+                        f"minutes stale, exceeding {max_entry_staleness_minutes:.1f}"
+                    )
+                actual_time_exit_comparable = actual_time_exit * adjustment
+                actual_time_exit_slippage = (
+                    actual_exit / actual_time_exit_comparable - 1.0
+                ) * 10_000.0
+            except (OSError, TypeError, ValueError):
+                actual_time_benchmark_failures += 1
 
         actual_entry_notional = entry_qty * actual_entry
         actual_exit_notional = exit_qty * actual_exit
@@ -316,10 +588,7 @@ def reconcile_execution(
             * (actual_entry_notional + simulated_exit_notional)
         )
         if not math.isclose(entry_qty, exit_qty, rel_tol=1e-8, abs_tol=1e-8):
-            warnings.append(
-                f"{symbol} quantity changed from {entry_qty:g} to {exit_qty:g}; "
-                "a corporate action or partial fill may require order-history reconstruction"
-            )
+            quantity_mismatch_count += 1
         rows.append(
             {
                 "symbol": symbol,
@@ -335,6 +604,13 @@ def reconcile_execution(
                 "simulator_exit_price": simulated_exit,
                 "simulator_exit_price_comparable": raw_auction,
                 "exit_slippage_bps": (actual_exit / raw_auction - 1.0) * 10_000.0,
+                "actual_time_exit_minute": _clock_text(actual_time_exit_minute)
+                if actual_time_exit_minute is not None
+                else None,
+                "actual_time_exit_price": actual_time_exit,
+                "actual_time_exit_price_comparable": actual_time_exit_comparable,
+                "actual_time_exit_staleness_minutes": actual_time_exit_staleness,
+                "actual_time_exit_slippage_bps": actual_time_exit_slippage,
                 "auction_exchange": auction["exchange"],
                 "actual_entry_notional": actual_entry_notional,
                 "actual_exit_notional": actual_exit_notional,
@@ -352,6 +628,18 @@ def reconcile_execution(
                 / actual_entry_notional
                 * 10_000.0,
             }
+        )
+
+    if actual_time_benchmark_failures:
+        warnings.append(
+            "actual-time exit minute benchmark is unavailable for "
+            f"{actual_time_benchmark_failures}/{len(symbols)} symbols"
+        )
+    if quantity_mismatch_count:
+        warnings.append(
+            f"entry and exit quantities differ for {quantity_mismatch_count}/"
+            f"{len(symbols)} symbols; a corporate action or partial fill may require "
+            "order-history reconstruction"
         )
 
     def total(field: str) -> float:
@@ -372,6 +660,15 @@ def reconcile_execution(
         float(row["entry_quantity"]) * float(row["simulator_exit_price_comparable"])
         for row in rows
     )
+    actual_time_exit_at_entry_quantities = (
+        sum(
+            float(row["entry_quantity"])
+            * float(row["actual_time_exit_price_comparable"])
+            for row in rows
+        )
+        if actual_time_exit_minute is not None and not actual_time_benchmark_failures
+        else None
+    )
     entry_execution_pnl_impact = total("entry_execution_pnl_impact")
     exit_execution_pnl_impact = total("exit_execution_pnl_impact")
     quantity_pnl_impact = total("quantity_pnl_impact")
@@ -389,6 +686,7 @@ def reconcile_execution(
         "exit_price_source": "primary_opening_auction",
         "transaction_cost_bps_per_side": float(transaction_cost_bps),
         "symbols": symbols,
+        "timing": timing,
         "warnings": warnings,
         "totals": {
             "actual_entry_notional": actual_entry_notional,
@@ -410,6 +708,16 @@ def reconcile_execution(
                 actual_exit_at_entry_quantities / auction_exit_at_entry_quantities - 1.0
             )
             * 10_000.0,
+            "actual_time_exit_slippage_bps": (
+                (
+                    actual_exit_at_entry_quantities
+                    / actual_time_exit_at_entry_quantities
+                    - 1.0
+                )
+                * 10_000.0
+                if actual_time_exit_at_entry_quantities is not None
+                else None
+            ),
             "entry_execution_pnl_impact": entry_execution_pnl_impact,
             "exit_execution_pnl_impact": exit_execution_pnl_impact,
             "quantity_pnl_impact": quantity_pnl_impact,
@@ -1087,6 +1395,24 @@ def print_result(
             side="exit",
         ),
     )
+    timing = result.get("timing") or {}
+    exit_timing = timing.get("exit") if isinstance(timing, Mapping) else None
+    actual_time_benchmark = (
+        exit_timing.get("actual_time_minute_benchmark")
+        if isinstance(exit_timing, Mapping)
+        else None
+    )
+    actual_time_exit_slippage = totals.get("actual_time_exit_slippage_bps")
+    if (
+        isinstance(actual_time_benchmark, Mapping)
+        and actual_time_exit_slippage is not None
+    ):
+        comparison.add_row(
+            "Off-schedule exit benchmark",
+            "Fills",
+            f"{actual_time_benchmark['date']} {actual_time_benchmark['time']} ET bar open",
+            execution_context(actual_time_exit_slippage, side="exit"),
+        )
     if abs(float(totals["quantity_pnl_impact"])) >= 0.005:
         comparison.add_row(
             "Quantity mismatch",
@@ -1173,6 +1499,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="simulator assumption per side; actual fills remain gross",
     )
     parser.add_argument("--max-entry-staleness-minutes", type=float, default=10.0)
+    parser.add_argument(
+        "--schedule-tolerance-minutes",
+        type=float,
+        default=DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
+        help="maximum fill-time deviation still considered on schedule (default: 1)",
+    )
     parser.add_argument("--skip-ranking-replay", action="store_true")
     parser.add_argument(
         "--trading-url",
@@ -1208,8 +1540,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.entry_date and args.since:
         parser.error("--entry-date and --since are mutually exclusive")
-    if args.transaction_cost_bps < 0.0 or args.max_entry_staleness_minutes < 0.0:
-        parser.error("cost and staleness values must be non-negative")
+    if (
+        args.transaction_cost_bps < 0.0
+        or args.max_entry_staleness_minutes < 0.0
+        or args.schedule_tolerance_minutes < 0.0
+    ):
+        parser.error("cost, staleness, and tolerance values must be non-negative")
     if args.request_timeout_seconds is not None and args.request_timeout_seconds <= 0.0:
         parser.error("--request-timeout-seconds must be positive")
     _dataset_manifest(args.data_dir, "1Min")
@@ -1260,6 +1596,7 @@ def main() -> None:
                 entry_minute_override=args.entry_time,
                 transaction_cost_bps=args.transaction_cost_bps,
                 max_entry_staleness_minutes=args.max_entry_staleness_minutes,
+                schedule_tolerance_minutes=args.schedule_tolerance_minutes,
             )
             if args.skip_broker_fees:
                 fee_summary = {
@@ -1279,7 +1616,7 @@ def main() -> None:
             if fee_warning:
                 result["warnings"].append(fee_warning)
 
-            result["version"] = 2
+            result["version"] = 3
             result["generated_at"] = datetime.now(tz=UTC).isoformat()
             result["live_summary_path"] = str(summary_path)
             if not args.skip_ranking_replay:
