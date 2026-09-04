@@ -468,7 +468,7 @@ The Nasdaq security-master cache is also kept under the work root.
 ### Reconcile live sessions with the simulator
 
 `reconcile_live_sessions.py` replays a completed basket using only information the
-simulator can observe: the split-adjusted minute-bar open at the scheduled entry minute
+simulator can observe: the split-adjusted 1-min bar open at the scheduled entry minute
 and the next session's primary condition-O opening auction. It compares those prices
 with the actual filled quantities and prices, separately reports the configured
 transaction-cost assumption and the broker-equity residual, and re-runs the shared
@@ -479,11 +479,19 @@ actual net results use only fee-confirmed sessions and show their coverage. Entr
 exit-fill, and quantity-mismatch P&L impacts remain available in the detailed artifacts.
 Reconciliation also checks fill timestamps against the scheduled entry minute and the
 09:30 opening cross, and verifies that exit orders were submitted before the 09:28
-auction cutoff. A deviation beyond one minute marks the session as not schedule
-comparable and emits a warning; configure the tolerance with
-`--schedule-tolerance-minutes`. For an off-schedule exit, the auction remains the
-scheduled-strategy counterfactual and a separate minute-bar-open benchmark is recorded
-at the median actual fill minute.
+auction cutoff. A deviation beyond 1 min marks the session as not schedule
+comparable. Strict schedule filtering is enabled by default: the whole session is
+excluded from reconciliation and aggregate results, with a warning explaining whether
+its entry, exit, or both were off schedule. Configure the tolerance with
+`--schedule-tolerance-minutes`. Use `--reconciliation-mode actual-time` to produce a
+forensic reconciliation of a botched session. In that mode, the headline P&L and
+execution comparison aligns every symbol's entry and exit to the open price of the
+1-min bar containing that symbol's fill. The scheduled entry bar and opening auction
+remain in the artifacts and detailed report as the scheduled-strategy counterfactual,
+rather than being presented as ordinary execution slippage.
+Actual-time mode never mixes benchmark types across a date range: if either actual-time
+leg is unavailable for a session, that date fails reconciliation instead of falling
+back to its scheduled prices.
 
 With no date it reconciles the latest closed session. Select one session or a range with:
 

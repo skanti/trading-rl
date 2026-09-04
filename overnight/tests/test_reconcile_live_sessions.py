@@ -1,23 +1,30 @@
 import json
+from io import StringIO
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import numpy as np
+from rich.console import Console
 
 from backtest import BAR_ORIGIN, EASTERN
 from broker_fees import summarize_broker_fees
 from reconcile_live_sessions import (
     attach_broker_fees,
     broker_fees_for_session,
+    build_parser,
     execution_timing,
     execution_context,
     format_usd,
     infer_entry_minute,
     pnl_comparison_context,
+    print_overview,
     reconcile_execution,
     replay_ranking,
+    select_reporting_benchmark,
+    summary_execution_timing,
     summarize_results,
 )
 
@@ -43,21 +50,35 @@ def order(
 
 
 class ReconcileLiveSessionsTest(unittest.TestCase):
+    def test_reconciliation_mode_defaults_to_strict_schedule(self):
+        parser = build_parser()
+
+        self.assertEqual(
+            parser.parse_args([]).reconciliation_mode,
+            "strict-schedule",
+        )
+        self.assertEqual(
+            parser.parse_args(
+                ["--reconciliation-mode", "actual-time"]
+            ).reconciliation_mode,
+            "actual-time",
+        )
+
     def test_formats_currency_sign_before_symbol(self):
         self.assertEqual(format_usd(-10.26, signed=True), "-$10.26")
         self.assertEqual(format_usd(1.13, signed=True), "+$1.13")
         self.assertEqual(format_usd(1.96), "$1.96")
         self.assertEqual(
             pnl_comparison_context(1.13, label="gross P&L", bps=1.15),
-            "Simulator gross P&L lower by $1.13 (1.15 bps)",
+            "Sim gross P&L < actual by $1.13 (1.15 bps)",
         )
         self.assertEqual(
             execution_context(-1.15, side="entry"),
-            "Simulator entry price 1.15 bps higher than actual",
+            "Sim entry price > actual by 1.15 bps",
         )
         self.assertEqual(
             execution_context(0.0, side="exit"),
-            "Simulator exit price matches actual (0.00 bps)",
+            "Sim exit price = actual (0.00 bps)",
         )
 
     def test_reconciles_actual_fills_with_minute_open_and_auction(self):
@@ -146,7 +167,7 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             self.assertTrue(result["timing"]["exit"]["opening_auction_comparable"])
             self.assertEqual(result["warnings"], [])
 
-    def test_off_schedule_exit_warns_and_adds_actual_time_minute_benchmark(self):
+    def test_off_schedule_exit_adds_per_symbol_actual_time_benchmarks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             minute_dir = root / "minute"
@@ -206,23 +227,36 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertFalse(timing["exit"]["opening_auction_comparable"])
         self.assertAlmostEqual(timing["exit"]["minimum_offset_minutes"], 195.05)
         self.assertEqual(
-            timing["exit"]["actual_time_minute_benchmark"],
+            timing["exit"]["actual_time_benchmark"],
             {
-                "date": "2026-08-31",
-                "time": "12:45",
+                "alignment": "per_symbol_fill_minute",
                 "price_source": "minute_bar_open",
             },
         )
         warning = result["warnings"][0]
         self.assertIn("not opening-auction comparable", warning)
         self.assertIn("1/1 orders were submitted", warning)
-        self.assertIn("1/1 symbols exceed the 1-minute tolerance", warning)
+        self.assertIn("1/1 symbols exceed the 1-min tolerance", warning)
         self.assertNotIn("AAPL", warning)
         row = result["rows"][0]
+        self.assertEqual(row["actual_time_entry_bar_at"], "2026-08-28T15:59:00-04:00")
+        self.assertEqual(row["actual_time_entry_price"], 100.0)
+        self.assertEqual(row["actual_time_exit_bar_at"], "2026-08-31T12:45:00-04:00")
         self.assertEqual(row["actual_time_exit_price"], 109.0)
         self.assertAlmostEqual(
             result["totals"]["actual_time_exit_slippage_bps"],
             (109.1 / 109.0 - 1.0) * 10_000.0,
+        )
+        self.assertAlmostEqual(
+            result["totals"]["actual_time_simulator_gross_pnl"], 90.0
+        )
+        self.assertAlmostEqual(
+            result["totals"]["actual_minus_actual_time_simulator_gross_pnl"],
+            1.0,
+        )
+        self.assertEqual(
+            select_reporting_benchmark(result, prefer_actual_time=True),
+            "actual_time_1_min",
         )
 
     def test_off_schedule_entry_is_not_schedule_comparable(self):
@@ -249,9 +283,111 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertFalse(timing["entry"]["comparable"])
         self.assertTrue(timing["exit"]["opening_auction_comparable"])
         self.assertEqual(len(warnings), 1)
-        self.assertIn("1/1 symbols exceed the 1-minute tolerance", warnings[0])
+        self.assertIn("1/1 symbols exceed the 1-min tolerance", warnings[0])
         self.assertIn("3.0–3.0 minutes after the scheduled 15:59 ET entry", warnings[0])
         self.assertNotIn("AAPL", warnings[0])
+
+    def test_actual_time_mode_uses_the_entry_fill_minute_per_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            minute_dir = root / "minute"
+            minute_dir.mkdir()
+            entry_day = date(2026, 8, 28)
+            exit_day = date(2026, 8, 31)
+            np.save(
+                minute_dir / "AAPL.npy",
+                np.asarray(
+                    [
+                        [seconds(entry_day, time(15, 59)), 100_000, 100, 10],
+                        [seconds(entry_day, time(16, 2)), 101_000, 100, 10],
+                        [seconds(exit_day, time(9, 30)), 110_000, 100, 10],
+                    ],
+                    dtype=np.int32,
+                ),
+            )
+            auctions = root / "auctions.npz"
+            np.savez_compressed(
+                auctions,
+                format_version=np.asarray(1, dtype=np.int16),
+                split_adjusted=np.asarray(True),
+                symbol=np.asarray(["AAPL"]),
+                date=np.asarray([exit_day.isoformat()], dtype="datetime64[D]"),
+                session=np.asarray([0], dtype=np.uint8),
+                condition=np.asarray(["O"]),
+                price=np.asarray([110.0]),
+                raw_price=np.asarray([110.0]),
+                size=np.asarray([1_000.0]),
+                exchange=np.asarray(["Q"]),
+            )
+            summary = {
+                "configuration": {"entry_time": "15:59"},
+                "position": {
+                    "status": "closed",
+                    "entry_date": entry_day.isoformat(),
+                    "exit_date": exit_day.isoformat(),
+                    "symbols": ["AAPL"],
+                    "entry_orders": {"AAPL": order(10, 101, "2026-08-28T20:02:03Z")},
+                    "exit_orders": {
+                        "AAPL": order(
+                            10,
+                            110,
+                            "2026-08-31T13:30:02Z",
+                            "2026-08-31T12:00:00Z",
+                        )
+                    },
+                },
+            }
+
+            result = reconcile_execution(summary, minute_dir, auctions)
+            select_reporting_benchmark(result, prefer_actual_time=True)
+
+        row = result["rows"][0]
+        self.assertEqual(row["simulator_entry_price"], 100.0)
+        self.assertEqual(row["actual_time_entry_price"], 101.0)
+        self.assertEqual(row["actual_time_exit_price"], 110.0)
+        self.assertEqual(row["actual_time_entry_bar_at"], "2026-08-28T16:02:00-04:00")
+        self.assertEqual(result["reporting_benchmark"], "actual_time_1_min")
+        self.assertAlmostEqual(
+            result["totals"]["actual_time_simulator_gross_pnl"], 90.0
+        )
+        self.assertAlmostEqual(
+            result["totals"]["actual_minus_actual_time_simulator_gross_pnl"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            row["actual_time_entry_execution_pnl_impact"]
+            + row["actual_time_exit_execution_pnl_impact"]
+            + row["quantity_pnl_impact"],
+            row["actual_minus_actual_time_simulator_gross_pnl"],
+        )
+
+    def test_summary_timing_can_skip_off_schedule_session_without_market_data(self):
+        summary = {
+            "configuration": {"entry_time": "15:59"},
+            "position": {
+                "status": "closed",
+                "entry_date": "2026-09-02",
+                "exit_date": "2026-09-03",
+                "symbols": ["AAPL"],
+                "entry_orders": {"AAPL": order(10, 100, "2026-09-02T19:59:00Z")},
+                "exit_orders": {
+                    "AAPL": order(
+                        10,
+                        101,
+                        "2026-09-03T16:45:00Z",
+                        "2026-09-03T16:44:00Z",
+                    )
+                },
+            },
+        }
+
+        timing, warnings = summary_execution_timing(summary)
+
+        self.assertFalse(timing["schedule_comparable"])
+        self.assertTrue(timing["entry"]["comparable"])
+        self.assertFalse(timing["exit"]["opening_auction_comparable"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("exit is not opening-auction comparable", warnings[0])
 
     def test_uses_exit_date_fee_activities_for_actual_net_pnl(self):
         fees = summarize_broker_fees(
@@ -391,6 +527,68 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertAlmostEqual(summary["actual_minus_simulator_net_pnl_total"], 3.0)
         self.assertAlmostEqual(summary["unexplained_residual_total"], 0.5)
         self.assertAlmostEqual(summary["ranking_overlap_fraction"], 0.5)
+
+    def test_overview_uses_selected_actual_time_entry_and_exit_benchmarks(self):
+        result = {
+            "entry_date": "2026-09-02",
+            "exit_date": "2026-09-03",
+            "symbols": ["A"],
+            "reporting_benchmark": "actual_time_1_min",
+            "transaction_cost_bps_per_side": 1.0,
+            "broker_fees": {"status": "pending"},
+            "totals": {
+                "actual_entry_notional": 1_000.0,
+                "actual_gross_pnl": 91.0,
+                "simulator_gross_pnl": 50.0,
+                "actual_time_simulator_gross_pnl": 90.0,
+                "entry_execution_slippage_bps": 0.0,
+                "actual_time_entry_slippage_bps": 2.0,
+                "exit_execution_slippage_bps": 100.0,
+                "actual_time_exit_slippage_bps": 10.0,
+                "simulator_transaction_cost": 2.0,
+                "actual_time_simulator_transaction_cost": 2.0,
+                "simulator_net_pnl": 48.0,
+                "actual_time_simulator_net_pnl": 88.0,
+                "broker_equity_pnl": None,
+            },
+        }
+
+        summary = summarize_results([result])
+
+        self.assertEqual(summary["actual_time_benchmark_sessions"], 1)
+        self.assertAlmostEqual(summary["simulator_gross_pnl_total"], 90.0)
+        self.assertAlmostEqual(summary["actual_minus_simulator_gross_pnl_total"], 1.0)
+        self.assertAlmostEqual(summary["entry_execution_slippage_bps"], 2.0)
+        self.assertAlmostEqual(summary["exit_execution_slippage_bps"], 10.0)
+        self.assertAlmostEqual(summary["simulator_net_pnl_total"], 88.0)
+
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=160)
+        with patch("reconcile_live_sessions.CONSOLE", console):
+            print_overview(
+                [result],
+                skipped_sessions=[
+                    (
+                        date(2026, 9, 2),
+                        ["exit is not opening-auction comparable: late fills"],
+                    )
+                ],
+            )
+        rendered = output.getvalue()
+        self.assertIn("Skipped sessions", rendered)
+        self.assertIn("2026-09-02: exit schedule mismatch", rendered)
+
+    def test_actual_time_mode_does_not_fall_back_to_scheduled_benchmark(self):
+        result = {
+            "totals": {"actual_time_simulator_gross_pnl": None},
+            "warnings": ["actual-time entry 1-min benchmark is unavailable"],
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires complete per-symbol entry and exit 1-min benchmarks",
+        ):
+            select_reporting_benchmark(result, prefer_actual_time=True)
 
     def test_entry_time_prefers_archived_configuration(self):
         summary = {

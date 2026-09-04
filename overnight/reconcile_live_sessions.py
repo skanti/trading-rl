@@ -1,7 +1,7 @@
 """Reconcile completed live baskets with the simulator's observable prices.
 
 The live side uses durable order fills and account snapshots. The modeled side uses
-only the split-adjusted minute-bar open at the scheduled entry minute and the primary
+only the split-adjusted 1-min bar open at the scheduled entry minute and the primary
 condition-O opening auction on the next session, matching ``backtest.py``. Results are
 written per session as JSON and CSV so execution drift stays auditable.
 """
@@ -47,6 +47,8 @@ from price_utils import forward_fill_positions
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_TRANSACTION_COST_BPS = 1.0
 DEFAULT_SCHEDULE_TOLERANCE_MINUTES = 1.0
+SCHEDULED_REPORTING_BENCHMARK = "scheduled_strategy"
+ACTUAL_TIME_REPORTING_BENCHMARK = "actual_time_1_min"
 DATE_DIRECTORY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONSOLE = Console()
 
@@ -181,6 +183,17 @@ def attach_broker_fees(
         / float(totals["actual_entry_notional"])
         * 10_000.0
     )
+    actual_time_simulator_net = totals.get("actual_time_simulator_net_pnl")
+    if actual_time_simulator_net is not None:
+        actual_time_net_difference = actual_net - float(actual_time_simulator_net)
+        totals["actual_minus_actual_time_simulator_net_pnl"] = (
+            actual_time_net_difference
+        )
+        totals["actual_minus_actual_time_simulator_net_bps"] = (
+            actual_time_net_difference
+            / float(totals["actual_entry_notional"])
+            * 10_000.0
+        )
     broker_pnl = totals.get("broker_equity_pnl")
     totals["broker_minus_fee_adjusted_fill_pnl"] = (
         float(broker_pnl) - actual_net if broker_pnl is not None else None
@@ -246,6 +259,17 @@ def _filled_order(
     if quantity <= 0.0 or price <= 0.0:
         raise ValueError(f"{symbol} {side} order is not filled")
     return quantity, price
+
+
+def _fill_bar_timestamp(
+    orders: Mapping[str, object], symbol: str, side: str
+) -> datetime:
+    """Return the Eastern timestamp of the 1-min bar containing a fill."""
+    order = orders.get(symbol)
+    if not isinstance(order, Mapping):
+        raise ValueError(f"missing {side} order for {symbol}")
+    filled_at = _timestamp(order.get("filled_at"), f"{symbol} {side} fill")
+    return filled_at.astimezone(EASTERN).replace(second=0, microsecond=0)
 
 
 def _order_timestamps(
@@ -348,13 +372,6 @@ def execution_timing(
         exit_fill_comparable and submitted_before_cutoff is True
     )
 
-    representative_exit = None
-    if exit_fills and not opening_auction_comparable:
-        ordered_exit_fills = sorted(exit_fills.values())
-        representative_exit = ordered_exit_fills[
-            len(ordered_exit_fills) // 2
-        ].astimezone(EASTERN)
-
     timing: dict[str, object] = {
         "tolerance_minutes": float(tolerance_minutes),
         "schedule_comparable": bool(
@@ -374,6 +391,10 @@ def execution_timing(
             "missing_fill_timestamp_count": len(missing_entry_fills),
             "exceeding_tolerance_count": len(entry_exceeded),
             "comparable": entry_fill_comparable,
+            "actual_time_benchmark": {
+                "alignment": "per_symbol_fill_minute",
+                "price_source": "minute_bar_open",
+            },
         },
         "exit": {
             "benchmark": "primary_opening_auction",
@@ -403,15 +424,10 @@ def execution_timing(
             "exceeding_tolerance_count": len(exit_exceeded),
             "submitted_before_auction_cutoff": submitted_before_cutoff,
             "opening_auction_comparable": opening_auction_comparable,
-            "actual_time_minute_benchmark": (
-                {
-                    "date": representative_exit.date().isoformat(),
-                    "time": representative_exit.strftime("%H:%M"),
-                    "price_source": "minute_bar_open",
-                }
-                if representative_exit is not None
-                else None
-            ),
+            "actual_time_benchmark": {
+                "alignment": "per_symbol_fill_minute",
+                "price_source": "minute_bar_open",
+            },
         },
     }
 
@@ -425,7 +441,7 @@ def execution_timing(
         if entry_exceeded:
             details.append(
                 f"{len(entry_exceeded)}/{len(symbols)} symbols exceed the "
-                f"{tolerance_minutes:g}-minute tolerance; fills span "
+                f"{tolerance_minutes:g}-min tolerance; fills span "
                 f"{_offset_range_text(min(entry_offsets), max(entry_offsets))} "
                 f"the scheduled {_clock_text(entry_minute)} ET entry"
             )
@@ -455,7 +471,7 @@ def execution_timing(
         if exit_exceeded:
             reasons.append(
                 f"{len(exit_exceeded)}/{len(symbols)} symbols exceed the "
-                f"{tolerance_minutes:g}-minute tolerance; fills span "
+                f"{tolerance_minutes:g}-min tolerance; fills span "
                 f"{_offset_range_text(min(exit_offsets), max(exit_offsets))} "
                 "the 09:30 ET opening cross"
             )
@@ -466,6 +482,37 @@ def execution_timing(
             "not ordinary execution slippage"
         )
     return timing, warnings
+
+
+def summary_execution_timing(
+    summary: Mapping[str, object],
+    *,
+    entry_minute_override: int | None = None,
+    schedule_tolerance_minutes: float = DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
+) -> tuple[dict[str, object], list[str]]:
+    """Classify a closed session's timing without requiring market data."""
+    position = summary.get("position") or {}
+    if not isinstance(position, Mapping) or position.get("status") != "closed":
+        raise ValueError("session does not contain a closed position")
+    entry_day = parse_day(str(position.get("entry_date")))
+    exit_day = parse_day(str(position.get("exit_date")))
+    symbols = [str(value).upper() for value in position.get("symbols") or []]
+    if not symbols:
+        raise ValueError("closed position has no symbols")
+    entry_orders = position.get("entry_orders") or {}
+    exit_orders = position.get("exit_orders") or {}
+    if not isinstance(entry_orders, Mapping) or not isinstance(exit_orders, Mapping):
+        raise ValueError("position orders must be mappings")
+    entry_minute = infer_entry_minute(summary, entry_minute_override)
+    return execution_timing(
+        entry_orders,
+        exit_orders,
+        symbols,
+        entry_day,
+        exit_day,
+        entry_minute,
+        schedule_tolerance_minutes,
+    )
 
 
 def _equity(position: Mapping[str, object], side: str) -> float | None:
@@ -487,6 +534,7 @@ def reconcile_execution(
     transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS,
     max_entry_staleness_minutes: float = 10.0,
     schedule_tolerance_minutes: float = DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
+    actual_time_benchmark: bool | None = None,
 ) -> dict[str, object]:
     position = summary.get("position") or {}
     if not isinstance(position, Mapping) or position.get("status") != "closed":
@@ -501,30 +549,25 @@ def reconcile_execution(
     if not isinstance(entry_orders, Mapping) or not isinstance(exit_orders, Mapping):
         raise ValueError("position orders must be mappings")
     entry_minute = infer_entry_minute(summary, entry_minute_override)
-    timing, timing_warnings = execution_timing(
-        entry_orders,
-        exit_orders,
-        symbols,
-        entry_day,
-        exit_day,
-        entry_minute,
-        schedule_tolerance_minutes,
+    timing, timing_warnings = summary_execution_timing(
+        summary,
+        entry_minute_override=entry_minute_override,
+        schedule_tolerance_minutes=schedule_tolerance_minutes,
     )
     auctions = opening_auction_rows(auctions_path, exit_day, symbols)
     exit_timing = timing["exit"]
     if not isinstance(exit_timing, Mapping):
         raise TypeError("exit timing must be a mapping")
-    actual_time_benchmark = exit_timing.get("actual_time_minute_benchmark")
-    if isinstance(actual_time_benchmark, Mapping):
-        actual_time_exit_day = parse_day(str(actual_time_benchmark["date"]))
-        actual_time_exit_minute = parse_clock(str(actual_time_benchmark["time"]))
-    else:
-        actual_time_exit_day = None
-        actual_time_exit_minute = None
+    calculate_actual_time = (
+        not bool(timing["schedule_comparable"])
+        if actual_time_benchmark is None
+        else actual_time_benchmark
+    )
 
     rows: list[dict[str, object]] = []
     warnings = list(timing_warnings)
-    actual_time_benchmark_failures = 0
+    actual_time_entry_benchmark_failures = 0
+    actual_time_exit_benchmark_failures = 0
     quantity_mismatch_count = 0
     for symbol in symbols:
         entry_qty, actual_entry = _filled_order(entry_orders, symbol, "entry")
@@ -546,16 +589,57 @@ def reconcile_execution(
         raw_auction = float(auction["raw_price"])
         adjustment = raw_auction / simulated_exit
         comparable_entry = simulated_entry * adjustment
+        actual_time_entry_at = None
+        actual_time_entry = None
+        actual_time_entry_comparable = None
+        actual_time_entry_staleness = None
+        actual_time_entry_slippage = None
+        if calculate_actual_time:
+            try:
+                actual_time_entry_at = _fill_bar_timestamp(
+                    entry_orders, symbol, "entry"
+                )
+                actual_time_entry_minute = (
+                    actual_time_entry_at.hour * 60 + actual_time_entry_at.minute
+                )
+                actual_time_entry, actual_time_entry_staleness = minute_open_price(
+                    data_dir,
+                    symbol,
+                    actual_time_entry_at.date(),
+                    actual_time_entry_minute,
+                )
+                if actual_time_entry_staleness > max_entry_staleness_minutes:
+                    raise ValueError(
+                        f"actual-time entry mark is {actual_time_entry_staleness:.1f} "
+                        f"minutes stale, exceeding {max_entry_staleness_minutes:.1f}"
+                    )
+                actual_time_entry_comparable = actual_time_entry * adjustment
+                actual_time_entry_slippage = (
+                    actual_entry / actual_time_entry_comparable - 1.0
+                ) * 10_000.0
+            except (OSError, TypeError, ValueError):
+                actual_time_entry_benchmark_failures += 1
+
+        actual_time_exit_at = None
         actual_time_exit = None
         actual_time_exit_comparable = None
         actual_time_exit_staleness = None
         actual_time_exit_slippage = None
-        if actual_time_exit_day is not None and actual_time_exit_minute is not None:
+        actual_time_simulated_return = None
+        actual_time_simulated_pnl = None
+        actual_time_simulated_cost = None
+        actual_time_entry_execution_pnl_impact = None
+        actual_time_exit_execution_pnl_impact = None
+        if calculate_actual_time:
             try:
+                actual_time_exit_at = _fill_bar_timestamp(exit_orders, symbol, "exit")
+                actual_time_exit_minute = (
+                    actual_time_exit_at.hour * 60 + actual_time_exit_at.minute
+                )
                 actual_time_exit, actual_time_exit_staleness = minute_open_price(
                     data_dir,
                     symbol,
-                    actual_time_exit_day,
+                    actual_time_exit_at.date(),
                     actual_time_exit_minute,
                 )
                 if actual_time_exit_staleness > max_entry_staleness_minutes:
@@ -568,7 +652,7 @@ def reconcile_execution(
                     actual_exit / actual_time_exit_comparable - 1.0
                 ) * 10_000.0
             except (OSError, TypeError, ValueError):
-                actual_time_benchmark_failures += 1
+                actual_time_exit_benchmark_failures += 1
 
         actual_entry_notional = entry_qty * actual_entry
         actual_exit_notional = exit_qty * actual_exit
@@ -587,6 +671,32 @@ def reconcile_execution(
             / 10_000.0
             * (actual_entry_notional + simulated_exit_notional)
         )
+        if (
+            actual_time_entry is not None
+            and actual_time_entry_comparable is not None
+            and actual_time_exit is not None
+            and actual_time_exit_comparable is not None
+        ):
+            actual_time_simulated_return = actual_time_exit / actual_time_entry - 1.0
+            actual_time_simulated_pnl = (
+                actual_entry_notional * actual_time_simulated_return
+            )
+            actual_time_simulated_exit_notional = (
+                actual_entry_notional + actual_time_simulated_pnl
+            )
+            actual_time_simulated_cost = (
+                float(transaction_cost_bps)
+                / 10_000.0
+                * (actual_entry_notional + actual_time_simulated_exit_notional)
+            )
+            actual_time_entry_execution_pnl_impact = actual_entry_notional * (
+                actual_time_exit_comparable / actual_entry
+                - 1.0
+                - actual_time_simulated_return
+            )
+            actual_time_exit_execution_pnl_impact = entry_qty * (
+                actual_exit - actual_time_exit_comparable
+            )
         if not math.isclose(entry_qty, exit_qty, rel_tol=1e-8, abs_tol=1e-8):
             quantity_mismatch_count += 1
         rows.append(
@@ -600,17 +710,44 @@ def reconcile_execution(
                 "entry_slippage_bps": (actual_entry / comparable_entry - 1.0)
                 * 10_000.0,
                 "entry_staleness_minutes": staleness,
+                "actual_time_entry_bar_at": actual_time_entry_at.isoformat()
+                if actual_time_entry_at is not None
+                else None,
+                "actual_time_entry_price": actual_time_entry,
+                "actual_time_entry_price_comparable": actual_time_entry_comparable,
+                "actual_time_entry_staleness_minutes": actual_time_entry_staleness,
+                "actual_time_entry_slippage_bps": actual_time_entry_slippage,
                 "actual_exit_price": actual_exit,
                 "simulator_exit_price": simulated_exit,
                 "simulator_exit_price_comparable": raw_auction,
                 "exit_slippage_bps": (actual_exit / raw_auction - 1.0) * 10_000.0,
-                "actual_time_exit_minute": _clock_text(actual_time_exit_minute)
-                if actual_time_exit_minute is not None
+                "actual_time_exit_bar_at": actual_time_exit_at.isoformat()
+                if actual_time_exit_at is not None
                 else None,
                 "actual_time_exit_price": actual_time_exit,
                 "actual_time_exit_price_comparable": actual_time_exit_comparable,
                 "actual_time_exit_staleness_minutes": actual_time_exit_staleness,
                 "actual_time_exit_slippage_bps": actual_time_exit_slippage,
+                "actual_time_simulator_gross_return": actual_time_simulated_return,
+                "actual_time_simulator_gross_pnl": actual_time_simulated_pnl,
+                "actual_time_simulator_transaction_cost": actual_time_simulated_cost,
+                "actual_time_simulator_net_pnl": (
+                    actual_time_simulated_pnl - actual_time_simulated_cost
+                    if actual_time_simulated_pnl is not None
+                    and actual_time_simulated_cost is not None
+                    else None
+                ),
+                "actual_minus_actual_time_simulator_gross_pnl": (
+                    actual_pnl - actual_time_simulated_pnl
+                    if actual_time_simulated_pnl is not None
+                    else None
+                ),
+                "actual_time_entry_execution_pnl_impact": (
+                    actual_time_entry_execution_pnl_impact
+                ),
+                "actual_time_exit_execution_pnl_impact": (
+                    actual_time_exit_execution_pnl_impact
+                ),
                 "auction_exchange": auction["exchange"],
                 "actual_entry_notional": actual_entry_notional,
                 "actual_exit_notional": actual_exit_notional,
@@ -630,10 +767,15 @@ def reconcile_execution(
             }
         )
 
-    if actual_time_benchmark_failures:
+    if actual_time_entry_benchmark_failures:
         warnings.append(
-            "actual-time exit minute benchmark is unavailable for "
-            f"{actual_time_benchmark_failures}/{len(symbols)} symbols"
+            "actual-time entry 1-min benchmark is unavailable for "
+            f"{actual_time_entry_benchmark_failures}/{len(symbols)} symbols"
+        )
+    if actual_time_exit_benchmark_failures:
+        warnings.append(
+            "actual-time exit 1-min benchmark is unavailable for "
+            f"{actual_time_exit_benchmark_failures}/{len(symbols)} symbols"
         )
     if quantity_mismatch_count:
         warnings.append(
@@ -660,13 +802,35 @@ def reconcile_execution(
         float(row["entry_quantity"]) * float(row["simulator_exit_price_comparable"])
         for row in rows
     )
+    actual_time_benchmarks_available = calculate_actual_time and not (
+        actual_time_entry_benchmark_failures or actual_time_exit_benchmark_failures
+    )
+    actual_time_entry_at_entry_quantities = (
+        sum(
+            float(row["entry_quantity"])
+            * float(row["actual_time_entry_price_comparable"])
+            for row in rows
+        )
+        if actual_time_benchmarks_available
+        else None
+    )
     actual_time_exit_at_entry_quantities = (
         sum(
             float(row["entry_quantity"])
             * float(row["actual_time_exit_price_comparable"])
             for row in rows
         )
-        if actual_time_exit_minute is not None and not actual_time_benchmark_failures
+        if actual_time_benchmarks_available
+        else None
+    )
+    actual_time_simulator_gross_pnl = (
+        sum(float(row["actual_time_simulator_gross_pnl"]) for row in rows)
+        if actual_time_exit_at_entry_quantities is not None
+        else None
+    )
+    actual_time_simulator_cost = (
+        sum(float(row["actual_time_simulator_transaction_cost"]) for row in rows)
+        if actual_time_exit_at_entry_quantities is not None
         else None
     )
     entry_execution_pnl_impact = total("entry_execution_pnl_impact")
@@ -684,6 +848,7 @@ def reconcile_execution(
         "exit_date": exit_day.isoformat(),
         "entry_time": _clock_text(entry_minute),
         "exit_price_source": "primary_opening_auction",
+        "reporting_benchmark": SCHEDULED_REPORTING_BENCHMARK,
         "transaction_cost_bps_per_side": float(transaction_cost_bps),
         "symbols": symbols,
         "timing": timing,
@@ -716,6 +881,37 @@ def reconcile_execution(
                 )
                 * 10_000.0
                 if actual_time_exit_at_entry_quantities is not None
+                else None
+            ),
+            "actual_time_entry_slippage_bps": (
+                (actual_entry_notional / actual_time_entry_at_entry_quantities - 1.0)
+                * 10_000.0
+                if actual_time_entry_at_entry_quantities is not None
+                else None
+            ),
+            "actual_time_simulator_gross_pnl": actual_time_simulator_gross_pnl,
+            "actual_time_simulator_gross_return_on_deployed": (
+                actual_time_simulator_gross_pnl / actual_entry_notional
+                if actual_time_simulator_gross_pnl is not None
+                else None
+            ),
+            "actual_minus_actual_time_simulator_gross_pnl": (
+                actual_gross_pnl - actual_time_simulator_gross_pnl
+                if actual_time_simulator_gross_pnl is not None
+                else None
+            ),
+            "actual_minus_actual_time_simulator_bps": (
+                (actual_gross_pnl - actual_time_simulator_gross_pnl)
+                / actual_entry_notional
+                * 10_000.0
+                if actual_time_simulator_gross_pnl is not None
+                else None
+            ),
+            "actual_time_simulator_transaction_cost": actual_time_simulator_cost,
+            "actual_time_simulator_net_pnl": (
+                actual_time_simulator_gross_pnl - actual_time_simulator_cost
+                if actual_time_simulator_gross_pnl is not None
+                and actual_time_simulator_cost is not None
                 else None
             ),
             "entry_execution_pnl_impact": entry_execution_pnl_impact,
@@ -1024,10 +1220,12 @@ def pnl_comparison_context(
 ) -> str:
     difference = float(pnl)
     if abs(difference) < 0.005:
-        explanation = f"Simulator {label} matches actual"
+        explanation = f"Sim {label} = actual"
     else:
-        direction = "lower" if difference > 0.0 else "higher"
-        explanation = f"Simulator {label} {direction} by {format_usd(abs(difference))}"
+        comparison = "<" if difference > 0.0 else ">"
+        explanation = (
+            f"Sim {label} {comparison} actual by {format_usd(abs(difference))}"
+        )
     if bps is not None:
         explanation += f" ({abs(float(bps)):.2f} bps)"
     return explanation
@@ -1036,12 +1234,45 @@ def pnl_comparison_context(
 def execution_context(bps: object, *, side: str) -> str:
     price_difference = float(bps)
     if abs(price_difference) < 0.005:
-        return f"Simulator {side} price matches actual (0.00 bps)"
-    price_direction = "lower" if price_difference > 0.0 else "higher"
-    return (
-        f"Simulator {side} price {abs(price_difference):.2f} bps "
-        f"{price_direction} than actual"
+        return f"Sim {side} price = actual (0.00 bps)"
+    comparison = "<" if price_difference > 0.0 else ">"
+    return f"Sim {side} price {comparison} actual by {abs(price_difference):.2f} bps"
+
+
+def select_reporting_benchmark(
+    result: dict[str, object], *, prefer_actual_time: bool
+) -> str:
+    """Select the headline benchmark while preserving both result families."""
+    totals = result.get("totals") or {}
+    actual_time_available = isinstance(totals, Mapping) and (
+        totals.get("actual_time_simulator_gross_pnl") is not None
     )
+    if prefer_actual_time and not actual_time_available:
+        raise ValueError(
+            "actual-time reconciliation requires complete per-symbol entry and exit "
+            "1-min benchmarks"
+        )
+    benchmark = (
+        ACTUAL_TIME_REPORTING_BENCHMARK
+        if prefer_actual_time
+        else SCHEDULED_REPORTING_BENCHMARK
+    )
+    result["reporting_benchmark"] = benchmark
+    return benchmark
+
+
+def _reported_total(
+    result: Mapping[str, object], scheduled_field: str, actual_time_field: str
+) -> float:
+    totals = result.get("totals")
+    if not isinstance(totals, Mapping):
+        raise TypeError("reconciliation totals must be a mapping")
+    field = (
+        actual_time_field
+        if result.get("reporting_benchmark") == ACTUAL_TIME_REPORTING_BENCHMARK
+        else scheduled_field
+    )
+    return _number(totals.get(field), field)
 
 
 def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, object]:
@@ -1058,13 +1289,29 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     def total(field: str, selected: Sequence[Mapping[str, object]] = results) -> float:
         return sum(_number(totals(result).get(field), field) for result in selected)
 
-    def weighted_bps(field: str) -> float:
+    def reported_total(scheduled_field: str, actual_time_field: str) -> float:
+        return sum(
+            _reported_total(result, scheduled_field, actual_time_field)
+            for result in results
+        )
+
+    def reported_total_for(
+        scheduled_field: str,
+        actual_time_field: str,
+        selected: Sequence[Mapping[str, object]],
+    ) -> float:
+        return sum(
+            _reported_total(result, scheduled_field, actual_time_field)
+            for result in selected
+        )
+
+    def reported_weighted_bps(scheduled_field: str, actual_time_field: str) -> float:
         notional = total("actual_entry_notional")
         if notional <= 0.0:
             raise ValueError("aggregate entry notional must be positive")
         return (
             sum(
-                _number(totals(result).get(field), field)
+                _reported_total(result, scheduled_field, actual_time_field)
                 * _number(
                     totals(result).get("actual_entry_notional"),
                     "actual entry notional",
@@ -1099,9 +1346,15 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     ]
 
     count = len(results)
+    actual_time_benchmark_sessions = sum(
+        result.get("reporting_benchmark") == ACTUAL_TIME_REPORTING_BENCHMARK
+        for result in results
+    )
     entry_notional = total("actual_entry_notional")
     actual_gross = total("actual_gross_pnl")
-    simulator_gross = total("simulator_gross_pnl")
+    simulator_gross = reported_total(
+        "simulator_gross_pnl", "actual_time_simulator_gross_pnl"
+    )
     gross_difference = actual_gross - simulator_gross
     summary: dict[str, object] = {
         "sessions": count,
@@ -1115,8 +1368,13 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
         "actual_minus_simulator_gross_bps": gross_difference
         / entry_notional
         * 10_000.0,
-        "entry_execution_slippage_bps": weighted_bps("entry_execution_slippage_bps"),
-        "exit_execution_slippage_bps": weighted_bps("exit_execution_slippage_bps"),
+        "entry_execution_slippage_bps": reported_weighted_bps(
+            "entry_execution_slippage_bps", "actual_time_entry_slippage_bps"
+        ),
+        "exit_execution_slippage_bps": reported_weighted_bps(
+            "exit_execution_slippage_bps", "actual_time_exit_slippage_bps"
+        ),
+        "actual_time_benchmark_sessions": actual_time_benchmark_sessions,
         "fee_confirmed_sessions": len(fee_confirmed),
         "account_observed_sessions": len(account_observed),
         "residual_observed_sessions": len(residual_observed),
@@ -1132,7 +1390,11 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     }
     if fee_confirmed:
         actual_net = total("actual_net_pnl_after_broker_fees", fee_confirmed)
-        simulator_net = total("simulator_net_pnl", fee_confirmed)
+        simulator_net = reported_total_for(
+            "simulator_net_pnl",
+            "actual_time_simulator_net_pnl",
+            fee_confirmed,
+        )
         net_difference = actual_net - simulator_net
         confirmed_notional = total("actual_entry_notional", fee_confirmed)
         summary.update(
@@ -1140,8 +1402,10 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
                 "actual_broker_fee_cost_total": total(
                     "actual_broker_fee_cost", fee_confirmed
                 ),
-                "simulator_transaction_cost_total": total(
-                    "simulator_transaction_cost", fee_confirmed
+                "simulator_transaction_cost_total": reported_total_for(
+                    "simulator_transaction_cost",
+                    "actual_time_simulator_transaction_cost",
+                    fee_confirmed,
                 ),
                 "actual_net_pnl_total": actual_net,
                 "simulator_net_pnl_total": simulator_net,
@@ -1152,10 +1416,13 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
             }
         )
     else:
-        summary["simulator_transaction_cost_total"] = total(
-            "simulator_transaction_cost"
+        summary["simulator_transaction_cost_total"] = reported_total(
+            "simulator_transaction_cost",
+            "actual_time_simulator_transaction_cost",
         )
-        summary["simulator_net_pnl_total"] = total("simulator_net_pnl")
+        summary["simulator_net_pnl_total"] = reported_total(
+            "simulator_net_pnl", "actual_time_simulator_net_pnl"
+        )
     if account_observed:
         summary["broker_equity_pnl_total"] = total(
             "broker_equity_pnl", account_observed
@@ -1179,10 +1446,15 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     return summary
 
 
-def print_overview(results: Sequence[Mapping[str, object]]) -> None:
+def print_overview(
+    results: Sequence[Mapping[str, object]],
+    *,
+    skipped_sessions: Sequence[tuple[date, Sequence[str]]] = (),
+) -> None:
     summary = summarize_results(results)
     sessions = int(summary["sessions"])
     fee_sessions = int(summary["fee_confirmed_sessions"])
+    actual_time_sessions = int(summary["actual_time_benchmark_sessions"])
     comparison = Table(
         title="Reconciliation overview",
         caption=f"{summary['first_entry_date']} → {summary['last_exit_date']}",
@@ -1216,7 +1488,7 @@ def print_overview(results: Sequence[Mapping[str, object]]) -> None:
             if summary.get("simulator_transaction_cost_total")
             else "$0.00"
         ),
-        "Actual: Fees*, Simulator: "
+        "Actual: Fees*, Sim: "
         + "/".join(
             f"{value:g}bps" for value in summary["transaction_cost_bps_per_side"]
         )
@@ -1239,13 +1511,25 @@ def print_overview(results: Sequence[Mapping[str, object]]) -> None:
     comparison.add_row(
         "Entry price",
         "Fills",
-        "Minute-bar open",
+        (
+            "Scheduled 1-min bar open"
+            if not actual_time_sessions
+            else "Actual-time 1-min bar open"
+            if actual_time_sessions == sessions
+            else f"Per-session ({actual_time_sessions} actual-time)"
+        ),
         execution_context(summary["entry_execution_slippage_bps"], side="entry"),
     )
     comparison.add_row(
         "Exit price",
         "Fills",
-        "Opening auction",
+        (
+            "Opening auction"
+            if not actual_time_sessions
+            else "Actual-time 1-min bar open"
+            if actual_time_sessions == sessions
+            else f"Per-session ({actual_time_sessions} actual-time)"
+        ),
         execution_context(summary["exit_execution_slippage_bps"], side="exit"),
     )
     account_sessions = int(summary["account_observed_sessions"])
@@ -1262,7 +1546,7 @@ def print_overview(results: Sequence[Mapping[str, object]]) -> None:
             f"Unexplained residual ({residual_sessions}/{sessions})",
             format_usd(summary["unexplained_residual_total"], signed=True),
             "—",
-            "Account change minus fee-adjusted fill P&L",
+            "Account Δ − fee-adjusted fill P&L",
         )
     if summary.get("ranking_observed_sessions"):
         ranking_sessions = int(summary["ranking_observed_sessions"])
@@ -1278,6 +1562,34 @@ def print_overview(results: Sequence[Mapping[str, object]]) -> None:
         str(sessions),
         "100% matched baskets",
     )
+    if skipped_sessions:
+        skipped_contexts: list[str] = []
+        for entry_day, warnings in skipped_sessions:
+            entry_mismatch = any(
+                warning.startswith("entry is off schedule") for warning in warnings
+            )
+            exit_mismatch = any(
+                warning.startswith("exit is not opening-auction comparable")
+                for warning in warnings
+            )
+            if entry_mismatch and exit_mismatch:
+                reason = "entry/exit schedule mismatch"
+            elif entry_mismatch:
+                reason = "entry schedule mismatch"
+            elif exit_mismatch:
+                reason = "exit schedule mismatch"
+            else:
+                reason = "schedule mismatch"
+            skipped_contexts.append(f"{entry_day.isoformat()}: {reason}")
+        displayed_context = "; ".join(skipped_contexts[:3])
+        if len(skipped_contexts) > 3:
+            displayed_context += f"; +{len(skipped_contexts) - 3} more"
+        comparison.add_row(
+            "Skipped sessions",
+            str(len(skipped_sessions)),
+            "—",
+            displayed_context,
+        )
     comparison.add_row(
         "Trades",
         str(summary["trades"]),
@@ -1290,6 +1602,12 @@ def print_overview(results: Sequence[Mapping[str, object]]) -> None:
         "Execution differences and P&L bps are weighted by deployed capital. "
         "Gross P&L and execution differences exclude transaction costs.[/dim]"
     )
+    if actual_time_sessions:
+        CONSOLE.print(
+            f"[dim]The headline simulator uses actual-time 1-min bar opens for "
+            f"{actual_time_sessions}/{sessions} sessions; scheduled-strategy "
+            "counterfactuals remain in the reconciliation artifacts.[/dim]"
+        )
     if fee_sessions:
         CONSOLE.print(
             f"[dim]* Actual costs use Alpaca FEE activities for {fee_sessions}/{sessions} "
@@ -1297,10 +1615,40 @@ def print_overview(results: Sequence[Mapping[str, object]]) -> None:
         )
 
 
+def _actual_time_bar_label(result: Mapping[str, object], side: str) -> str:
+    stamps = sorted(
+        _timestamp(
+            row.get(f"actual_time_{side}_bar_at"), f"actual-time {side} bar"
+        ).astimezone(EASTERN)
+        for row in result.get("rows") or []
+        if isinstance(row, Mapping) and row.get(f"actual_time_{side}_bar_at")
+    )
+    if not stamps:
+        return "Actual-time 1-min bar open"
+    first = stamps[0]
+    last = stamps[-1]
+    if first == last:
+        return f"{first:%Y-%m-%d %H:%M} ET 1-min bar open"
+    if first.date() == last.date():
+        return f"{first:%Y-%m-%d %H:%M}–{last:%H:%M} ET 1-min bar opens"
+    return f"{first:%Y-%m-%d %H:%M}–{last:%Y-%m-%d %H:%M} ET 1-min bar opens"
+
+
 def print_result(
     result: Mapping[str, object], *, show_symbol_breakdown: bool = False
 ) -> None:
     totals = result["totals"]
+    use_actual_time = (
+        result.get("reporting_benchmark") == ACTUAL_TIME_REPORTING_BENCHMARK
+    )
+    simulator_gross_pnl = _reported_total(
+        result, "simulator_gross_pnl", "actual_time_simulator_gross_pnl"
+    )
+    actual_gross_pnl = float(totals["actual_gross_pnl"])
+    gross_difference = actual_gross_pnl - simulator_gross_pnl
+    gross_difference_bps = (
+        gross_difference / float(totals["actual_entry_notional"]) * 10_000.0
+    )
     ranking = result.get("ranking_replay") or {}
     ranking_text = "Unavailable"
     if isinstance(ranking, Mapping) and ranking.get("status") == "complete":
@@ -1320,15 +1668,33 @@ def print_result(
     comparison.add_column("Explanation", justify="right")
     comparison.add_row(
         "Gross P&L",
-        format_usd(totals["actual_gross_pnl"], signed=True),
-        format_usd(totals["simulator_gross_pnl"], signed=True),
+        format_usd(actual_gross_pnl, signed=True),
+        format_usd(simulator_gross_pnl, signed=True),
         pnl_comparison_context(
-            totals["actual_minus_simulator_gross_pnl"],
+            gross_difference,
             label="gross P&L",
-            bps=totals["actual_minus_simulator_bps"],
+            bps=gross_difference_bps,
         ),
     )
-    modeled_cost = float(totals["simulator_transaction_cost"])
+    if use_actual_time:
+        comparison.add_row(
+            "Scheduled counterfactual",
+            format_usd(actual_gross_pnl, signed=True),
+            format_usd(totals["simulator_gross_pnl"], signed=True),
+            pnl_comparison_context(
+                totals["actual_minus_simulator_gross_pnl"],
+                label="gross P&L",
+                bps=totals["actual_minus_simulator_bps"],
+            ),
+        )
+    modeled_cost = _reported_total(
+        result,
+        "simulator_transaction_cost",
+        "actual_time_simulator_transaction_cost",
+    )
+    simulator_net_pnl = _reported_total(
+        result, "simulator_net_pnl", "actual_time_simulator_net_pnl"
+    )
     broker_fees = result.get("broker_fees") or {}
     fee_complete = (
         isinstance(broker_fees, Mapping)
@@ -1347,7 +1713,7 @@ def print_result(
         ),
         f"-{format_usd(modeled_cost)}" if modeled_cost else "$0.00",
         ("Actual: Fees*, " if fee_complete else "Actual: unavailable, ")
-        + f"Simulator: {float(result['transaction_cost_bps_per_side']):g}bps per side",
+        + f"Sim: {float(result['transaction_cost_bps_per_side']):g}bps per side",
     )
     actual_account_result = totals.get("broker_equity_pnl")
     comparison.add_row(
@@ -1355,11 +1721,15 @@ def print_result(
         format_usd(totals["actual_net_pnl_after_broker_fees"], signed=True)
         if fee_complete
         else "Unavailable",
-        format_usd(totals["simulator_net_pnl"], signed=True),
+        format_usd(simulator_net_pnl, signed=True),
         pnl_comparison_context(
-            totals["actual_minus_simulator_net_pnl"],
+            float(totals["actual_net_pnl_after_broker_fees"]) - simulator_net_pnl,
             label="net P&L",
-            bps=totals["actual_minus_simulator_net_bps"],
+            bps=(
+                (float(totals["actual_net_pnl_after_broker_fees"]) - simulator_net_pnl)
+                / float(totals["actual_entry_notional"])
+                * 10_000.0
+            ),
         )
         if fee_complete
         else "Actual fees unavailable",
@@ -1380,37 +1750,49 @@ def print_result(
     comparison.add_row(
         f"Entry · {result['entry_date']}",
         "Fills",
-        f"{result['entry_time']} ET bar open",
+        (
+            _actual_time_bar_label(result, "entry")
+            if use_actual_time
+            else f"{result['entry_time']} ET 1-min bar open"
+        ),
         execution_context(
-            totals["entry_execution_slippage_bps"],
+            totals[
+                "actual_time_entry_slippage_bps"
+                if use_actual_time
+                else "entry_execution_slippage_bps"
+            ],
             side="entry",
         ),
     )
+    timing = result.get("timing") or {}
     comparison.add_row(
         f"Exit · {result['exit_date']}",
         "Fills",
-        "Opening auction",
+        (
+            _actual_time_bar_label(result, "exit")
+            if use_actual_time
+            else "Opening auction"
+        ),
         execution_context(
-            totals["exit_execution_slippage_bps"],
+            totals[
+                "actual_time_exit_slippage_bps"
+                if use_actual_time
+                else "exit_execution_slippage_bps"
+            ],
             side="exit",
         ),
     )
-    timing = result.get("timing") or {}
-    exit_timing = timing.get("exit") if isinstance(timing, Mapping) else None
-    actual_time_benchmark = (
-        exit_timing.get("actual_time_minute_benchmark")
-        if isinstance(exit_timing, Mapping)
-        else None
-    )
     actual_time_exit_slippage = totals.get("actual_time_exit_slippage_bps")
     if (
-        isinstance(actual_time_benchmark, Mapping)
+        not use_actual_time
+        and isinstance(timing, Mapping)
+        and not timing.get("schedule_comparable")
         and actual_time_exit_slippage is not None
     ):
         comparison.add_row(
             "Off-schedule exit benchmark",
             "Fills",
-            f"{actual_time_benchmark['date']} {actual_time_benchmark['time']} ET bar open",
+            _actual_time_bar_label(result, "exit"),
             execution_context(actual_time_exit_slippage, side="exit"),
         )
     if abs(float(totals["quantity_pnl_impact"])) >= 0.005:
@@ -1423,9 +1805,14 @@ def print_result(
     CONSOLE.print(comparison)
     CONSOLE.print(
         "[dim]Gross P&L and execution differences exclude transaction costs. "
-        "Entry price differences are actual fills versus minute-bar opens; positive "
-        "means paid more. Exit differences are fills versus official opening auctions; "
-        "positive means received more.[/dim]"
+        "Entry price differences are actual fills versus 1-min bar opens; positive "
+        "means paid more. Exit differences are fills versus "
+        + (
+            "the 1-min bar open at the actual fill time"
+            if use_actual_time
+            else "official opening auctions"
+        )
+        + "; positive means received more.[/dim]"
     )
     if fee_complete:
         CONSOLE.print(
@@ -1448,18 +1835,43 @@ def print_result(
         detail.add_column("Exit impact", justify="right")
         detail.add_column("Net model Δ", justify="right")
         for row in result["rows"]:
+            entry_bps = row[
+                "actual_time_entry_slippage_bps"
+                if use_actual_time
+                else "entry_slippage_bps"
+            ]
+            exit_bps = row[
+                "actual_time_exit_slippage_bps"
+                if use_actual_time
+                else "exit_slippage_bps"
+            ]
+            model_difference = row[
+                "actual_minus_actual_time_simulator_gross_pnl"
+                if use_actual_time
+                else "actual_minus_simulator_gross_pnl"
+            ]
+            entry_impact = row[
+                "actual_time_entry_execution_pnl_impact"
+                if use_actual_time
+                else "entry_execution_pnl_impact"
+            ]
+            exit_impact = row[
+                "actual_time_exit_execution_pnl_impact"
+                if use_actual_time
+                else "exit_execution_pnl_impact"
+            ]
             detail.add_row(
                 str(row["symbol"]),
-                format_bps(row["entry_slippage_bps"]),
-                format_usd(row["entry_execution_pnl_impact"], signed=True),
-                format_bps(row["exit_slippage_bps"]),
-                format_usd(row["exit_execution_pnl_impact"], signed=True),
-                format_usd(row["actual_minus_simulator_gross_pnl"], signed=True),
+                format_bps(entry_bps),
+                format_usd(entry_impact, signed=True),
+                format_bps(exit_bps),
+                format_usd(exit_impact, signed=True),
+                format_usd(model_difference, signed=True),
             )
         CONSOLE.print(detail)
         CONSOLE.print(
-            "[dim]Entry price Δ: actual fill vs minute-bar open; positive means "
-            "paid more. Exit price Δ: actual fill vs official opening auction; "
+            "[dim]Entry price Δ: actual fill vs 1-min bar open; positive means "
+            "paid more. Exit price Δ: actual fill vs selected exit benchmark; "
             "positive means received more. P&L impacts sum to Actual − simulator.[/dim]"
         )
     for warning in list(result.get("warnings") or []) + list(
@@ -1505,6 +1917,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
         help="maximum fill-time deviation still considered on schedule (default: 1)",
     )
+    parser.add_argument(
+        "--reconciliation-mode",
+        choices=("strict-schedule", "actual-time"),
+        default="strict-schedule",
+        help=(
+            "strict-schedule skips off-schedule sessions; actual-time uses each "
+            "symbol's 1-min bar opens at its entry and exit fill times "
+            "(default: strict-schedule)"
+        ),
+    )
     parser.add_argument("--skip-ranking-replay", action="store_true")
     parser.add_argument(
         "--trading-url",
@@ -1548,9 +1970,6 @@ def main() -> None:
         parser.error("cost, staleness, and tolerance values must be non-negative")
     if args.request_timeout_seconds is not None and args.request_timeout_seconds <= 0.0:
         parser.error("--request-timeout-seconds must be positive")
-    _dataset_manifest(args.data_dir, "1Min")
-    if not args.auctions_path.exists():
-        parser.error(f"auction data does not exist: {args.auctions_path}")
     summaries = discover_closed_summaries(args.work_dir)
     if args.entry_date:
         selected_days = [args.entry_date] if args.entry_date in summaries else []
@@ -1560,6 +1979,44 @@ def main() -> None:
         selected_days = [max(summaries)] if summaries else []
     if not selected_days:
         parser.error("no matching closed live sessions were found")
+
+    skipped_sessions: list[tuple[date, list[str]]] = []
+    strict_schedule = args.reconciliation_mode == "strict-schedule"
+    if strict_schedule:
+        comparable_days: list[date] = []
+        for entry_day in selected_days:
+            _summary_path, summary = summaries[entry_day]
+            try:
+                timing, warnings = summary_execution_timing(
+                    summary,
+                    entry_minute_override=args.entry_time,
+                    schedule_tolerance_minutes=args.schedule_tolerance_minutes,
+                )
+            except (TypeError, ValueError) as error:
+                parser.error(f"cannot classify {entry_day} schedule: {error}")
+            if timing["schedule_comparable"]:
+                comparable_days.append(entry_day)
+            else:
+                skipped_sessions.append((entry_day, warnings))
+        selected_days = comparable_days
+        for entry_day, warnings in skipped_sessions:
+            reason = " ".join(warnings) or "execution timing is not schedule comparable"
+            CONSOLE.print(
+                f"[yellow]Warning ({entry_day}):[/yellow] skipped by strict schedule "
+                f"policy: {reason} Re-run with --reconciliation-mode actual-time "
+                "to produce a forensic reconciliation."
+            )
+        if not selected_days:
+            CONSOLE.print(
+                f"No schedule-comparable sessions to reconcile; skipped "
+                f"{len(skipped_sessions)} session"
+                f"{'s' if len(skipped_sessions) != 1 else ''}."
+            )
+            return
+
+    _dataset_manifest(args.data_dir, "1Min")
+    if not args.auctions_path.exists():
+        parser.error(f"auction data does not exist: {args.auctions_path}")
 
     broker_client: AlpacaClient | None = None
     broker_unavailable_reason: str | None = None
@@ -1597,7 +2054,9 @@ def main() -> None:
                 transaction_cost_bps=args.transaction_cost_bps,
                 max_entry_staleness_minutes=args.max_entry_staleness_minutes,
                 schedule_tolerance_minutes=args.schedule_tolerance_minutes,
+                actual_time_benchmark=not strict_schedule,
             )
+            select_reporting_benchmark(result, prefer_actual_time=not strict_schedule)
             if args.skip_broker_fees:
                 fee_summary = {
                     "status": "skipped",
@@ -1616,7 +2075,7 @@ def main() -> None:
             if fee_warning:
                 result["warnings"].append(fee_warning)
 
-            result["version"] = 3
+            result["version"] = 5
             result["generated_at"] = datetime.now(tz=UTC).isoformat()
             result["live_summary_path"] = str(summary_path)
             if not args.skip_ranking_replay:
@@ -1644,7 +2103,7 @@ def main() -> None:
             failures += 1
             CONSOLE.print(f"[red]{entry_day}: reconciliation failed:[/red] {error}")
     if completed_results:
-        print_overview(completed_results)
+        print_overview(completed_results, skipped_sessions=skipped_sessions)
         if not (args.show_session_details or args.show_symbol_breakdown):
             for result in completed_results:
                 ranking = result.get("ranking_replay") or {}
