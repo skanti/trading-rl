@@ -1,5 +1,18 @@
 # Overnight dollar-liquidity strategy
 
+Install the repository once in editable mode from its root so every command and
+cross-package import resolves through the `trading_rl` package:
+
+```bash
+uv pip install -e .
+```
+
+The installed commands include `trading-dashboard`, `trading-live`,
+`trading-backtest`, `trading-reconcile`, `download-bars`,
+`download-auctions`, and `download-nbbo`.
+The existing `python overnight/live.py` and `python scripts/download_bars.py`
+forms remain as compatibility launchers.
+
 `backtest.py` simulates the strategy point-in-time:
 
 1. Read each stock's completed daily dollar volume as split-adjusted daily
@@ -100,9 +113,15 @@ stale path, since a session either produced a condition-O cross or did not.
 
 Existing `.npy` bar files can be extended without redownloading every ticker's full
 history. Filenames use plain symbols such as `AAPL.npy` and `BRK.B.npy`.
+The bulk downloader and live ranking refresh both use
+`trading_rl/market_data/bars.py` for
+Alpaca request construction and pagination, compact bar encoding, exact-overlap
+validation, and atomic array replacement. Their orchestration remains separate so
+the live path can require a specific completed session and fail closed without
+partially updating its cache.
 
-To refresh the broad daily store, rebuild the dollar-volume shortlist, update
-the shortlist's minute bars, and extend auction data in one pass, run:
+To refresh the broad daily store, rebuild the dollar-volume shortlist, extend
+auction and scheduled-NBBO data, and update shortlist minute bars in one pass, run:
 
 ```bash
 ../scripts/download_latest_bars_and_auctions.sh
@@ -113,8 +132,9 @@ tradable, fractionable Nasdaq company stocks. Only that current universe is
 refreshed, while historical and delisted `.npy` files already in the bar stores are
 retained for backtests. It then loads `overnight/.env` by default and accepts
 environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
-overlap/shortlist settings shown by `--help`. It obtains the auction end date from
-the refreshed daily bars, so a still-forming market session is not requested.
+overlap/shortlist settings shown by `--help`. Auction and NBBO updates use the
+current New York date; snapshots still inside Alpaca's delayed-SIP window are deferred
+and filled by the next overlap refresh.
 The shortlist is ordered by consistent daily top-N appearances, then trailing
 average liquidity, so its most persistently liquid symbols enter the concurrent
 minute-download queue first.
@@ -206,8 +226,12 @@ python backtest.py \
   --transaction-cost-bps 1
 ```
 
-There is no auction at the entry time, so the entry remains the SIP minute-bar
-open. Substituting the 16:00 closing auction would model a different entry time.
+For a causal spread-aware entry, the wrapper also maintains
+`alpaca_nbbo_1545_2022-01-01.npz`. It stores the latest valid SIP bid/ask at or before
+15:45 ET, never a later quote, with raw and split-adjusted fields. Use it in a backtest
+with `--entry-price-source nbbo-ask`; the backward-compatible default remains
+`minute-bar`. The NBBO source requires `--entry-time 15:45`. A buy is benchmarked at
+the ask, while the existing transaction-cost assumption remains separately visible.
 
 `--entry-time` defaults to 15:45 rather than the close. The selected basket
 drifts about 3.5 bps upward between 15:45 and 15:59 (t=2.66 over 500 sessions),
@@ -468,8 +492,10 @@ The Nasdaq security-master cache is also kept under the work root.
 ### Reconcile live sessions with the simulator
 
 `reconcile_live_sessions.py` replays a completed basket using only information the
-simulator can observe: the split-adjusted 1-min bar open at the scheduled entry minute
-and the next session's primary condition-O opening auction. It compares those prices
+simulator can observe: the split-adjusted causal SIP NBBO ask at the scheduled 15:45
+entry and the next session's primary condition-O opening auction. If a scheduled NBBO
+snapshot is missing, it warns once with an aggregate count and falls back to the 1-min
+bar open for only those symbols. It compares those prices
 with the actual filled quantities and prices, separately reports the configured
 transaction-cost assumption and the broker-equity residual, and re-runs the shared
 liquidity ranker from that entry day's archived `ticks.jsonl`. The default console
@@ -483,8 +509,9 @@ auction cutoff. A deviation beyond 1 min marks the session as not schedule
 comparable. Strict schedule filtering is enabled by default: the whole session is
 excluded from reconciliation and aggregate results, with a warning explaining whether
 its entry, exit, or both were off schedule. Configure the tolerance with
-`--schedule-tolerance-minutes`. Use `--reconciliation-mode actual-time` to produce a
-forensic reconciliation of a botched session. In that mode, the headline P&L and
+`--schedule-tolerance-minutes`. Use
+`--reconciliation-mode actual-time-minute-bar` to produce a forensic reconciliation
+of a botched session (`actual-time` remains an alias). In that mode, the headline P&L and
 execution comparison aligns every symbol's entry and exit to the open price of the
 1-min bar containing that symbol's fill. The scheduled entry bar and opening auction
 remain in the artifacts and detailed report as the scheduled-strategy counterfactual,

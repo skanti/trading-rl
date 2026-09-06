@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,11 +8,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).parents[1] / "download_auctions.py"
-SPEC = importlib.util.spec_from_file_location("download_auctions", SCRIPT_PATH)
-assert SPEC is not None and SPEC.loader is not None
-download_auctions = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(download_auctions)
+from trading_rl.cli import download_auctions
 
 
 def auction_row(symbol: str, date: str, price: object) -> dict[str, object]:

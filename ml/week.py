@@ -13,16 +13,16 @@ import pandas as pd
 import torch
 from omegaconf import DictConfig
 
-import model
-from reference_mlp import MLP_REFERENCE_FEATURE_DIM, build_shifted_price_features
-from train import (
+from . import model
+from .reference_mlp import MLP_REFERENCE_FEATURE_DIM, build_shifted_price_features
+from .train import (
     MarketRollout,
     generalized_advantages,
     market_rewards,
     ppo_update,
     reward_metrics,
 )
-from week_dataset import SESSIONS_PER_WEEK, ticks_per_session
+from .week_dataset import SESSIONS_PER_WEEK, ticks_per_session
 
 
 WEEK_FEATURE_NAMES = (

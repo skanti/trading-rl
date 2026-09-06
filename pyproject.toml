@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-rl"
+version = "0.1.0"
+description = "Market-data, backtesting, and live execution tools"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "omegaconf",
+  "pandas",
+  "requests",
+  "rich",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+ml = [
+  "einops",
+  "fsspec",
+  "munch",
+  "pillow",
+  "torch",
+]
+dashboard = [
+  "firebase-admin",
+  "google-api-core<2.35",
+]
+dev = [
+  "ruff",
+]
+
+[project.scripts]
+trading-dashboard = "trading_rl.dashboard.daemon:main"
+trading-dashboard-auth = "trading_rl.dashboard.auth:main"
+trading-backtest = "trading_rl.overnight.backtest:main"
+trading-experiments = "trading_rl.overnight.experiments:main"
+trading-live = "trading_rl.overnight.live:main"
+trading-reconcile = "trading_rl.overnight.reconcile_live_sessions:main"
+trading-universe = "trading_rl.overnight.universe:main"
+download-bars = "trading_rl.cli.download_bars:cli"
+download-auctions = "trading_rl.cli.download_auctions:main"
+download-nbbo = "trading_rl.cli.download_nbbo:main"
+build-liquidity-candidates = "trading_rl.cli.build_most_liquid:main"
+overnight-backtest = "trading_rl.overnight.backtest:main"
+overnight-experiments = "trading_rl.overnight.experiments:main"
+overnight-live = "trading_rl.overnight.live:main"
+overnight-reconcile = "trading_rl.overnight.reconcile_live_sessions:main"
+overnight-universe = "trading_rl.overnight.universe:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["trading_rl*", "ml*"]
+exclude = ["ml.tests*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"trading_rl.overnight" = ["config.yaml"]

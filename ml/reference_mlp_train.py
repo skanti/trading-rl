@@ -14,17 +14,16 @@ from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-import model
-import utils
-from reference_dataset import make_reference_dataloader
-from reference_mlp import (
+from . import model, utils
+from .reference_dataset import make_reference_dataloader
+from .reference_mlp import (
     MLP_REFERENCE_FEATURE_DIM,
     MLP_REFERENCE_FEATURE_NAMES,
     MLP_REFERENCE_SCALAR_NAMES,
     collect_shifted_mlp_rollout,
     shifted_mlp_train_step,
 )
-from train import regular_session_mask, rollout_metrics
+from .train import regular_session_mask, rollout_metrics
 
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()])

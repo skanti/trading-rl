@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import logging
 from pathlib import Path
 import tempfile
@@ -10,11 +9,7 @@ from unittest import mock
 import numpy as np
 
 
-SCRIPT_PATH = Path(__file__).parents[1] / "download_bars.py"
-SPEC = importlib.util.spec_from_file_location("download_bars", SCRIPT_PATH)
-assert SPEC is not None and SPEC.loader is not None
-download_bars = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(download_bars)
+from trading_rl.cli import download_bars
 
 
 def bars(*rows: tuple[int, int, int, int]) -> np.ndarray:

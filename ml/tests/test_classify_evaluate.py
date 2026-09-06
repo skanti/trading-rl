@@ -6,12 +6,12 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-from classify_evaluate import (
+from ml.classify_evaluate import (
     evaluate_bets,
     parse_anchor_time,
     summarize_trades,
 )
-from week_dataset import forward_fill_positions
+from ml.week_dataset import forward_fill_positions
 
 
 class FixedClassifier(torch.nn.Module):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -9,11 +8,7 @@ import unittest
 import numpy as np
 
 
-SCRIPT_PATH = Path(__file__).parents[1] / "build_most_liquid.py"
-SPEC = importlib.util.spec_from_file_location("build_most_liquid", SCRIPT_PATH)
-assert SPEC is not None and SPEC.loader is not None
-build_most_liquid = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(build_most_liquid)
+from trading_rl.cli import build_most_liquid
 
 
 def daily_rows(volumes: list[int]) -> np.ndarray:

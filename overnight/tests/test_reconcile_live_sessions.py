@@ -9,9 +9,9 @@ from pathlib import Path
 import numpy as np
 from rich.console import Console
 
-from backtest import BAR_ORIGIN, EASTERN
-from broker_fees import summarize_broker_fees
-from reconcile_live_sessions import (
+from trading_rl.overnight.backtest import BAR_ORIGIN, EASTERN
+from trading_rl.overnight.broker_fees import summarize_broker_fees
+from trading_rl.overnight.reconcile_live_sessions import (
     attach_broker_fees,
     broker_fees_for_session,
     build_parser,
@@ -62,6 +62,12 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 ["--reconciliation-mode", "actual-time"]
             ).reconciliation_mode,
             "actual-time",
+        )
+        self.assertEqual(
+            parser.parse_args(
+                ["--reconciliation-mode", "actual-time-minute-bar"]
+            ).reconciliation_mode,
+            "actual-time-minute-bar",
         )
 
     def test_formats_currency_sign_before_symbol(self):
@@ -166,6 +172,36 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             self.assertTrue(result["timing"]["schedule_comparable"])
             self.assertTrue(result["timing"]["exit"]["opening_auction_comparable"])
             self.assertEqual(result["warnings"], [])
+
+            nbbo = root / "nbbo.npz"
+            np.savez_compressed(
+                nbbo,
+                format_version=np.asarray(1, dtype=np.int16),
+                split_adjusted=np.asarray(True),
+                symbol=np.asarray(["AAPL"]),
+                date=np.asarray([entry_day.isoformat()], dtype="datetime64[D]"),
+                target_timestamp=np.asarray(["2026-08-28T19:59:00Z"]),
+                timestamp=np.asarray(["2026-08-28T19:58:59Z"]),
+                ask_price=np.asarray([101.0]),
+                raw_ask_price=np.asarray([101.0]),
+                ask_exchange=np.asarray(["Q"]),
+            )
+            nbbo_result = reconcile_execution(
+                summary,
+                minute_dir,
+                auctions,
+                nbbo_path=nbbo,
+                transaction_cost_bps=1.0,
+            )
+
+            self.assertEqual(nbbo_result["entry_price_source"], "nbbo_ask")
+            self.assertEqual(
+                nbbo_result["rows"][0]["simulator_entry_source"], "nbbo_ask"
+            )
+            self.assertAlmostEqual(
+                nbbo_result["rows"][0]["simulator_entry_price"], 101.0
+            )
+            self.assertEqual(nbbo_result["warnings"], [])
 
     def test_off_schedule_exit_adds_per_symbol_actual_time_benchmarks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -564,7 +600,7 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
 
         output = StringIO()
         console = Console(file=output, force_terminal=False, width=160)
-        with patch("reconcile_live_sessions.CONSOLE", console):
+        with patch("trading_rl.overnight.reconcile_live_sessions.CONSOLE", console):
             print_overview(
                 [result],
                 skipped_sessions=[

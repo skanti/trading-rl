@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 import csv
 
+import numpy as np
 import torch
 import fsspec
 
@@ -96,4 +97,3 @@ def weights_interpolation(weights: dict, i: int, max_steps: int) -> dict:
         else:
             weights_new[k] = v
     return weights_new
-

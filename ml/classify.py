@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-import model
+from . import model
 
 
 RELATIVE_FEATURE_NAMES = ("relative_log_price",)

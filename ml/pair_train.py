@@ -21,10 +21,9 @@ from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-import model
-import utils
-from dataset import OnlinePairToyProvider
-from pair import (
+from . import model, utils
+from .dataset import OnlinePairToyProvider
+from .pair import (
     PAIR_FEATURE_DIM,
     PAIR_FEATURE_NAMES,
     PAIR_SCALAR_DIM,
@@ -32,7 +31,7 @@ from pair import (
     pair_rollout_metrics,
     pair_train_step,
 )
-from train import prepare_batch, regular_session_mask
+from .train import prepare_batch, regular_session_mask
 
 
 logger = logging.getLogger("PAIR_RL")

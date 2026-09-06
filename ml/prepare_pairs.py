@@ -36,7 +36,7 @@ import pandas as pd
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-from prepare_days import FULL_SESSION_INTERVALS, RTH_CLOSE_MINUTE, RTH_OPEN_MINUTE
+from .prepare_days import FULL_SESSION_INTERVALS, RTH_CLOSE_MINUTE, RTH_OPEN_MINUTE
 
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)

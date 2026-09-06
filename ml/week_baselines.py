@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
 
-from week_dataset import forward_filled_prices
+from .week_dataset import forward_filled_prices
 
 
 MAG7 = ("AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA")

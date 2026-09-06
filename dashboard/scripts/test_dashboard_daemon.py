@@ -10,11 +10,11 @@ from unittest import mock
 
 from omegaconf import OmegaConf
 
-import dashboard_metrics as metrics
-import dashboard_daemon
-import dashboard_digest
-from dashboard_config import DashboardConfigError
-from dashboard_daemon import (
+from trading_rl.dashboard import daemon as dashboard_daemon
+from trading_rl.dashboard import digest as dashboard_digest
+from trading_rl.dashboard import metrics
+from trading_rl.dashboard.config import DashboardConfigError
+from trading_rl.dashboard.daemon import (
     AlpacaClient,
     _firestore_client,
     _is_paper_url,
@@ -371,7 +371,7 @@ class SnapshotTest(unittest.TestCase):
             {"date": "2026-08-25", "open": "09:30", "close": "16:00"},
         )
 
-    def test_snapshot_displays_provisional_point_but_excludes_it_from_statistics(self):
+    def test_snapshot_displays_provisional_performance_but_excludes_it_from_statistics(self):
         snapshot = build_snapshot(
             FakeAlpacaClient(),
             {},
@@ -396,7 +396,14 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(snapshot["equity_curve"][-1]["provisional"])
         self.assertEqual(snapshot["equity_curve"][-1]["trades"], 12)
         self.assertEqual(snapshot["statistics"]["sessions"], 0)
-        self.assertEqual(snapshot["performance"]["inception"]["sessions"], 0)
+        self.assertEqual(snapshot["performance"]["today"]["pnl"], 12.5)
+        self.assertEqual(snapshot["performance"]["today"]["sessions"], 1)
+        self.assertEqual(snapshot["performance"]["today"]["status"], "provisional")
+        self.assertEqual(snapshot["performance"]["inception"]["sessions"], 1)
+        for key in ("week", "month", "year", "inception"):
+            self.assertEqual(snapshot["performance"][key]["pnl"], 12.5)
+            self.assertEqual(snapshot["performance"][key]["sessions"], 1)
+            self.assertEqual(snapshot["performance"][key]["status"], "provisional")
 
     def test_shared_trading_config_is_published_without_runtime_values(self):
         configuration = load_trading_configuration(
@@ -860,6 +867,7 @@ class DigestTest(unittest.TestCase):
                     "label": "Today",
                     "pnl": 500.0,
                     "pnl_pct": 0.005,
+                    "status": "provisional",
                 }
             },
             "closed_basket": [
@@ -892,15 +900,18 @@ class DigestTest(unittest.TestCase):
         self.assertIn("[LIVE]", message["Subject"])
         self.assertIn("+$100.00", message["Subject"])
         self.assertNotIn("+$500.00", message["Subject"])
+        self.assertNotIn("provisional", message["Subject"])
         text = dashboard_digest.render_text(self.snapshot, self.state, self.config)
         self.assertIn("NVDA", text)
         self.assertIn("TOTAL", text)
+        self.assertIn("Today's strategy P&L (provisional)", text)
 
     def test_html_labels_mode_and_includes_fill_based_total(self):
         html = dashboard_digest.render_html(self.snapshot, self.state, self.config)
         self.assertIn("[LIVE]", html)
         self.assertIn("TOTAL", html)
         self.assertIn("+$100.00", html)
+        self.assertIn("provisional", html)
 
     def test_html_colors_profits_green_and_losses_red(self):
         html = dashboard_digest.render_html(self.snapshot, self.state, self.config)
@@ -915,7 +926,7 @@ class DigestTest(unittest.TestCase):
         self.assertIn("color:#be123c", dashboard_digest.render_html(losing, self.state, self.config))
 
     def test_send_uses_starttls_and_login(self):
-        with mock.patch("dashboard_digest.smtplib.SMTP") as smtp:
+        with mock.patch("trading_rl.dashboard.digest.smtplib.SMTP") as smtp:
             session = smtp.return_value.__enter__.return_value
             recipients = dashboard_digest.send_digest(self.snapshot, self.state, self.config)
         smtp.assert_called_once_with("smtp.example", 587, timeout=30)

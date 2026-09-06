@@ -14,10 +14,9 @@ from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-import model
-import utils
-from train import rollout_metrics
-from week import (
+from . import model, utils
+from .train import rollout_metrics
+from .week import (
     WEEK_METRIC_FIELDS,
     WEEK_FEATURE_DIM,
     WEEK_FEATURE_NAMES,
@@ -29,7 +28,7 @@ from week import (
     week_metrics,
     week_train_step,
 )
-from week_dataset import (
+from .week_dataset import (
     make_week_dataloader,
     ticks_per_session,
     week_context_ticks,

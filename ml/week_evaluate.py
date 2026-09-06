@@ -11,16 +11,15 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-import model
-import utils
-from train import market_rewards, performance_metrics
-from week import (
+from . import model, utils
+from .train import market_rewards, performance_metrics
+from .week import (
     WEEK_FEATURE_NAMES,
     WEEK_SCALAR_NAMES,
     collect_week_rollout,
     validate_week_hours,
 )
-from week_dataset import (
+from .week_dataset import (
     WeekReferenceDataset,
     read_universe,
     ticks_per_session,

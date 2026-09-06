@@ -12,7 +12,7 @@ from omegaconf import DictConfig
 from rich.logging import RichHandler
 from torch.utils.data import DataLoader, Dataset
 
-from dataset import MarketDayDataset, market_context_window_size
+from .dataset import MarketDayDataset, market_context_window_size
 
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)

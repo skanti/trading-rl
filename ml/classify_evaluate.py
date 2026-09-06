@@ -15,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from classify import (
+from .classify import (
     CLASSIFY_SCALAR_NAMES,
     RelativeDirectionClassifier,
     binary_metrics,
@@ -24,14 +24,14 @@ from classify import (
     classify_feature_names,
     classify_labels,
 )
-from classify_dataset import (
+from .classify_dataset import (
     EXTENDED_OPEN_MINUTE,
     RTH_CLOSE_MINUTE,
     RTH_OPEN_MINUTE,
     RelativeDirectionDataset,
 )
-from reference_dataset import trailing_validation_start
-from week_dataset import forward_fill_positions, read_universe
+from .reference_dataset import trailing_validation_start
+from .week_dataset import forward_fill_positions, read_universe
 
 
 @lru_cache(maxsize=256)

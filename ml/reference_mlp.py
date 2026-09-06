@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
 
-import model
-from train import MarketRollout, generalized_advantages, market_rewards, ppo_update
+from . import model
+from .train import MarketRollout, generalized_advantages, market_rewards, ppo_update
 
 
 MLP_REFERENCE_FEATURE_NAMES = (

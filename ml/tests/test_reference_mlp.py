@@ -8,15 +8,15 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-import model
-from reference_mlp import (
+from ml import model
+from ml.reference_mlp import (
     MLP_REFERENCE_FEATURE_DIM,
     build_shifted_price_features,
     collect_shifted_mlp_rollout,
     shifted_mlp_train_step,
 )
-from reference_dataset import MarketReferenceDataset
-from reference_mlp_train import MAX_MLP_PARAMETERS, build_mlp_models
+from ml.reference_dataset import MarketReferenceDataset
+from ml.reference_mlp_train import MAX_MLP_PARAMETERS, build_mlp_models
 
 
 def tiny_actor(window_size: int = 4) -> model.TradingActor:

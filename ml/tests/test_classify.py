@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-from classify import (
+from ml.classify import (
     CLASSIFY_FEATURE_DIM,
     CLASSIFY_SCALAR_DIM,
     DUAL_PRICE_FEATURE_NAMES,
@@ -23,15 +23,15 @@ from classify import (
     relative_log_prices,
     stock_direction_labels,
 )
-from classify_dataset import (
+from ml.classify_dataset import (
     RelativeDirectionDataset,
     classification_split_mask,
     regular_hours_offsets,
     session_tick_count,
 )
-from classify_train import MAX_PARAMETERS, MIN_PARAMETERS, build_classifier
-from classify_evaluate import RegularMinuteSweepDataset
-from week_dataset import forward_filled_prices
+from ml.classify_train import MAX_PARAMETERS, MIN_PARAMETERS, build_classifier
+from ml.classify_evaluate import RegularMinuteSweepDataset
+from ml.week_dataset import forward_filled_prices
 
 
 ANNO = datetime(2010, 1, 1, tzinfo=ZoneInfo("UTC"))

@@ -18,16 +18,16 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-import model
-from dataset import OnlinePairToyProvider
-from pair import (
+from . import model
+from .dataset import OnlinePairToyProvider
+from .pair import (
     PAIR_FEATURE_DIM,
     PAIR_SCALAR_DIM,
     collect_pair_rollout,
     pair_rollout_metrics,
     pair_train_step,
 )
-from pair_eval import (
+from .pair_eval import (
     current_residual_z,
     score_positions,
     spread_behaviour,

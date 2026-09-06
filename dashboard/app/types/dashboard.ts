@@ -17,6 +17,7 @@ export interface PerformanceBucket {
   pnl: number
   pnl_pct: number
   sessions: number
+  status?: 'confirmed' | 'provisional'
 }
 
 export interface EquityPoint {

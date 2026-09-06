@@ -19,9 +19,8 @@ from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-import model
-import utils
-from dataset import OnlineBezierToyProvider, make_dataloader, market_context_window_size
+from . import model, utils
+from .dataset import OnlineBezierToyProvider, make_dataloader, market_context_window_size
 
 
 logger = logging.getLogger("RL")

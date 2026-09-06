@@ -26,13 +26,13 @@ from __future__ import annotations
 
 import torch
 
-import model
-from pair import (
+from . import model
+from .pair import (
     build_pair_features,
     pair_market_rewards,
     PairRollout,
 )
-from train import build_market_features
+from .train import build_market_features
 
 
 def spread_behaviour(

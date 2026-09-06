@@ -18,8 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig
 
-import model
-from train import build_market_features, generalized_advantages, performance_metrics
+from . import model
+from .train import build_market_features, generalized_advantages, performance_metrics
 
 
 PAIR_FEATURE_NAMES = (

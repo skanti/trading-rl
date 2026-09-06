@@ -10,9 +10,9 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-import model
-from dataset import OnlineBezierToyProvider
-from train import collect_rollout, market_rewards, rollout_metrics, train_step
+from . import model
+from .dataset import OnlineBezierToyProvider
+from .train import collect_rollout, market_rewards, rollout_metrics, train_step
 
 
 @torch.no_grad()

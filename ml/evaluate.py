@@ -12,10 +12,9 @@ import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-import model
-import utils
-from dataset import MarketDayDataset
-from train import collect_rollout, market_rewards, regular_session_mask, session_progress
+from . import model, utils
+from .dataset import MarketDayDataset
+from .train import collect_rollout, market_rewards, regular_session_mask, session_progress
 
 
 @torch.no_grad()

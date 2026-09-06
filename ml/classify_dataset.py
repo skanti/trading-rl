@@ -19,9 +19,9 @@ from omegaconf import DictConfig
 from rich.logging import RichHandler
 from torch.utils.data import DataLoader, Dataset
 
-from dataset import EXTENDED_SESSION_BARS
-from reference_dataset import trailing_validation_start
-from week_dataset import forward_filled_prices, read_universe
+from .dataset import EXTENDED_SESSION_BARS
+from .reference_dataset import trailing_validation_start
+from .week_dataset import forward_filled_prices, read_universe
 
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)

@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 from rich.logging import RichHandler
 
-import model
+from . import model
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)
 logger = logging.getLogger("ANALYZE")
@@ -135,7 +135,9 @@ def inference(
         schedule = schedule.map(lambda x: x.replace(year=today.year, month=today.month, day=today.day))
         idx = np.searchsorted(dt, schedule, side="right") - 1
         assert len(idx) == len(schedule)
-        assert (dt[idx] <= schedule).all(), f"Latest match error, sample_id={sample_id}, today={today}"
+        assert (dt[idx] <= schedule).all(), (
+            f"Latest match error, symbol={symbol}, today={today}"
+        )
         temp = gt.temp[a + idx]
         secs = gt.secs[a + idx]
         dt = gt.dt[a + idx]

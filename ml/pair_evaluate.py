@@ -16,11 +16,10 @@ from dataclasses import dataclass
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-import model
-import utils
-from dataset import OnlinePairToyProvider
-from pair import PAIR_SCALAR_DIM, collect_pair_rollout, pair_rollout_metrics
-from pair_eval import (
+from . import model, utils
+from .dataset import OnlinePairToyProvider
+from .pair import PAIR_SCALAR_DIM, collect_pair_rollout, pair_rollout_metrics
+from .pair_eval import (
     current_residual_z,
     independent_leg_positions,
     oracle_positions,
@@ -28,7 +27,7 @@ from pair_eval import (
     spread_behaviour,
     zscore_rule_positions,
 )
-from train import collect_rollout, performance_metrics
+from .train import collect_rollout, performance_metrics
 
 
 REPORTED_METRICS = (

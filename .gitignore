@@ -5,6 +5,7 @@
 # generated files
 MUJOCO_LOG.TXT
 __pycache__/
+*.egg-info/
 .DS_Store
 outputs
 /ml/artifacts/

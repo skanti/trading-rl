@@ -12,6 +12,7 @@ BAR_SINCE="${BAR_SINCE:-2022-01-01}"
 DAILY_BARS_DIR="${DAILY_BARS_DIR:-$UPDATES_DIR/bars_1day_$BAR_SINCE}"
 MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_$BAR_SINCE}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
+NBBO_PATH="${NBBO_PATH:-$UPDATES_DIR/alpaca_nbbo_1545_2022-01-01.npz}"
 MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 # Keep the mutable download universe beside the market-data stores, not in the
 # tracked repository. MOST_LIQUID_PATH remains a compatibility override.
@@ -20,8 +21,11 @@ SHORTLIST_SINCE="${SHORTLIST_SINCE:-2022-01-01}"
 SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-50}"
 SHORTLIST_LOOKBACK_SESSIONS="${SHORTLIST_LOOKBACK_SESSIONS:-250}"
 AUCTION_START="${AUCTION_START:-2022-01-01}"
+NBBO_START="${NBBO_START:-2022-01-01}"
 BAR_OVERLAP_DAYS="${BAR_OVERLAP_DAYS:-30}"
 AUCTION_OVERLAP_DAYS="${AUCTION_OVERLAP_DAYS:-7}"
+NBBO_OVERLAP_DAYS="${NBBO_OVERLAP_DAYS:-7}"
+NBBO_TARGET_TIME="${NBBO_TARGET_TIME:-15:45}"
 WORKERS="${WORKERS:-4}"
 DAILY_BAR_BATCH_SIZE="${DAILY_BAR_BATCH_SIZE:-100}"
 MINUTE_BAR_BATCH_SIZE="${MINUTE_BAR_BATCH_SIZE:-10}"
@@ -31,8 +35,9 @@ LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 usage() {
   cat <<'EOF'
 Refresh the current eligible company-stock universe, update its split-adjusted
-daily bars, rebuild the dollar-volume shortlist, update auctions, and then update
-minute bars for the shortlist plus SPY. Historical bar files are retained.
+daily bars, rebuild the dollar-volume shortlist, update auctions and scheduled
+15:45 NBBO snapshots, and then update minute bars for the shortlist plus SPY.
+Historical bar files are retained.
 
 Usage:
   scripts/download_latest_bars_and_auctions.sh
@@ -51,6 +56,8 @@ Common environment overrides:
   ALPACA_REQUESTS_PER_MINUTE=180
   BAR_OVERLAP_DAYS=30
   AUCTION_OVERLAP_DAYS=7
+  NBBO_OVERLAP_DAYS=7
+  NBBO_TARGET_TIME=15:45
   SHORTLIST_SINCE=2022-01-01
   SHORTLIST_DAILY_TOP=50
   SHORTLIST_LOOKBACK_SESSIONS=250
@@ -168,6 +175,28 @@ else
     --end "$auction_end" \
     --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
     --output "$AUCTIONS_PATH"
+fi
+
+log "Updating scheduled $NBBO_TARGET_TIME ET SIP NBBO snapshots through $auction_end"
+if [[ -f "$NBBO_PATH" && -f "${NBBO_PATH%.npz}.json" ]]; then
+  "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
+    --update \
+    --end "$auction_end" \
+    --target-time "$NBBO_TARGET_TIME" \
+    --overlap-days "$NBBO_OVERLAP_DAYS" \
+    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
+    --symbols SPY \
+    --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
+    --output "$NBBO_PATH"
+else
+  "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
+    --start "$NBBO_START" \
+    --end "$auction_end" \
+    --target-time "$NBBO_TARGET_TIME" \
+    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
+    --symbols SPY \
+    --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
+    --output "$NBBO_PATH"
 fi
 
 # The minute universe is fully derived from the liquidity-prioritized shortlist,

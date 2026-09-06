@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from rich.console import Console
 
-from backtest import (
+from trading_rl.overnight.backtest import (
     DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
     basket_quantities,
@@ -19,6 +19,7 @@ from backtest import (
     liquidity_scores,
     load_opening_auction_prices,
     load_primary_auction_exchange_mask,
+    load_scheduled_nbbo_asks,
     print_symbol_trade_counts,
     print_summary_table,
     reference_session_calendar,
@@ -47,6 +48,33 @@ def write_auction_npz(path: Path, rows: list[dict[str, object]]) -> None:
 class OvernightLiquidityBaselineTest(unittest.TestCase):
     def test_default_transaction_cost_is_one_basis_point_per_side(self):
         self.assertEqual(DEFAULT_TRANSACTION_COST_BPS, 1.0)
+
+    def test_scheduled_nbbo_loader_returns_adjusted_asks_and_quote_age(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nbbo.npz"
+            np.savez_compressed(
+                path,
+                split_adjusted=np.asarray(True),
+                symbol=np.asarray(["AAPL"]),
+                date=np.asarray(["2026-09-02"], dtype="datetime64[D]"),
+                target_timestamp=np.asarray(["2026-09-02T19:45:00Z"]),
+                timestamp=np.asarray(["2026-09-02T19:44:57Z"]),
+                ask_price=np.asarray([100.0]),
+                raw_ask_price=np.asarray([200.0]),
+                ask_exchange=np.asarray(["Q"]),
+            )
+
+            prices, staleness, rows = load_scheduled_nbbo_asks(
+                path,
+                pd.DatetimeIndex(["2026-09-02"]),
+                np.asarray(["AAPL", "MSFT"]),
+            )
+
+        self.assertEqual(prices[0, 0], 100.0)
+        self.assertTrue(np.isnan(prices[0, 1]))
+        self.assertAlmostEqual(staleness[0, 0], 0.05)
+        self.assertTrue(np.isinf(staleness[0, 1]))
+        self.assertEqual(float(rows.iloc[0].raw_price), 200.0)
 
     def test_opening_auction_loader_uses_only_official_condition_o(self):
         with tempfile.TemporaryDirectory() as directory:

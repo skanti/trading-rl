@@ -11,8 +11,8 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-import model
-from week import (
+from ml import model
+from ml.week import (
     WEEK_FEATURE_DIM,
     WEEK_SCALAR_DIM,
     build_week_scalars,
@@ -21,7 +21,7 @@ from week import (
     validate_week_hours,
     week_train_step,
 )
-from week_dataset import (
+from ml.week_dataset import (
     MarketWeekDataset,
     WeekReferenceDataset,
     ticks_per_context_day,
@@ -29,8 +29,8 @@ from week_dataset import (
     week_context_ticks,
     week_rollout_size,
 )
-from reference_dataset import trailing_validation_start
-from week_train import MAX_MLP_PARAMETERS, build_week_models
+from ml.reference_dataset import trailing_validation_start
+from ml.week_train import MAX_MLP_PARAMETERS, build_week_models
 
 
 ANNO = datetime(2010, 1, 1, tzinfo=ZoneInfo("UTC"))
@@ -260,7 +260,7 @@ class WeekRolloutTest(unittest.TestCase):
         # the toy rollout up with it rather than with the tiny fixture above.
         cfg.data.rollout_size = 6
         before = actor.main[-1].weight.detach().clone()
-        with unittest.mock.patch("week.ticks_per_session", return_value=3):
+        with unittest.mock.patch("ml.week.ticks_per_session", return_value=3):
             rollout, losses = week_train_step(actor, critic, optimizer, asset, spy, cfg)
         self.assertEqual(rollout.actions.shape, (2, 6))
         self.assertFalse(torch.equal(before, actor.main[-1].weight))

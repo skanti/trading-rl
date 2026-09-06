@@ -1,6 +1,4 @@
-firebase-admin
-# 2.35.0 percent-encodes Firestore's special `(default)` database ID, causing
-# `400 Invalid database id %28default%29` with google-cloud-firestore 2.29.0.
-google-api-core<2.35
-omegaconf
-requests
+# Installs the repository package plus the dashboard-only dependencies. The
+# google-api-core upper bound is declared by the dashboard extra because 2.35.0
+# percent-encodes Firestore's special `(default)` database ID.
+-e ..[dashboard]

@@ -8,10 +8,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from omegaconf import OmegaConf
 from omegaconf.errors import ConfigKeyError
 from rich.console import Console
 
-from live import (
+from trading_rl.overnight.live import (
     DEFAULT_EXCHANGES,
     EASTERN,
     RANKING_PIPELINE_VERSION,
@@ -42,9 +43,10 @@ from live import (
     whole_share_order_plan,
     parse_live_arguments,
 )
-from live_config import (
+from trading_rl.overnight.live_config import (
     DEFAULT_LIVE_CONFIG_PATH,
     EFFECTIVE_CONFIG_FILENAME,
+    PACKAGED_LIVE_CONFIG_PATH,
     effective_live_settings,
     load_live_settings,
 )
@@ -433,6 +435,15 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             with self.assertRaises(ConfigKeyError):
                 load_live_settings(config_path)
 
+    def test_legacy_and_packaged_live_config_stay_in_sync(self):
+        legacy_path = Path(__file__).resolve().parents[1] / "config.yaml"
+
+        self.assertEqual(DEFAULT_LIVE_CONFIG_PATH.resolve(), legacy_path.resolve())
+        self.assertEqual(
+            OmegaConf.to_container(OmegaConf.load(legacy_path)),
+            OmegaConf.to_container(OmegaConf.load(PACKAGED_LIVE_CONFIG_PATH)),
+        )
+
     def test_preopen_exit_clock_allows_queued_orders(self):
         preopen = FakeClockBroker("2026-08-25T09:00:00-04:00", False)
         regular = FakeClockBroker("2026-08-25T09:30:00-04:00", True)
@@ -813,7 +824,10 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
     def test_live_ranking_matches_the_simulator_scheme_for_scheme(self):
         """The live scorer must agree with the simulator on identical input, or a
         live basket and a backtested one silently diverge."""
-        from backtest import causal_ema_log_liquidity, causal_turnover_stability
+        from trading_rl.overnight.backtest import (
+            causal_ema_log_liquidity,
+            causal_turnover_stability,
+        )
 
         days = [f"2026-06-{d:02d}" for d in range(1, 26)]
         sessions = [date.fromisoformat(d) for d in days]

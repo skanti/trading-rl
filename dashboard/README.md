@@ -28,9 +28,11 @@ the Admin SDK, which bypasses rules.
 The chart is dated by basket exit day and compounds strategy net P&L: closed-basket fill
 P&L less confirmed Alpaca `FEE` account activities booked on the exit date. The daemon
 caches those activities beside the live summary. Newly closed sessions appear
-immediately as provisional, using gross fill P&L with zero fees assumed. Their final
-chart segment is dashed, and they remain excluded from performance statistics until
-fees post, normally the next day. Confirmed results then subtract the actual fees.
+immediately using gross fill P&L with zero fees assumed. Performance buckets and digest
+emails label these results as `provisional`; the final chart segment is dashed, and
+provisional sessions remain excluded from risk statistics until fees post, normally the
+next day. Today/WTD/MTD/YTD/inception performance includes provisional sessions.
+Confirmed results then subtract the actual fees.
 Account-equity change remains a separate reconciliation value, with any difference
 shown as the unexplained residual. This keeps strategy performance independent of
 deposits, settlement rounding, and Alpaca's delayed portfolio-history rollover.
@@ -88,7 +90,7 @@ The project id is already set to `trading-dashboard-ccdd5` in `.firebaserc` and
    (`dashboard/.secrets/service-account.json`). Never commit this file.
 5. Create the login user from `config.yaml`:
    ```bash
-   .venv/bin/python scripts/provision_auth_user.py
+   .venv/bin/trading-dashboard-auth
    ```
 
 ## Deploying
@@ -113,9 +115,9 @@ SMTP failures are logged and retried without affecting Firestore publishing.
 ```bash
 set -a && source ../overnight/.env && set +a
 
-.venv/bin/python scripts/dashboard_daemon.py --dry-run  # print one payload
-.venv/bin/python scripts/dashboard_daemon.py --once     # publish once
-.venv/bin/python scripts/dashboard_daemon.py            # keep publishing
+.venv/bin/trading-dashboard --dry-run  # print one payload
+.venv/bin/trading-dashboard --once     # publish once
+.venv/bin/trading-dashboard            # keep publishing
 ```
 
 Always use `dashboard/.venv` for this process. The ML environment intentionally has a
@@ -144,7 +146,7 @@ does not need rebuilding when the publisher switches between paper and live.
 | `app/repositories/` | Firestore adapter and the offline demo adapter |
 | `app/types/dashboard.ts` | Snapshot shapes; mirror of the publisher's output |
 | `app/utils/` | Formatting and chart geometry (both unit tested) |
-| `scripts/dashboard_daemon.py` | Independent Alpaca-to-Firestore polling daemon |
-| `scripts/dashboard_metrics.py` | Pure snapshot performance calculations |
-| `scripts/dashboard_config.py` | Dashboard-only configuration loader |
+| `trading_rl/dashboard/daemon.py` | Independent Alpaca-to-Firestore polling daemon |
+| `trading_rl/dashboard/metrics.py` | Pure snapshot performance calculations |
+| `trading_rl/dashboard/config.py` | Dashboard-only configuration loader |
 | `firestore.rules` | Authenticated read, no browser writes |

@@ -14,8 +14,8 @@ from omegaconf import DictConfig, OmegaConf
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-import utils
-from classify import (
+from . import utils
+from .classify import (
     CLASSIFY_SCALAR_DIM,
     CLASSIFY_SCALAR_NAMES,
     RelativeDirectionClassifier,
@@ -25,7 +25,7 @@ from classify import (
     classify_feature_names,
     classify_labels,
 )
-from classify_dataset import make_classify_dataloader
+from .classify_dataset import make_classify_dataloader
 
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()])

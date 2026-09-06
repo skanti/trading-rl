@@ -7,9 +7,9 @@ import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
-import model
-from dataset import OnlinePairToyProvider, sample_ornstein_uhlenbeck
-from pair import (
+from ml import model
+from ml.dataset import OnlinePairToyProvider, sample_ornstein_uhlenbeck
+from ml.pair import (
     PAIR_FEATURE_DIM,
     PAIR_SCALAR_DIM,
     build_pair_features,
@@ -18,9 +18,9 @@ from pair import (
     pair_train_step,
     pair_window_statistics,
 )
-from pair_dataset import MarketPairDataset, make_pair_dataloader
-from pair_eval import step_limited_positions, zscore_rule_positions
-from prepare_pairs import scan_symbol, session_table
+from ml.pair_dataset import MarketPairDataset, make_pair_dataloader
+from ml.pair_eval import step_limited_positions, zscore_rule_positions
+from ml.prepare_pairs import scan_symbol, session_table
 
 
 ANNO = "2010-01-01"
