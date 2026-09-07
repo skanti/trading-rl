@@ -19,17 +19,19 @@ MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 # tracked repository. MOST_LIQUID_PATH remains a compatibility override.
 LIQUIDITY_CANDIDATES_PATH="${LIQUIDITY_CANDIDATES_PATH:-${MOST_LIQUID_PATH:-$UPDATES_DIR/liquidity_candidates.txt}}"
 SHORTLIST_SINCE="${SHORTLIST_SINCE:-2022-01-01}"
-SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-50}"
-SHORTLIST_LOOKBACK_SESSIONS="${SHORTLIST_LOOKBACK_SESSIONS:-250}"
+SHORTLIST_DAILY_TOP="${SHORTLIST_DAILY_TOP:-20}"
+# Historical downloads must retain former liquidity leaders as well as current ones.
+# Zero unions every daily top-N list since SHORTLIST_SINCE.
+SHORTLIST_LOOKBACK_SESSIONS="${SHORTLIST_LOOKBACK_SESSIONS:-0}"
 AUCTION_START="${AUCTION_START:-2022-01-01}"
 NBBO_START="${NBBO_START:-2022-01-01}"
 BAR_OVERLAP_DAYS="${BAR_OVERLAP_DAYS:-30}"
 AUCTION_OVERLAP_DAYS="${AUCTION_OVERLAP_DAYS:-7}"
 NBBO_OVERLAP_DAYS="${NBBO_OVERLAP_DAYS:-7}"
 NBBO_TARGET_TIME="${NBBO_TARGET_TIME:-15:45}"
-WORKERS="${WORKERS:-4}"
+WORKERS="${WORKERS:-8}"
 DAILY_BAR_BATCH_SIZE="${DAILY_BAR_BATCH_SIZE:-100}"
-MINUTE_BAR_BATCH_SIZE="${MINUTE_BAR_BATCH_SIZE:-10}"
+MINUTE_BAR_BATCH_SIZE="${MINUTE_BAR_BATCH_SIZE:-1}"
 ALPACA_REQUESTS_PER_MINUTE="${ALPACA_REQUESTS_PER_MINUTE:-180}"
 LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 
@@ -39,7 +41,9 @@ Refresh the current eligible company-stock universe, update its split-adjusted
 daily bars, rebuild the dollar-volume shortlist, update auctions, and then update
 minute bars for the shortlist plus SPY. When NBBO_TARGETS_PATH is set, the final
 step updates strict scheduled 15:45 NBBO targets from that simulator trade CSV.
-Historical bar files are retained.
+The shortlist includes every daily top-20 symbol since 2022-01-01 by default.
+Historical bar files are retained; new auction symbols are backfilled to the
+existing dataset's start date.
 
 Usage:
   scripts/download_latest_bars_and_auctions.sh
@@ -51,9 +55,9 @@ Common environment overrides:
   BAR_SINCE=2022-01-01
   DAILY_BARS_DIR=/data/ppv1/updates/bars_1day_2022-01-01
   MINUTE_BARS_DIR=/data/ppv1/updates/bars_1min_2022-01-01
-  WORKERS=4
+  WORKERS=8
   DAILY_BAR_BATCH_SIZE=100
-  MINUTE_BAR_BATCH_SIZE=10
+  MINUTE_BAR_BATCH_SIZE=1
   # Algo Trader Plus accounts may use 9000 (below Alpaca's documented 10000 RPM).
   ALPACA_REQUESTS_PER_MINUTE=180
   BAR_OVERLAP_DAYS=30
@@ -62,8 +66,8 @@ Common environment overrides:
   NBBO_TARGET_TIME=15:45
   NBBO_TARGETS_PATH=/tmp/overnight_trades.csv
   SHORTLIST_SINCE=2022-01-01
-  SHORTLIST_DAILY_TOP=50
-  SHORTLIST_LOOKBACK_SESSIONS=250
+  SHORTLIST_DAILY_TOP=20
+  SHORTLIST_LOOKBACK_SESSIONS=0  # all sessions since SHORTLIST_SINCE
   LIQUIDITY_CANDIDATES_PATH=/data/ppv1/updates/liquidity_candidates.txt
 EOF
 }
@@ -139,7 +143,11 @@ log "Updating broad daily bars in $DAILY_BARS_DIR"
   --overlap_days "$BAR_OVERLAP_DAYS"
 check_failures "$DAILY_BARS_DIR"
 
-log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAILY_TOP daily dollar-volume union"
+if [[ "$SHORTLIST_LOOKBACK_SESSIONS" == "0" ]]; then
+  log "Rebuilding top-$SHORTLIST_DAILY_TOP daily dollar-volume union over all sessions since $SHORTLIST_SINCE"
+else
+  log "Rebuilding trailing-$SHORTLIST_LOOKBACK_SESSIONS-session top-$SHORTLIST_DAILY_TOP daily dollar-volume union since $SHORTLIST_SINCE"
+fi
 "$PYTHON_BIN" "$SCRIPT_DIR/build_most_liquid.py" \
   --bars-dir "$DAILY_BARS_DIR" \
   --since "$SHORTLIST_SINCE" \
@@ -168,6 +176,7 @@ log "Updating auctions through the current New York date $auction_end"
 if [[ -f "$AUCTIONS_PATH" && -f "${AUCTIONS_PATH%.npz}.json" ]]; then
   "$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
     --update \
+    --refresh-requested-only \
     --end "$auction_end" \
     --overlap-days "$AUCTION_OVERLAP_DAYS" \
     --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \

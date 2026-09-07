@@ -153,6 +153,74 @@ class AuctionUpdateTests(unittest.TestCase):
                 updated_manifest["last_update"]["refresh_start"], "2026-08-21"
             )
 
+    def test_requested_refresh_retains_other_history_and_catches_up_returning_symbols(self):
+        for resume_requested_only in (True, False):
+            with self.subTest(resume_requested_only=resume_requested_only), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "auctions.npz"
+                download_auctions._write_dataset(
+                    output,
+                    [auction_row(symbol, "2025-01-10", 100.0) for symbol in ("AAPL", "MSFT", "SPY")],
+                    [],
+                    ["AAPL", "MSFT", "SPY"],
+                    "2022-01-01",
+                    "2025-01-10",
+                )
+
+                def fake_download(_session, _headers, symbols, start, end, _batch_size):
+                    return [auction_row(symbol, end, 110.0) for symbol in symbols]
+
+                with (
+                    mock.patch.object(download_auctions, "_request_headers", return_value={}),
+                    mock.patch.object(download_auctions, "_download_auction_rows", side_effect=fake_download) as fetch,
+                    mock.patch.object(download_auctions, "_download_splits", return_value=[]) as splits,
+                ):
+                    download_auctions.update_auctions(
+                        output, "2025-02-10", {"MSFT", "NVDA"}, refresh_requested_only=True
+                    )
+                    self.assertEqual(
+                        [call.args[2:5] for call in fetch.call_args_list],
+                        [
+                            (["MSFT", "SPY"], "2025-01-04", "2025-02-10"),
+                            (["NVDA"], "2022-01-01", "2025-02-10"),
+                        ],
+                    )
+                    # Retained history still participates in split adjustments.
+                    self.assertEqual(splits.call_args.args[2], ["AAPL", "MSFT", "NVDA", "SPY"])
+                    rows = download_auctions._load_raw_auction_rows(output)
+                    self.assertEqual(
+                        [(row["date"], row["price"]) for row in rows if row["symbol"] == "AAPL"],
+                        [("2025-01-10", 100.0)],
+                    )
+                    manifest = json.loads(output.with_suffix(".json").read_text())
+                    self.assertEqual(manifest["symbol_end_dates"]["AAPL"], "2025-01-10")
+                    self.assertEqual(manifest["symbol_end_dates"]["MSFT"], "2025-02-10")
+                    self.assertEqual(manifest["last_update"]["refreshed_symbols"], ["MSFT", "NVDA", "SPY"])
+
+                    fetch.reset_mock()
+                    download_auctions.update_auctions(
+                        output, "2025-03-10", {"AAPL"},
+                        refresh_requested_only=resume_requested_only,
+                    )
+                    expected = ["AAPL", "SPY"] if resume_requested_only else ["AAPL", "MSFT", "NVDA", "SPY"]
+                    self.assertEqual(fetch.call_args.args[2:5], (expected, "2025-01-04", "2025-03-10"))
+                    manifest = json.loads(output.with_suffix(".json").read_text())
+                    self.assertEqual(manifest["symbol_end_dates"]["AAPL"], "2025-03-10")
+                    self.assertEqual(
+                        manifest["symbol_end_dates"]["MSFT"],
+                        "2025-02-10" if resume_requested_only else "2025-03-10",
+                    )
+
+    def test_requested_refresh_rejects_empty_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "auctions.npz"
+            download_auctions._write_dataset(
+                output, [], [], ["SPY"], "2022-01-01", "2025-01-10"
+            )
+            with self.assertRaisesRegex(ValueError, "explicit symbol selection"):
+                download_auctions.update_auctions(
+                    output, "2025-02-10", set(), refresh_requested_only=True
+                )
+
     def test_npz_prices_and_sizes_are_pre_adjusted_from_embedded_split_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "auctions.npz"

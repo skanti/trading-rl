@@ -17,7 +17,7 @@ PRICE_INDICES = (1, 2, 3, 4, 7)
 MINUTE_INT32_MAX = np.iinfo(np.int32).max
 DEFAULT_BARS_DIR = Path("/data/ppv1/updates/bars_1day_2022-01-01")
 DEFAULT_OUTPUT = DEFAULT_BARS_DIR.parent / "liquidity_candidates.txt"
-DEFAULT_LOOKBACK_SESSIONS = 250
+DEFAULT_LOOKBACK_SESSIONS = 0
 
 
 def _validate_dataset(bars_dir: Path) -> None:
@@ -48,11 +48,11 @@ def _eligible_rows(array: np.ndarray, since_seconds: int) -> np.ndarray:
 def historical_top_symbols(
     bars_dir: Path,
     since: str,
-    top: int = 50,
+    top: int = 20,
     metrics: tuple[str, ...] = ("dollar_volume",),
-    lookback_sessions: int | None = DEFAULT_LOOKBACK_SESSIONS,
+    lookback_sessions: int | None = None,
 ) -> tuple[list[str], int]:
-    """Return a liquidity-prioritized trailing union of daily top-N symbols."""
+    """Return the daily top-N union since the epoch, optionally windowed."""
     if top < 1:
         raise ValueError("top must be positive")
     if lookback_sessions is not None and lookback_sessions < 1:
@@ -176,14 +176,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bars-dir", type=Path, default=DEFAULT_BARS_DIR)
     parser.add_argument("--since", default="2022-01-01")
-    parser.add_argument("--top", type=int, default=50)
+    parser.add_argument(
+        "--top", type=int, default=20, help="daily liquidity leaders to include (default: 20)"
+    )
     parser.add_argument(
         "--lookback-sessions",
         type=int,
         default=DEFAULT_LOOKBACK_SESSIONS,
         help=(
-            "union only the most recent completed sessions (default: 250); "
-            "use 0 for every session since --since"
+            "union only the most recent completed sessions; "
+            "default: 0, every session since --since for historical coverage"
         ),
     )
     parser.add_argument(

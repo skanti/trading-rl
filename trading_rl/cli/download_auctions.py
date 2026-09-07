@@ -432,6 +432,7 @@ def _write_dataset(
     end: str,
     update_metadata: dict[str, object] | None = None,
     split_adjusted_as_of: str | None = None,
+    symbol_end_dates: dict[str, str] | None = None,
 ) -> None:
     ordered = _ordered_unique_auction_rows(rows)
     ordered_splits = _ordered_splits(split_rows)
@@ -457,6 +458,8 @@ def _write_dataset(
     }
     if update_metadata:
         manifest["last_update"] = update_metadata
+    if symbol_end_dates is not None:
+        manifest["symbol_end_dates"] = symbol_end_dates
     manifest_path = output_path.with_suffix(".json")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -511,6 +514,7 @@ def update_auctions(
     additional_symbols: set[str],
     overlap_days: int = 7,
     batch_size: int = 50,
+    refresh_requested_only: bool = False,
 ) -> tuple[int, int]:
     manifest_path = output_path.with_suffix(".json")
     if not output_path.exists() or not manifest_path.exists():
@@ -523,31 +527,53 @@ def update_auctions(
     requested_end_date = pd.Timestamp(end).date()
     if requested_end_date < previous_end_date:
         raise ValueError(f"update end {end} precedes existing end {previous_end}")
-    refresh_start_date = max(
-        dataset_start_date,
-        previous_end_date - timedelta(days=int(overlap_days) - 1),
-    )
-    refresh_start = refresh_start_date.isoformat()
     dataset_start_bound = dataset_start_date.isoformat()
     requested_end_bound = requested_end_date.isoformat()
     query_end, _current_day = auction_query_end(end)
 
     existing_symbols = {_security_symbol(symbol) for symbol in manifest["symbols"]}
-    new_symbols = {_security_symbol(symbol) for symbol in additional_symbols} - existing_symbols
+    requested_symbols = {_security_symbol(symbol) for symbol in additional_symbols}
+    if refresh_requested_only:
+        if not requested_symbols:
+            raise ValueError("refresh-requested-only requires an explicit symbol selection")
+        requested_symbols.add("SPY")
+    new_symbols = requested_symbols - existing_symbols
     all_symbols = sorted(existing_symbols | new_symbols)
+    refresh_symbols = requested_symbols if refresh_requested_only else set(all_symbols)
+    refresh_existing = existing_symbols & refresh_symbols
+    # A retained symbol may have missed several updates outside the shortlist.
+    # Resume from its own coverage date, not the dataset's newest end date.
+    saved_end_dates = manifest.get("symbol_end_dates", {})
+    symbol_end_dates = {
+        symbol: saved_end_dates.get(symbol, previous_end) for symbol in existing_symbols
+    }
+    oldest_end = min(
+        (pd.Timestamp(symbol_end_dates[symbol]).date() for symbol in refresh_existing),
+        default=previous_end_date,
+    )
+    refresh_start = max(
+        dataset_start_date, oldest_end - timedelta(days=int(overlap_days) - 1)
+    ).isoformat()
+    print(
+        f"refreshing auctions for {len(refresh_symbols):,} symbols "
+        f"({len(refresh_existing):,} existing, {len(new_symbols):,} new); "
+        f"retaining {len(all_symbols):,} symbols in the dataset"
+    )
     existing_rows = _load_raw_auction_rows(output_path)
 
     headers = _request_headers()
     split_end = max(requested_end_date, datetime.now(timezone.utc).date()).isoformat()
     with requests.Session() as session:
-        refreshed_existing_rows = _download_auction_rows(
-            session,
-            headers,
-            sorted(existing_symbols),
-            refresh_start,
-            query_end,
-            batch_size,
-        )
+        refreshed_existing_rows = []
+        if refresh_existing:
+            refreshed_existing_rows = _download_auction_rows(
+                session,
+                headers,
+                sorted(refresh_existing),
+                refresh_start,
+                query_end,
+                batch_size,
+            )
         # Alpaca can occasionally include a print just outside the requested
         # calendar boundary. Excluding it prevents a retained row before the
         # replacement tail from acquiring a second, differently typed copy.
@@ -583,7 +609,7 @@ def update_auctions(
     merged = merge_auction_rows(
         existing_rows,
         refreshed_rows,
-        existing_symbols | new_symbols,
+        refresh_symbols,
         refresh_start,
     )
     update_metadata = {
@@ -591,7 +617,9 @@ def update_auctions(
         "refresh_start": refresh_start,
         "overlap_days": int(overlap_days),
         "new_symbols": sorted(new_symbols),
+        "refreshed_symbols": sorted(refresh_symbols),
     }
+    symbol_end_dates.update({symbol: end for symbol in refresh_symbols})
     _write_dataset(
         output_path,
         merged,
@@ -601,6 +629,7 @@ def update_auctions(
         end,
         update_metadata,
         split_adjusted_as_of=split_end,
+        symbol_end_dates=symbol_end_dates,
     )
     return len(all_symbols), len(merged)
 
@@ -630,6 +659,14 @@ def main() -> None:
         help="calendar days replaced during --update to capture late corrections (default: 7)",
     )
     parser.add_argument(
+        "--refresh-requested-only",
+        action="store_true",
+        help=(
+            "with --update, refresh only explicitly selected symbols plus SPY; "
+            "retain other stored history"
+        ),
+    )
+    parser.add_argument(
         "--symbols-from-trades",
         action="append",
         default=[],
@@ -650,6 +687,8 @@ def main() -> None:
         parser.error("--overlap-days must be positive")
     if not args.update and not args.start:
         parser.error("--start is required unless --update is used")
+    if args.refresh_requested_only and not args.update:
+        parser.error("--refresh-requested-only requires --update")
     try:
         query_end, current_day = auction_query_end(args.end)
     except ValueError as error:
@@ -665,6 +704,8 @@ def main() -> None:
         symbols.update(symbols_from_trade_csv(Path(path)))
     for path in args.symbols_file:
         symbols.update(symbols_from_file(Path(path)))
+    if args.refresh_requested_only and not symbols:
+        parser.error("--refresh-requested-only requires an explicit symbol selection")
     output_path = Path(args.output)
     if output_path.suffix.lower() != ".npz":
         parser.error("--output must end in .npz")
@@ -675,6 +716,7 @@ def main() -> None:
             symbols,
             args.overlap_days,
             args.batch_size,
+            refresh_requested_only=args.refresh_requested_only,
         )
     else:
         symbols.add("SPY")
@@ -685,7 +727,7 @@ def main() -> None:
             output_path,
             args.batch_size,
         )
-    print(f"wrote {prints:,} auction prints for {count} symbols to {args.output}")
+    print(f"wrote {prints:,} auction prints for {count} stored symbols to {args.output}")
 
 
 if __name__ == "__main__":

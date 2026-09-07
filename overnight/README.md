@@ -132,7 +132,10 @@ tradable, fractionable Nasdaq company stocks. Only that current universe is
 refreshed, while historical and delisted `.npy` files already in the bar stores are
 retained for backtests. It then loads `overnight/.env` by default and accepts
 environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
-overlap/shortlist settings shown by `--help`. Auction updates use the current New
+overlap/shortlist settings shown by `--help`. Downloads default to 8 workers,
+1 symbol per minute-bar batch, and a shared bar-download limit of 180 requests
+per minute. Single-symbol minute batches save each completed symbol independently
+and reduce memory use during full-history downloads. Auction updates use the current New
 York date. An optional NBBO update runs last when `NBBO_TARGETS_PATH` names a
 simulator trade CSV; targets still inside Alpaca's delayed-SIP window are deferred
 and filled by the next overlap refresh.
@@ -211,8 +214,12 @@ so their full retained history is refreshed and reapplied to every raw auction r
 before the NPZ is atomically replaced. Pass `--overlap-days` to change the
 overlap, or `--symbols`, `--symbols-file`, or `--symbols-from-trades` to add
 symbols; only a newly added symbol receives a full-history download. Use
-`--symbols-file /data/ppv1/updates/liquidity_candidates.txt` to align the auction
-universe with the complete liquidity candidate set. Use the last completed
+`--symbols-file /data/ppv1/updates/liquidity_candidates.txt` with
+`--refresh-requested-only` to refresh auction prints only for the candidate set
+plus SPY. Other symbols' stored records are retained. Per-symbol end dates in the
+manifest allow a returning candidate to catch up from its last refresh, including
+the overlap. Split actions still refresh for every stored symbol to keep historical
+prices adjusted consistently. Use the last completed
 trading date for `--end` when the Alpaca plan does not permit querying the most
 recent SIP data.
 
@@ -334,12 +341,25 @@ history from the shortlist epoch, so new listings can enter later shortlist rebu
 
 The market-data download script rebuilds
 `/data/ppv1/updates/liquidity_candidates.txt` as the union of each session's top
-50 stocks by `volume * VWAP`, over the most recent 250 completed sessions on or
-after 2022-01-01. Symbols whose split-adjusted prices cannot fit the compact
+20 stocks by `volume * VWAP` (`SHORTLIST_DAILY_TOP=20`), over every completed session on or after
+2022-01-01 (`SHORTLIST_LOOKBACK_SESSIONS=0`). The standalone
+`build-liquidity-candidates` command also defaults to top 20 across all sessions
+since `--since`.
+This retains former liquidity leaders when downloading data for historical
+backtests. Symbols whose split-adjusted prices cannot fit the compact
 `int32` minute schema are excluded. This downloader-owned file lets the minute-bar
-and auction downloads follow the same universe.
+and auction downloads follow the same universe. The script refreshes auction prints
+only for the current candidate set plus SPY, retains other previously downloaded
+records, and backfills new candidates to the existing manifest's start date.
+The stored symbol count can therefore exceed the number being refreshed.
+A positive `SHORTLIST_LOOKBACK_SESSIONS` explicitly restricts downloads to
+a recent window and can omit historical candidates.
 
-The live rank independently recomputes the same candidate set in memory and
+This broadens historical data coverage; it does not recover delisted companies
+missing from the daily store or reconstruct historical asset eligibility. The
+backtester still needs point-in-time universe rules to reproduce live selection.
+
+The live rank independently computes a daily top-50 union over the trailing 250 sessions in memory and
 considers every currently eligible company in it, instead of relying on Alpaca's
 top-share-volume or top-trade-count activity feed. It never reads or writes the
 shared downloader artifact. Each rank only snapshots its own candidate set under
@@ -349,7 +369,7 @@ The longer ranked reserve remains in `ranking.candidates`, while
 `position.symbols` records the actual basket after entry-time conflict and
 duplicate-share-class filtering.
 
-`--shortlist-lookback-sessions` bounds the union to a trailing window so the
+For live ranking, `--shortlist-lookback-sessions` bounds the union to a trailing window so the
 shortlist tracks current liquidity. Without it, one session in the daily top 50
 in 2022 bought permanent candidacy and the list only ever grew: unioning all
 1,168 sessions since 2022-01-01 yields 724 candidates, of which 386 had not been
