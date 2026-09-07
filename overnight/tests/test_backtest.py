@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from pathlib import Path
 import tempfile
 
@@ -6,6 +7,7 @@ import numpy as np
 import pandas as pd
 from rich.console import Console
 
+from trading_rl.market_data.calendar import auction_close_minutes, short_entry_dates
 from trading_rl.overnight.backtest import (
     DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
@@ -42,6 +44,7 @@ def write_auction_npz(path: Path, rows: list[dict[str, object]]) -> None:
         price=np.asarray([row["price"] for row in rows], dtype=np.float64),
         size=np.asarray([row["size"] for row in rows], dtype=np.float64),
         exchange=np.asarray([row["exchange"] for row in rows]),
+        timestamp=np.asarray([row.get("timestamp", "") for row in rows]),
     )
 
 
@@ -363,6 +366,122 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertAlmostEqual(whole_summary["average_capital_utilization"], 0.8)
         self.assertAlmostEqual(fractional_summary["average_capital_utilization"], 1.0)
 
+    def test_short_session_is_skipped_for_entry_but_remains_the_prior_exit(self):
+        dates = pd.DatetimeIndex(
+            ["2026-11-24", "2026-11-25", "2026-11-27", "2026-11-30", "2026-12-01"]
+        )
+        symbols = np.array(["SPY", "A"])
+        dollar_volume = np.array(
+            [[1_000.0, 2_000.0 + index] for index in range(len(dates))]
+        )
+        entry_prices = np.full((len(dates), 2), 100.0)
+        morning_prices = np.full((len(dates), 2), 101.0)
+        staleness = np.zeros_like(entry_prices)
+
+        trades, summary = run_backtest(
+            dates=dates,
+            symbols=symbols,
+            dollar_volume=dollar_volume,
+            entry_prices=entry_prices,
+            morning_prices=morning_prices,
+            entry_staleness=staleness,
+            morning_staleness=staleness,
+            start_date=dates[1],
+            end_date=dates[4],
+            top=1,
+            ema_span=1,
+            min_history_days=1,
+            minimum_trading_days=1,
+            transaction_cost_bps=0.0,
+            max_entry_staleness_minutes=1,
+            max_exit_staleness_minutes=1,
+            liquidity_scheme="dollar_ema",
+            entry_session_mask=np.array([True, True, False, True, True]),
+        )
+
+        self.assertEqual(trades.entry_date.tolist(), ["2026-11-25", "2026-11-30"])
+        self.assertEqual(trades.exit_date.iloc[0], "2026-11-27")
+        self.assertEqual(summary["skipped_short_entry_sessions"], 1)
+
+    def test_auction_close_times_identify_short_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auctions.npz"
+            write_auction_npz(
+                path,
+                [
+                    {
+                        "symbol": "SPY",
+                        "date": "2026-11-25",
+                        "session": "close",
+                        "condition": "6",
+                        "price": 600.0,
+                        "size": 1_000,
+                        "timestamp": "2026-11-25T21:00:00Z",
+                        "exchange": "P",
+                    },
+                    {
+                        "symbol": "SPY",
+                        "date": "2026-11-27",
+                        "session": "close",
+                        "condition": "6",
+                        "price": 601.0,
+                        "size": 1_000,
+                        "timestamp": "2026-11-27T18:00:00Z",
+                        "exchange": "P",
+                    },
+                ],
+            )
+            closes = auction_close_minutes(
+                path, [date(2026, 11, 25), date(2026, 11, 27)]
+            )
+
+        self.assertEqual(closes[date(2026, 11, 25)], 16 * 60)
+        self.assertEqual(closes[date(2026, 11, 27)], 13 * 60)
+        self.assertEqual(
+            short_entry_dates(closes, 15 * 60 + 45), {date(2026, 11, 27)}
+        )
+
+    def test_nbbo_backtest_does_not_replace_a_selected_symbol_with_a_lower_rank(self):
+        dates = pd.date_range("2026-08-24", periods=4, freq="B")
+        symbols = np.array(["SPY", "HIGH", "LOW"])
+        dollar_volume = np.array(
+            [
+                [1_000.0, 3_000.0, 2_000.0],
+                [1_000.0, 3_100.0, 2_100.0],
+                [1_000.0, 3_200.0, 2_200.0],
+                [1_000.0, 3_300.0, 2_300.0],
+            ]
+        )
+        entry_prices = np.array([[100.0, 100.0, 100.0]] * 4)
+        entry_prices[2, 1] = np.nan
+        morning_prices = np.array([[100.0, 101.0, 101.0]] * 4)
+        staleness = np.zeros_like(entry_prices)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"fresh scheduled NBBO entry on 2026-08-26: HIGH",
+        ):
+            run_backtest(
+                dates=dates,
+                symbols=symbols,
+                dollar_volume=dollar_volume,
+                entry_prices=entry_prices,
+                morning_prices=morning_prices,
+                entry_staleness=staleness,
+                morning_staleness=staleness,
+                start_date=dates[2],
+                end_date=dates[3],
+                top=1,
+                ema_span=1,
+                min_history_days=1,
+                minimum_trading_days=1,
+                transaction_cost_bps=0.0,
+                max_entry_staleness_minutes=1,
+                max_exit_staleness_minutes=1,
+                liquidity_scheme="dollar_ema",
+                entry_price_source="nbbo-ask",
+            )
+
     def test_completed_trading_day_count_is_strictly_lagged(self):
         volume = np.array(
             [
@@ -552,13 +671,20 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "SPY.npy"
             np.save(path, bars)
-            dates, context_sod = reference_session_calendar(path)
+            dates, context_sod = reference_session_calendar(
+                path, {date(2026, 1, 6): 13 * 60}
+            )
 
-        self.assertEqual(dates.strftime("%Y-%m-%d").tolist(), ["2026-01-05", "2026-01-07"])
+        self.assertEqual(
+            dates.strftime("%Y-%m-%d").tolist(),
+            ["2026-01-05", "2026-01-06", "2026-01-07"],
+        )
         context_times = pd.to_datetime(
             context_sod, unit="s", origin="2010-01-01", utc=True
         ).tz_convert("America/New_York")
-        self.assertEqual(context_times.strftime("%H:%M").tolist(), ["04:00", "04:00"])
+        self.assertEqual(
+            context_times.strftime("%H:%M").tolist(), ["04:00", "04:00", "04:00"]
+        )
 
     def test_company_filter_rejects_funds_and_non_common_instruments(self):
         cases = (

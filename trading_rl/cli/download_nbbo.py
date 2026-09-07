@@ -17,19 +17,17 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
+from ..market_data.calendar import auction_close_minutes, short_entry_dates
 from .download_auctions import (
     _download_splits,
     _ordered_splits,
     _request_headers,
     _security_symbol,
-    symbols_from_file,
-    symbols_from_trade_csv,
 )
 
 
 QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes"
-DEFAULT_TRADING_URL = "https://paper-api.alpaca.markets/v2"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 FIELDNAMES = (
     "symbol",
     "date",
@@ -44,6 +42,8 @@ FIELDNAMES = (
 )
 EASTERN = ZoneInfo("America/New_York")
 RECENT_SIP_SAFETY_DELAY = timedelta(minutes=20)
+REFERENCE_SYMBOL = "SPY"
+DEFAULT_AUCTIONS_PATH = "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
 
 
 class RateLimiter:
@@ -94,18 +94,6 @@ def eligible_sessions(
     return eligible, len(values) - len(eligible)
 
 
-def _trading_headers() -> dict[str, str]:
-    key = os.environ.get("ALPACA_KEY") or os.environ.get("ALPACA_DATA_KEY")
-    secret = os.environ.get("ALPACA_SECRET") or os.environ.get("ALPACA_DATA_SECRET")
-    if not key or not secret:
-        raise RuntimeError("Alpaca credentials must be set")
-    return {
-        "APCA-API-KEY-ID": key,
-        "APCA-API-SECRET-KEY": secret,
-        "accept": "application/json",
-    }
-
-
 def _request_json(
     session: requests.Session,
     url: str,
@@ -135,27 +123,70 @@ def _request_json(
     raise AssertionError("request retry loop exited unexpectedly")
 
 
-def _calendar_days(
-    session: requests.Session,
-    start: str,
-    end: str,
-    limiter: RateLimiter,
-) -> list[date]:
-    payload = _request_json(
-        session,
-        os.environ.get("ALPACA_URL", DEFAULT_TRADING_URL).rstrip("/") + "/calendar",
-        _trading_headers(),
-        {"start": start, "end": end},
-        limiter,
-    )
-    if not isinstance(payload, list):
-        raise ValueError("Alpaca returned a non-list calendar response")
-    return sorted({pd.Timestamp(row["date"]).date() for row in payload})
-
-
 def _batches(values: list[str], size: int) -> Iterable[list[str]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def targets_from_trade_csv(path: Path) -> dict[date, set[str]]:
+    """Read the exact daily basket from a simulator trade CSV.
+
+    The union of symbols is deliberately not crossed with every date: membership may
+    rotate, and each symbol is requested only for the sessions on which it was selected.
+    """
+    try:
+        trades = pd.read_csv(path, usecols=["entry_date", "sample_id"])
+    except ValueError as error:
+        raise ValueError(
+            f"{path} must contain entry_date and sample_id columns"
+        ) from error
+    if trades.empty:
+        raise ValueError(f"NBBO target CSV is empty: {path}")
+    if trades[["entry_date", "sample_id"]].isna().any().any():
+        raise ValueError(f"NBBO target CSV contains blank dates or symbols: {path}")
+
+    targets: dict[date, set[str]] = {}
+    for raw_day, raw_symbol in trades[["entry_date", "sample_id"]].itertuples(
+        index=False, name=None
+    ):
+        try:
+            day = pd.Timestamp(raw_day).date()
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid NBBO target date {raw_day!r} in {path}") from error
+        symbol = _security_symbol(str(raw_symbol).strip())
+        if not symbol:
+            raise ValueError(f"blank NBBO target symbol on {day} in {path}")
+        targets.setdefault(day, set()).add(symbol)
+    return targets
+
+
+def merge_target_schedules(
+    schedules: Iterable[dict[date, set[str]]],
+) -> dict[date, set[str]]:
+    merged: dict[date, set[str]] = {}
+    for schedule in schedules:
+        for day, symbols in schedule.items():
+            merged.setdefault(day, set()).update(symbols)
+    if not merged:
+        raise ValueError("no NBBO symbol-date targets were provided")
+    return merged
+
+
+def _bounded_targets(
+    targets: dict[date, set[str]], start: str, end: str
+) -> dict[date, set[str]]:
+    start_day = pd.Timestamp(start).date()
+    end_day = pd.Timestamp(end).date()
+    if end_day < start_day:
+        raise ValueError(f"end {end} precedes start {start}")
+    bounded = {
+        day: set(symbols)
+        for day, symbols in targets.items()
+        if start_day <= day <= end_day
+    }
+    if not bounded:
+        raise ValueError(f"target schedule has no sessions from {start} through {end}")
+    return bounded
 
 
 def _valid_quote(record: object, target: datetime) -> bool:
@@ -241,18 +272,17 @@ def _quote_request(
 def _download_quote_rows(
     session: requests.Session,
     headers: dict[str, str],
-    symbols: list[str],
-    sessions: list[date],
+    targets: dict[date, set[str]],
     target: clock_time,
     batch_size: int,
     lookback_seconds: int,
     limiter: RateLimiter,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    missing = 0
+    sessions = sorted(targets)
     for day in tqdm(sessions, desc="Downloading scheduled NBBO", unit="session"):
         target_at = target_timestamp(day, target)
-        for batch in _batches(symbols, batch_size):
+        for batch in _batches(sorted(targets[day]), batch_size):
             # A tight batch query is efficient for liquid names. Any absent name gets
             # a single-symbol fallback over the full allowed staleness interval.
             payload = _quote_request(
@@ -266,8 +296,11 @@ def _download_quote_rows(
             )
             selected = select_causal_quotes(payload, day, target_at)
             for symbol in batch:
-                if symbol in selected:
-                    rows.append(selected[symbol])
+                candidate = selected.get(symbol)
+                if candidate is not None and _quote_staleness_seconds(
+                    candidate, target_at
+                ) <= lookback_seconds:
+                    rows.append(candidate)
                     continue
                 fallback = _quote_request(
                     session,
@@ -279,13 +312,22 @@ def _download_quote_rows(
                     1,
                 )
                 candidate = select_causal_quotes(fallback, day, target_at).get(symbol)
-                if candidate is None:
-                    missing += 1
-                else:
-                    rows.append(candidate)
-    if missing:
-        print(f"summary: {missing:,} symbol-sessions had no causal quote")
+                if candidate is None or _quote_staleness_seconds(
+                    candidate, target_at
+                ) > lookback_seconds:
+                    raise ValueError(
+                        f"no valid causal SIP NBBO within {lookback_seconds}s for "
+                        f"{day.isoformat()}:{symbol}"
+                    )
+                rows.append(candidate)
     return rows
+
+
+def _quote_staleness_seconds(row: dict[str, object], target: datetime) -> float:
+    stamp = pd.Timestamp(str(row["timestamp"]))
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize(timezone.utc)
+    return float((pd.Timestamp(target) - stamp).total_seconds())
 
 
 def _ordered_unique_rows(
@@ -298,16 +340,12 @@ def _ordered_unique_rows(
 def merge_quote_rows(
     existing_rows: Iterable[dict[str, object]],
     refreshed_rows: Iterable[dict[str, object]],
-    refreshed_symbols: set[str],
-    refresh_start: str,
+    refreshed_dates: set[str],
 ) -> list[dict[str, object]]:
     kept = [
         row
         for row in existing_rows
-        if not (
-            str(row["symbol"]) in refreshed_symbols
-            and str(row["date"]) >= refresh_start
-        )
+        if str(row["date"]) not in refreshed_dates
     ]
     return _ordered_unique_rows([*kept, *refreshed_rows])
 
@@ -386,8 +424,13 @@ def _atomic_write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
 
 def _load_raw_rows(path: Path) -> list[dict[str, object]]:
     with np.load(path, allow_pickle=False) as data:
-        if int(np.asarray(data["format_version"]).item()) != FORMAT_VERSION:
-            raise ValueError("unsupported NBBO NPZ format version")
+        found_version = int(np.asarray(data["format_version"]).item())
+        if found_version != FORMAT_VERSION:
+            raise ValueError(
+                f"NBBO dataset format {found_version} cannot be updated as strict "
+                f"symbol-date format {FORMAT_VERSION}; rebuild it with "
+                "--targets-from-trades"
+            )
         count = len(data["symbol"])
         return [
             {
@@ -415,6 +458,8 @@ def _write_dataset(
     end: str,
     target: clock_time,
     lookback_seconds: int,
+    target_count: int,
+    target_session_count: int,
     update_metadata: dict[str, object] | None = None,
 ) -> None:
     ordered = _ordered_unique_rows(rows)
@@ -429,10 +474,12 @@ def _write_dataset(
         "target_time": target.strftime("%H:%M"),
         "selection": "latest valid SIP NBBO at or before target",
         "max_staleness_seconds": lookback_seconds,
+        "scheduled_target_count": target_count,
+        "scheduled_session_count": target_session_count,
         "symbols": symbols,
         "symbol_count": len(symbols),
         "quote_count": len(ordered),
-        "format": "numpy-npz-columnar-v1",
+        "format": "numpy-npz-columnar-v2",
         "prices": "split-adjusted",
         "raw_prices_embedded": True,
         "split_ledger_embedded": True,
@@ -454,7 +501,7 @@ def _write_dataset(
 
 
 def _fetch(
-    symbols: list[str],
+    targets: dict[date, set[str]],
     start: str,
     end: str,
     target: clock_time,
@@ -464,47 +511,65 @@ def _fetch(
 ) -> tuple[list[dict[str, object]], int]:
     limiter = RateLimiter(requests_per_minute)
     headers = _request_headers()
+    requested = _bounded_targets(targets, start, end)
+    eligible, deferred = eligible_sessions(sorted(requested), target)
+    eligible_targets = {day: requested[day] for day in eligible}
+    if not eligible_targets:
+        return [], deferred
     with requests.Session() as session:
-        sessions = _calendar_days(session, start, end, limiter)
-        sessions, deferred = eligible_sessions(sessions, target)
         rows = _download_quote_rows(
             session,
             headers,
-            symbols,
-            sessions,
+            eligible_targets,
             target,
             batch_size,
             lookback_seconds,
             limiter,
         )
+    expected = sum(len(eligible_targets[day]) for day in eligible_targets)
+    if len(rows) != expected:
+        raise AssertionError(f"downloaded {len(rows):,}/{expected:,} scheduled NBBO targets")
     return rows, deferred
 
 
 def download_nbbo(
-    symbols: list[str],
+    targets: dict[date, set[str]],
     start: str,
     end: str,
     output: Path,
     target: clock_time,
-    batch_size: int = 10,
+    batch_size: int = 100,
     lookback_seconds: int = 60,
     requests_per_minute: int = 180,
 ) -> tuple[int, int, int]:
+    targets = _bounded_targets(targets, start, end)
     rows, deferred = _fetch(
-        symbols, start, end, target, batch_size, lookback_seconds, requests_per_minute
+        targets, start, end, target, batch_size, lookback_seconds, requests_per_minute
     )
+    symbols = sorted({symbol for values in targets.values() for symbol in values})
     headers = _request_headers()
     split_end = max(pd.Timestamp(end).date(), datetime.now(timezone.utc).date()).isoformat()
     with requests.Session() as session:
         splits = _download_splits(session, headers, symbols, start, split_end)
-    _write_dataset(output, rows, splits, symbols, start, end, target, lookback_seconds)
+    _write_dataset(
+        output,
+        rows,
+        splits,
+        symbols,
+        start,
+        end,
+        target,
+        lookback_seconds,
+        sum(len(values) for values in targets.values()),
+        len(targets),
+    )
     return len(symbols), len(_ordered_unique_rows(rows)), deferred
 
 
 def update_nbbo(
     output: Path,
     end: str,
-    additional_symbols: set[str],
+    targets: dict[date, set[str]],
     overlap_days: int,
     batch_size: int,
     lookback_seconds: int,
@@ -531,11 +596,12 @@ def update_nbbo(
         pd.Timestamp(start).date(),
         pd.Timestamp(previous_end).date() - timedelta(days=overlap_days - 1),
     ).isoformat()
-    existing_symbols = {_security_symbol(value) for value in manifest["symbols"]}
-    new_symbols = {_security_symbol(value) for value in additional_symbols} - existing_symbols
-    all_symbols = sorted(existing_symbols | new_symbols)
+    existing_rows = _load_raw_rows(output)
+    existing_symbols = {str(row["symbol"]) for row in existing_rows}
+    scheduled_symbols = {symbol for values in targets.values() for symbol in values}
+    all_symbols = sorted(existing_symbols | scheduled_symbols)
     refreshed, deferred = _fetch(
-        sorted(existing_symbols),
+        targets,
         refresh_start,
         end,
         target,
@@ -543,26 +609,16 @@ def update_nbbo(
         lookback_seconds,
         requests_per_minute,
     )
-    if new_symbols:
-        new_rows, new_deferred = _fetch(
-            sorted(new_symbols),
-            start,
-            end,
-            target,
-            batch_size,
-            lookback_seconds,
-            requests_per_minute,
-        )
-        refreshed.extend(new_rows)
-        deferred += new_deferred
     # Refresh the complete split ledger once for the final universe.
     headers = _request_headers()
     split_end = max(pd.Timestamp(end).date(), datetime.now(timezone.utc).date()).isoformat()
     with requests.Session() as session:
         splits = _download_splits(session, headers, all_symbols, start, split_end)
-    merged = merge_quote_rows(
-        _load_raw_rows(output), refreshed, existing_symbols | new_symbols, refresh_start
-    )
+    # A target still inside the delayed-SIP window is deferred by _fetch.  Derive
+    # replacement dates from rows actually fetched so deferral cannot erase a
+    # previously stored session during an overlap update.
+    refreshed_days = {str(row["date"]) for row in refreshed}
+    merged = merge_quote_rows(existing_rows, refreshed, refreshed_days)
     _write_dataset(
         output,
         merged,
@@ -572,11 +628,14 @@ def update_nbbo(
         end,
         target,
         lookback_seconds,
+        sum(len(values) for values in targets.values()),
+        len(targets),
         {
             "previous_end": previous_end,
             "refresh_start": refresh_start,
             "overlap_days": overlap_days,
-            "new_symbols": sorted(new_symbols),
+            "scheduled_symbols": sorted(scheduled_symbols),
+            "scheduled_target_count": sum(len(values) for values in targets.values()),
         },
     )
     return len(all_symbols), len(merged), deferred
@@ -585,55 +644,89 @@ def update_nbbo(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", default=None)
-    parser.add_argument("--end", default=default_end())
+    parser.add_argument("--end", default=None)
     parser.add_argument("--target-time", type=parse_target_time, default=None)
+    parser.add_argument(
+        "--auctions-path",
+        default=DEFAULT_AUCTIONS_PATH,
+        help="auction NPZ used for official session-close times",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--overlap-days", type=int, default=7)
     parser.add_argument("--lookback-seconds", type=int, default=60)
-    parser.add_argument("--symbols-from-trades", action="append", default=[])
-    parser.add_argument("--symbols-file", action="append", default=[])
-    parser.add_argument("--symbols", default="")
-    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument(
+        "--targets-from-trades",
+        "--symbols-from-trades",
+        dest="targets_from_trades",
+        action="append",
+        default=[],
+        metavar="CSV",
+        help=(
+            "simulator trade CSV containing entry_date and sample_id; may be repeated. "
+            "The older --symbols-from-trades spelling remains an alias"
+        ),
+    )
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--requests-per-minute", type=int, default=180)
     args = parser.parse_args()
-    if not args.update and not args.start:
-        parser.error("--start is required unless --update is used")
     if min(args.overlap_days, args.lookback_seconds, args.batch_size, args.requests_per_minute) < 1:
         parser.error("overlap, lookback, batch size, and request rate must be positive")
-    symbols = {_security_symbol(value) for value in args.symbols.split(",") if value.strip()}
-    for value in args.symbols_from_trades:
-        symbols.update(symbols_from_trade_csv(Path(value)))
-    for value in args.symbols_file:
-        symbols.update(symbols_from_file(Path(value)))
+    if not args.targets_from_trades:
+        parser.error("at least one --targets-from-trades CSV is required")
     output = Path(args.output)
     if output.suffix.lower() != ".npz":
         parser.error("--output must end in .npz")
+    target = args.target_time
+    manifest_path = output.with_suffix(".json")
+    if target is None and args.update and manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        target = parse_target_time(str(manifest["target_time"]))
+    target = target or parse_target_time("15:45")
+    targets = merge_target_schedules(
+        targets_from_trade_csv(Path(value)) for value in args.targets_from_trades
+    )
+    # The simulator prices SPY at the same entry source for its benchmark.  Keep
+    # that reference observation alongside each day's rotating strategy basket.
+    for day_symbols in targets.values():
+        day_symbols.add(REFERENCE_SYMBOL)
+    close_minutes = auction_close_minutes(Path(args.auctions_path), targets)
+    shortened = short_entry_dates(
+        close_minutes, target.hour * 60 + target.minute
+    )
+    targets = {day: symbols for day, symbols in targets.items() if day not in shortened}
+    if not targets:
+        parser.error("all scheduled NBBO targets fall on shortened sessions")
+    end = args.end or max(targets).isoformat()
     if args.update:
         count, quotes, deferred = update_nbbo(
             output,
-            args.end,
-            symbols,
+            end,
+            targets,
             args.overlap_days,
             args.batch_size,
             args.lookback_seconds,
             args.requests_per_minute,
-            args.target_time,
+            target,
         )
     else:
-        symbols.add("SPY")
-        target = args.target_time or parse_target_time("15:45")
+        start = args.start or min(targets).isoformat()
         count, quotes, deferred = download_nbbo(
-            sorted(symbols),
-            str(args.start),
-            args.end,
+            targets,
+            start,
+            end,
             output,
             target,
             args.batch_size,
             args.lookback_seconds,
             args.requests_per_minute,
         )
-    suffix = f"; deferred {deferred} session(s) inside the SIP delay" if deferred else ""
+    parts = []
+    if shortened:
+        parts.append(f"skipped {len(shortened)} shortened session(s)")
+    if deferred:
+        parts.append(f"deferred {deferred} session(s) inside the SIP delay")
+    suffix = "; " + "; ".join(parts) if parts else ""
     print(f"wrote {quotes:,} scheduled NBBO quotes for {count} symbols to {output}{suffix}")
 
 

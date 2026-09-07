@@ -42,6 +42,7 @@ from trading_rl.market_data.bars import (
     encode_alpaca_bars,
     merge_bar_arrays,
 )
+from trading_rl.market_data.calendar import calendar_session_supports_entry
 
 from .backtest import (
     DEFAULT_SECURITY_MASTER_CACHE,
@@ -1195,12 +1196,29 @@ def _next_session(client: AlpacaClient, current: date) -> date:
 
 
 def _market_session_status(
-    client: AlpacaClient, current: date
-) -> tuple[bool, date | None]:
-    """Return whether ``current`` is a session and the following session date."""
-    sessions = _calendar_dates(client.calendar(current, current + timedelta(days=10)))
+    client: AlpacaClient,
+    current: date,
+    entry_time: time | None = None,
+) -> tuple[bool, date | None] | tuple[bool, date | None, bool]:
+    """Return session status, next date, and optionally entry eligibility."""
+    calendar = client.calendar(current, current + timedelta(days=10))
+    sessions = _calendar_dates(calendar)
     is_session = current in sessions
     next_session = next((session for session in sessions if session > current), None)
+    if entry_time is not None:
+        current_record = next(
+            (
+                session
+                for session in calendar
+                if str(session.get("date")) == current.isoformat()
+            ),
+            None,
+        )
+        supports_entry = bool(
+            current_record is not None
+            and calendar_session_supports_entry(current_record, entry_time)
+        )
+        return is_session, next_session, supports_entry
     return is_session, next_session
 
 
@@ -2411,6 +2429,7 @@ def run_daemon(
     last_attempts: dict[str, datetime] = {}
     calendar_date: date | None = None
     is_trading_session = False
+    entry_session_eligible = False
     next_trading_session: date | None = None
 
     def may_attempt(key: str, current: datetime) -> bool:
@@ -2429,8 +2448,12 @@ def run_daemon(
                 if not may_attempt("calendar", now):
                     time_module.sleep(sleep_seconds)
                     continue
-                is_trading_session, next_trading_session = _market_session_status(
-                    client, today
+                (
+                    is_trading_session,
+                    next_trading_session,
+                    entry_session_eligible,
+                ) = _market_session_status(
+                    client, today, entry_time
                 )
                 calendar_date = today
                 if not is_trading_session:
@@ -2443,6 +2466,13 @@ def run_daemon(
                         "%s is not an Alpaca trading session; idling until %s",
                         today,
                         next_label,
+                    )
+                elif not entry_session_eligible:
+                    LOGGER.info(
+                        "%s is a shortened session; exits remain enabled and the %s "
+                        "entry is skipped",
+                        today,
+                        entry_time.strftime("%H:%M"),
                     )
             if not is_trading_session:
                 last_error_key = None
@@ -2487,7 +2517,8 @@ def run_daemon(
                 minutes=minimum_ranking_lead_minutes
             )
             if (
-                rank_start <= now <= ranking_deadline
+                entry_session_eligible
+                and rank_start <= now <= ranking_deadline
                 and (
                     ranking.get("trade_date") != today.isoformat()
                     or ranking.get("ranking_pipeline_version")
@@ -2516,7 +2547,12 @@ def run_daemon(
             ranking_early = ranking_ready and _ranking_is_early_enough(
                 ranking, entry_at, minimum_ranking_lead_minutes
             )
-            if preflight_due and ranking_early and may_attempt("entry-preflight", now):
+            if (
+                entry_session_eligible
+                and preflight_due
+                and ranking_early
+                and may_attempt("entry-preflight", now)
+            ):
                 _validate_live_clock(client, today)
                 prepared = enter_for_day(
                     client,
@@ -2550,7 +2586,8 @@ def run_daemon(
                 today, time(16, 0)
             )
             if (
-                (new_entry_due or restart_due)
+                entry_session_eligible
+                and (new_entry_due or restart_due)
                 and ranking_early
                 and may_attempt("entry", now)
             ):
@@ -2570,7 +2607,8 @@ def run_daemon(
                 _print_entry_plan(result, True)
                 artifacts.write_summary(today, "enter", store, config)
             elif (
-                new_entry_due
+                entry_session_eligible
+                and new_entry_due
                 and not ranking_early
                 and may_attempt("missing-ranking", now)
             ):
@@ -3070,6 +3108,20 @@ def main() -> None:
         data_secret=data_secret,
     )
     try:
+        if args.action in {"rank", "preview", "enter"}:
+            is_session, _next_date, supports_entry = _market_session_status(
+                client, trade_date, args.entry_time
+            )
+            if is_session and not supports_entry:
+                message = (
+                    f"{trade_date} is a shortened session; skipping the "
+                    f"{args.entry_time:%H:%M} entry"
+                )
+                CONSOLE.print(message)
+                artifacts.write_summary(
+                    trade_date, "skip-short-session", store, config
+                )
+                return
         if args.action == "rank":
             _print_ranking(
                 rank_for_day(client, store, config, trade_date, artifacts=artifacts),

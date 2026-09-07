@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 from trading_rl.cli import download_nbbo
 
@@ -22,6 +25,58 @@ def quote_row(symbol: str, day: str, ask: float) -> dict[str, object]:
 
 
 class DownloadNbboTest(unittest.TestCase):
+    def test_trade_csv_preserves_rotating_daily_membership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades.csv"
+            path.write_text(
+                "entry_date,sample_id\n"
+                "2026-09-01,AAPL\n"
+                "2026-09-01,MSFT\n"
+                "2026-09-02,MSFT\n"
+                "2026-09-02,NVDA\n"
+            )
+
+            targets = download_nbbo.targets_from_trade_csv(path)
+
+        self.assertEqual(targets[date(2026, 9, 1)], {"AAPL", "MSFT"})
+        self.assertEqual(targets[date(2026, 9, 2)], {"MSFT", "NVDA"})
+        self.assertEqual(set().union(*targets.values()), {"AAPL", "MSFT", "NVDA"})
+
+    def test_downloader_queries_only_each_days_members(self):
+        targets = {
+            date(2026, 9, 1): {"AAPL", "MSFT"},
+            date(2026, 9, 2): {"MSFT", "NVDA"},
+        }
+
+        def response(_session, _headers, _limiter, symbols, _start, target, _limit):
+            stamp = target.isoformat().replace("+00:00", "Z")
+            return {
+                "quotes": {
+                    symbol: [
+                        {"t": stamp, "bp": 99.9, "ap": 100.0, "bs": 1, "as": 2}
+                    ]
+                    for symbol in symbols
+                }
+            }
+
+        with mock.patch.object(
+            download_nbbo, "_quote_request", side_effect=response
+        ) as request:
+            rows = download_nbbo._download_quote_rows(
+                mock.Mock(),
+                {},
+                targets,
+                time(15, 45),
+                100,
+                60,
+                download_nbbo.RateLimiter(10_000),
+            )
+
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].args[3], ["AAPL", "MSFT"])
+        self.assertEqual(request.call_args_list[1].args[3], ["MSFT", "NVDA"])
+
     def test_selects_latest_quote_at_or_before_target(self):
         day = date(2026, 9, 2)
         target = datetime(2026, 9, 2, 19, 45, tzinfo=timezone.utc)
@@ -59,7 +114,7 @@ class DownloadNbboTest(unittest.TestCase):
         self.assertEqual(float(arrays["ask_size"][0]), 2_000.0)
         self.assertEqual(float(arrays["raw_ask_price"][0]), 1_200.0)
 
-    def test_overlap_replaces_only_refreshed_symbol_tail(self):
+    def test_overlap_replaces_the_complete_refreshed_date_membership(self):
         existing = [
             quote_row("AAPL", "2026-08-24", 100.0),
             quote_row("AAPL", "2026-08-25", 101.0),
@@ -67,18 +122,44 @@ class DownloadNbboTest(unittest.TestCase):
         ]
         refreshed = [quote_row("AAPL", "2026-08-25", 101.5)]
 
-        merged = download_nbbo.merge_quote_rows(
-            existing, refreshed, {"AAPL"}, "2026-08-25"
-        )
+        merged = download_nbbo.merge_quote_rows(existing, refreshed, {"2026-08-25"})
 
         self.assertEqual(
             [(row["symbol"], row["date"], row["ask_price"]) for row in merged],
             [
                 ("AAPL", "2026-08-24", 100.0),
                 ("AAPL", "2026-08-25", 101.5),
-                ("MSFT", "2026-08-25", 500.0),
             ],
         )
+
+    def test_missing_or_overly_stale_target_fails_the_download(self):
+        target = datetime(2026, 9, 2, 19, 45, tzinfo=timezone.utc)
+        stale = {
+            "quotes": {
+                "AAPL": [
+                    {
+                        "t": "2026-09-02T19:43:00Z",
+                        "bp": 99.9,
+                        "ap": 100.0,
+                        "bs": 1,
+                        "as": 2,
+                    }
+                ]
+            }
+        }
+        with mock.patch.object(download_nbbo, "_quote_request", return_value=stale):
+            with self.assertRaisesRegex(
+                ValueError, r"within 60s.*2026-09-02:AAPL"
+            ):
+                download_nbbo._download_quote_rows(
+                    mock.Mock(),
+                    {},
+                    {date(2026, 9, 2): {"AAPL"}},
+                    target.astimezone(download_nbbo.EASTERN).time().replace(tzinfo=None),
+                    100,
+                    60,
+                    download_nbbo.RateLimiter(10_000),
+                )
 
     def test_current_snapshot_is_deferred_until_sip_delay_passes(self):
         sessions, deferred = download_nbbo.eligible_sessions(

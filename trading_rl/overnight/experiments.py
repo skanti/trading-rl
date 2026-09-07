@@ -66,6 +66,7 @@ import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
+from ..market_data.calendar import auction_close_minutes
 from .backtest import (
     DEFAULT_AUCTIONS_PATH,
     DEFAULT_DAILY_DATA_DIR,
@@ -164,7 +165,10 @@ def build_panel(
     workers: int,
 ) -> Panel:
     """Assemble the ranking inputs plus a price matrix per candidate clock minute."""
-    all_dates, all_context = reference_session_calendar(minute_dir / f"{REFERENCE_SYMBOL}.npy")
+    session_closes = auction_close_minutes(auctions_path, None)
+    all_dates, all_context = reference_session_calendar(
+        minute_dir / f"{REFERENCE_SYMBOL}.npy", session_closes
+    )
     end_index = len(all_dates) - 1
     requested_start = pd.Timestamp(all_dates[end_index]) - pd.DateOffset(months=int(months))
     first_entry = int(np.flatnonzero(all_dates >= requested_start)[0])

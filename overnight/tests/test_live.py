@@ -292,6 +292,20 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
             ],
         )
 
+    def test_market_session_status_disables_only_entry_on_a_short_day(self):
+        class CalendarBroker:
+            def calendar(self, start, end):
+                return [
+                    {"date": "2026-11-27", "open": "09:30", "close": "13:00"},
+                    {"date": "2026-11-30", "open": "09:30", "close": "16:00"},
+                ]
+
+        status = _market_session_status(
+            CalendarBroker(), date(2026, 11, 27), datetime.strptime("15:45", "%H:%M").time()
+        )
+
+        self.assertEqual(status, (True, date(2026, 11, 30), False))
+
     def test_whole_share_preview_prints_per_symbol_and_total_sizing(self):
         console = Console(record=True, width=140, color_system=None)
         _print_entry_plan(

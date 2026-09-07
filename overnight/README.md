@@ -121,7 +121,7 @@ the live path can require a specific completed session and fail closed without
 partially updating its cache.
 
 To refresh the broad daily store, rebuild the dollar-volume shortlist, extend
-auction and scheduled-NBBO data, and update shortlist minute bars in one pass, run:
+auction data, and update shortlist minute bars in one pass, run:
 
 ```bash
 ../scripts/download_latest_bars_and_auctions.sh
@@ -132,8 +132,9 @@ tradable, fractionable Nasdaq company stocks. Only that current universe is
 refreshed, while historical and delisted `.npy` files already in the bar stores are
 retained for backtests. It then loads `overnight/.env` by default and accepts
 environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
-overlap/shortlist settings shown by `--help`. Auction and NBBO updates use the
-current New York date; snapshots still inside Alpaca's delayed-SIP window are deferred
+overlap/shortlist settings shown by `--help`. Auction updates use the current New
+York date. An optional NBBO update runs last when `NBBO_TARGETS_PATH` names a
+simulator trade CSV; targets still inside Alpaca's delayed-SIP window are deferred
 and filled by the next overlap refresh.
 The shortlist is ordered by consistent daily top-N appearances, then trailing
 average liquidity, so its most persistently liquid symbols enter the concurrent
@@ -226,12 +227,43 @@ python backtest.py \
   --transaction-cost-bps 1
 ```
 
-For a causal spread-aware entry, the wrapper also maintains
-`alpaca_nbbo_1545_2022-01-01.npz`. It stores the latest valid SIP bid/ask at or before
-15:45 ET, never a later quote, with raw and split-adjusted fields. Use it in a backtest
-with `--entry-price-source nbbo-ask`; the backward-compatible default remains
-`minute-bar`. The NBBO source requires `--entry-time 15:45`. A buy is benchmarked at
-the ask, while the existing transaction-cost assumption remains separately visible.
+For a causal spread-aware entry, generate a normal minute-bar backtest CSV and use its
+exact `(entry_date, sample_id)` basket as the NBBO download schedule:
+
+```bash
+trading-backtest \
+  --since 2024-01-01 \
+  --entry-price-source minute-bar \
+  --output-csv /tmp/overnight_nbbo_targets.csv
+
+download-nbbo \
+  --targets-from-trades /tmp/overnight_nbbo_targets.csv \
+  --output /data/ppv1/updates/alpaca_nbbo_1545_2024-01-01.npz
+```
+
+The downloader stores the latest valid SIP bid/ask at or before 15:45 ET, never a
+later quote, with raw and split-adjusted fields. It requests only each session's
+selected basket rather than crossing every symbol that appeared during the entire
+window with every date. Basket rotation is therefore preserved: a multi-month run may
+contain many unique symbols, but normally only that day's 12 targets plus the SPY
+benchmark are queried in a single batch. Any target without a valid quote inside
+`--lookback-seconds` (60 seconds by default) aborts the download before the dataset is
+replaced. Version-1 broad-union NBBO files must be rebuilt once with the target CSV.
+
+Use the resulting dataset in a backtest with `--entry-price-source nbbo-ask`; the
+backward-compatible default remains `minute-bar`. The NBBO source requires
+`--entry-time 15:45`. A buy is benchmarked at the ask, while the existing
+transaction-cost assumption remains separately visible. Set `NBBO_TARGETS_PATH` to
+the same trade CSV when running the all-in-one downloader wrapper; without it the
+wrapper explicitly skips the optional NBBO update.
+
+Afternoon entries are skipped on shortened sessions whose official close is at or
+before the configured entry time. Historical runs read the close from the auction NPZ
+(`--auctions-path`); the NBBO downloader uses the same file, and the live daemon uses
+Alpaca's session-specific calendar close. The shortened date remains in the session
+calendar so a position entered on the preceding full day can still exit at its normal
+09:30 opening auction. Regenerate the minute-bar target CSV after changing this policy;
+do not widen NBBO staleness to carry a 13:00 quote forward to 15:45.
 
 `--entry-time` defaults to 15:45 rather than the close. The selected basket
 drifts about 3.5 bps upward between 15:45 and 15:59 (t=2.66 over 500 sessions),

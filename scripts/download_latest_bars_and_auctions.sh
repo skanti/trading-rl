@@ -13,6 +13,7 @@ DAILY_BARS_DIR="${DAILY_BARS_DIR:-$UPDATES_DIR/bars_1day_$BAR_SINCE}"
 MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_$BAR_SINCE}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
 NBBO_PATH="${NBBO_PATH:-$UPDATES_DIR/alpaca_nbbo_1545_2022-01-01.npz}"
+NBBO_TARGETS_PATH="${NBBO_TARGETS_PATH:-}"
 MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 # Keep the mutable download universe beside the market-data stores, not in the
 # tracked repository. MOST_LIQUID_PATH remains a compatibility override.
@@ -35,8 +36,9 @@ LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 usage() {
   cat <<'EOF'
 Refresh the current eligible company-stock universe, update its split-adjusted
-daily bars, rebuild the dollar-volume shortlist, update auctions and scheduled
-15:45 NBBO snapshots, and then update minute bars for the shortlist plus SPY.
+daily bars, rebuild the dollar-volume shortlist, update auctions, and then update
+minute bars for the shortlist plus SPY. When NBBO_TARGETS_PATH is set, the final
+step updates strict scheduled 15:45 NBBO targets from that simulator trade CSV.
 Historical bar files are retained.
 
 Usage:
@@ -58,6 +60,7 @@ Common environment overrides:
   AUCTION_OVERLAP_DAYS=7
   NBBO_OVERLAP_DAYS=7
   NBBO_TARGET_TIME=15:45
+  NBBO_TARGETS_PATH=/tmp/overnight_trades.csv
   SHORTLIST_SINCE=2022-01-01
   SHORTLIST_DAILY_TOP=50
   SHORTLIST_LOOKBACK_SESSIONS=250
@@ -177,28 +180,6 @@ else
     --output "$AUCTIONS_PATH"
 fi
 
-log "Updating scheduled $NBBO_TARGET_TIME ET SIP NBBO snapshots through $auction_end"
-if [[ -f "$NBBO_PATH" && -f "${NBBO_PATH%.npz}.json" ]]; then
-  "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
-    --update \
-    --end "$auction_end" \
-    --target-time "$NBBO_TARGET_TIME" \
-    --overlap-days "$NBBO_OVERLAP_DAYS" \
-    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
-    --symbols SPY \
-    --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
-    --output "$NBBO_PATH"
-else
-  "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
-    --start "$NBBO_START" \
-    --end "$auction_end" \
-    --target-time "$NBBO_TARGET_TIME" \
-    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
-    --symbols SPY \
-    --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
-    --output "$NBBO_PATH"
-fi
-
 # The minute universe is fully derived from the liquidity-prioritized shortlist,
 # so it lives in a scratch file the exit trap removes. The durable record of what
 # the store holds is _symbols.txt inside the store itself, written once the
@@ -227,5 +208,35 @@ check_failures "$MINUTE_BARS_DIR"
 
 cp -- "$minute_symbols_tmp" "$MINUTE_BARS_DIR/_symbols.txt.part"
 mv -- "$MINUTE_BARS_DIR/_symbols.txt.part" "$MINUTE_BARS_DIR/_symbols.txt"
+
+if [[ -n "$NBBO_TARGETS_PATH" ]]; then
+  if [[ ! -f "$NBBO_TARGETS_PATH" ]]; then
+    echo "NBBO target trade CSV does not exist: $NBBO_TARGETS_PATH" >&2
+    exit 1
+  fi
+  log "Updating scheduled $NBBO_TARGET_TIME ET SIP NBBO targets through $auction_end"
+  if [[ -f "$NBBO_PATH" && -f "${NBBO_PATH%.npz}.json" ]]; then
+    "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
+      --update \
+      --end "$auction_end" \
+      --target-time "$NBBO_TARGET_TIME" \
+      --overlap-days "$NBBO_OVERLAP_DAYS" \
+      --targets-from-trades "$NBBO_TARGETS_PATH" \
+      --auctions-path "$AUCTIONS_PATH" \
+      --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
+      --output "$NBBO_PATH"
+  else
+    "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
+      --start "$NBBO_START" \
+      --end "$auction_end" \
+      --target-time "$NBBO_TARGET_TIME" \
+      --targets-from-trades "$NBBO_TARGETS_PATH" \
+      --auctions-path "$AUCTIONS_PATH" \
+      --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
+      --output "$NBBO_PATH"
+  fi
+else
+  log "Skipping optional NBBO update; set NBBO_TARGETS_PATH to a simulator trade CSV"
+fi
 
 log "Market-data update complete through $auction_end"

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import io
 import json
 import os
@@ -29,6 +29,7 @@ from rich.table import Table
 from tqdm import tqdm
 import requests
 
+from ..market_data.calendar import auction_close_minutes, short_entry_dates
 from .price_utils import forward_fill_positions
 
 
@@ -673,8 +674,11 @@ def _parse_percentage(value: str) -> float:
     return percent / 100.0
 
 
-def reference_session_calendar(reference_path: Path) -> tuple[pd.DatetimeIndex, np.ndarray]:
-    """Derive complete New York sessions directly from the reference minute bars."""
+def reference_session_calendar(
+    reference_path: Path,
+    session_close_minutes: Mapping[date, int] | None = None,
+) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """Derive New York trading sessions directly from the reference minute bars."""
     if not reference_path.exists():
         raise FileNotFoundError(f"reference minute bars do not exist: {reference_path}")
     source = np.load(reference_path, mmap_mode="r")
@@ -691,7 +695,14 @@ def reference_session_calendar(reference_path: Path) -> tuple[pd.DatetimeIndex, 
     for day_offset in range(first_day, last_day + 1):
         session_date = (BAR_ORIGIN + timedelta(days=day_offset)).date()
         regular_open = datetime.combine(session_date, time(9, 30), tzinfo=EASTERN)
-        regular_close = datetime.combine(session_date, time(16), tzinfo=EASTERN)
+        close_minute = (session_close_minutes or {}).get(
+            session_date, REGULAR_CLOSE_MINUTE
+        )
+        regular_close = datetime.combine(
+            session_date,
+            time(close_minute // 60, close_minute % 60),
+            tzinfo=EASTERN,
+        )
         open_second = int((regular_open.astimezone(timezone.utc) - BAR_ORIGIN).total_seconds())
         close_second = int(
             (regular_close.astimezone(timezone.utc) - BAR_ORIGIN).total_seconds()
@@ -707,8 +718,9 @@ def reference_session_calendar(reference_path: Path) -> tuple[pd.DatetimeIndex, 
             or int(aligned[0]) > open_second + 30 * 60
             or int(aligned[-1]) < close_second - 30 * 60
         ):
-            # Holidays, half-days, and materially incomplete sessions do not
-            # provide the full 15:59 entry window modeled by this strategy.
+            # Holidays and sessions without a usable opening are omitted. A
+            # shortened session stays because it can still be the morning exit for
+            # the preceding position; its afternoon entry is disabled separately.
             continue
         context_open = datetime.combine(session_date, time(4), tzinfo=EASTERN)
         context_second = int(
@@ -1210,6 +1222,9 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         f"{summary['last_exit_date']} {str(summary['exit_time_eastern']).split()[0]} Eastern",
     )
     details.add_row("Sessions / trades", f"{strategy['periods']} / {summary['trades']:,}")
+    skipped_short = int(summary.get("skipped_short_entry_sessions", 0))
+    if skipped_short:
+        details.add_row("Short sessions", f"{skipped_short} afternoon entries skipped")
     details.add_row(
         "Liquidity ranking",
         _metric_text(summary),
@@ -1388,6 +1403,7 @@ def run_backtest(
     entry_price_source: str = "minute-bar",
     exit_price_source: str = "opening-auction",
     execution_exchange_mask: np.ndarray | None = None,
+    entry_session_mask: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if transaction_cost_bps < 0.0:
         raise ValueError("transaction_cost_bps must be non-negative")
@@ -1410,7 +1426,15 @@ def run_backtest(
         execution_exchange_mask = np.asarray(execution_exchange_mask, dtype=bool)
         if execution_exchange_mask.shape != scores.shape:
             raise ValueError("execution_exchange_mask must match the liquidity arrays")
-    entries = np.flatnonzero((dates >= start_date) & (dates < end_date))
+    interval_entries = (dates >= start_date) & (dates < end_date)
+    if entry_session_mask is None:
+        entry_session_mask = np.ones(len(dates), dtype=bool)
+    else:
+        entry_session_mask = np.asarray(entry_session_mask, dtype=bool)
+        if entry_session_mask.shape != (len(dates),):
+            raise ValueError("entry_session_mask must match dates")
+    skipped_short_entries = int((interval_entries & ~entry_session_mask).sum())
+    entries = np.flatnonzero(interval_entries & entry_session_mask)
     if not entries.size:
         raise ValueError("the requested interval contains no entry sessions")
     if entries[-1] + 1 >= len(dates):
@@ -1434,6 +1458,16 @@ def run_backtest(
             entry_prices[date_index, stock_mask],
             np.nan,
         )
+        # A scheduled NBBO dataset is deliberately sparse: it contains the basket
+        # selected for each session, not a price for every security in the ranking
+        # universe.  Ranking on that sparse price matrix would let a missing quote
+        # silently replace an intended member with a lower-ranked name.  Rank first
+        # in NBBO mode, then require every selected member to have its scheduled ask.
+        ranking_entries = (
+            np.ones_like(executable_entries)
+            if entry_price_source == "nbbo-ask"
+            else executable_entries
+        )
         date_scores = np.where(
             completed_trading_days[date_index, stock_mask] >= int(minimum_trading_days),
             scores[date_index, stock_mask],
@@ -1445,7 +1479,7 @@ def run_backtest(
             )
         selected_local = top_liquid_indices(
             date_scores,
-            executable_entries,
+            ranking_entries,
             top,
             stock_symbols,
             issuers=issuers if dedupe_share_classes else None,
@@ -1453,6 +1487,19 @@ def run_backtest(
         selected = stock_indices[selected_local]
         selected_ranks = np.arange(1, int(top) + 1)
         selected_entries = entry_prices[date_index, selected]
+        selected_entry_staleness = entry_staleness[date_index, selected]
+        missing_entry = (
+            ~np.isfinite(selected_entries)
+            | (selected_entries <= 0.0)
+            | ~np.isfinite(selected_entry_staleness)
+            | (selected_entry_staleness > int(max_entry_staleness_minutes))
+        )
+        if missing_entry.any():
+            missing = symbols[selected[missing_entry]]
+            raise ValueError(
+                f"selected symbols lack a fresh scheduled NBBO entry on "
+                f"{dates[date_index].date()}: " + ", ".join(missing.tolist())
+            )
         session_budget = current_equity
         quantities = basket_quantities(selected_entries, session_budget, share_mode)
         executed = quantities > 0.0
@@ -1644,6 +1691,7 @@ def run_backtest(
         "average_executed_basket_size": float(executed_basket_sizes.mean()),
         "minimum_executed_basket_size": int(executed_basket_sizes.min()),
         "skipped_selections": int(skipped_by_entry.sum()),
+        "skipped_short_entry_sessions": skipped_short_entries,
         "average_position_weight_spread": float(weight_spreads.mean()),
         "liquidity_metric": liquidity_descriptions[liquidity_scheme],
         "ema_span_sessions": int(ema_span),
@@ -1908,10 +1956,17 @@ def main() -> None:
     ):
         parser.error("workers must be positive and staleness must be non-negative")
 
+    auction_path = Path(args.auctions_path)
+    if not auction_path.exists():
+        parser.error(
+            f"auction data required for official session-close filtering does not exist: "
+            f"{auction_path}"
+        )
     data_dir = Path(args.data_dir)
     daily_data_dir = Path(args.daily_bars_dir)
+    known_session_closes = auction_close_minutes(auction_path, None)
     all_dates, all_context_sod = reference_session_calendar(
-        data_dir / f"{REFERENCE_SYMBOL}.npy"
+        data_dir / f"{REFERENCE_SYMBOL}.npy", known_session_closes
     )
     requested_end = args.end_date if args.end_date is not None else pd.Timestamp(all_dates[-1])
     eligible_end = all_dates[all_dates <= requested_end]
@@ -1938,6 +1993,22 @@ def main() -> None:
     scan_start_index = max(0, first_entry_index - warmup)
     cache_dates = all_dates[scan_start_index : end_index + 1]
     cache_context_sod = all_context_sod[scan_start_index : end_index + 1]
+    requested_entry_dates = [
+        stamp.date()
+        for stamp in cache_dates
+        if stamp >= requested_start and stamp < end_date
+    ]
+    close_minutes = auction_close_minutes(auction_path, requested_entry_dates)
+    shortened_entries = short_entry_dates(close_minutes, args.entry_time)
+    entry_session_mask = np.asarray(
+        [stamp.date() not in shortened_entries for stamp in cache_dates], dtype=bool
+    )
+    if shortened_entries:
+        print(
+            f"short sessions: skipping {len(shortened_entries):,} afternoon entr"
+            f"{'y' if len(shortened_entries) == 1 else 'ies'} at {args.entry_time // 60:02d}:"
+            f"{args.entry_time % 60:02d}"
+        )
 
     metadata = _cache_metadata(
         data_dir,
@@ -2040,9 +2111,6 @@ def main() -> None:
             f"NBBO entries: loaded {len(nbbo_rows):,} causal 15:45 SIP asks from "
             f"{nbbo_path}"
         )
-    auction_path = Path(args.auctions_path)
-    if args.exit_price_source == "opening-auction" and not auction_path.exists():
-        parser.error(f"auction data does not exist: {auction_path}")
     official_auctions = None
     if auction_path.exists() and (
         args.exchange_filter != "all" or args.exit_price_source == "opening-auction"
@@ -2105,6 +2173,7 @@ def main() -> None:
         entry_price_source=args.entry_price_source,
         exit_price_source=args.exit_price_source,
         execution_exchange_mask=execution_exchange_mask,
+        entry_session_mask=entry_session_mask,
     )
     summary["cache_path"] = str(cache_path)
     summary["asset_filter"] = args.asset_filter
