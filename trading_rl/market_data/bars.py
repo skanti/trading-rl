@@ -12,21 +12,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .schema import BAR_COLUMNS
 
 BAR_EPOCH = datetime(2010, 1, 1, tzinfo=UTC)
-BAR_COLUMNS = {
-    "1Min": ("seconds", "open_mills", "volume", "trades"),
-    "1Day": (
-        "seconds",
-        "open_mills",
-        "high_mills",
-        "low_mills",
-        "close_mills",
-        "volume",
-        "trades",
-        "vwap_mills",
-    ),
-}
 
 
 def normalize_symbol(value: object) -> str:
@@ -115,9 +103,12 @@ def encode_alpaca_bars(
     dtype = np.int64 if timeframe == "1Day" else np.int32
     encoded: list[list[float]] = []
     for bar in bars:
+        missing = {"t", "o", "h", "l", "c", "v", "vw"}.difference(bar)
+        if missing:
+            raise ValueError(f"missing OHLCV fields for {symbol}: {sorted(missing)}")
         timestamp = bar.get("t")
         if not timestamp:
-            continue
+            raise ValueError(f"missing bar timestamp for {symbol}")
         parsed = pd.Timestamp(timestamp)
         if parsed.tzinfo is None:
             parsed = parsed.tz_localize(UTC)
@@ -132,25 +123,23 @@ def encode_alpaca_bars(
             seconds,
             np.rint(_number(bar.get("o"), f"{symbol}.o") * 1000.0),
         ]
-        if timeframe == "1Day":
-            values.extend(
-                np.rint(_number(bar.get(field), f"{symbol}.{field}") * 1000.0)
-                for field in ("h", "l", "c")
-            )
+        values.extend(
+            np.rint(_number(bar.get(field), f"{symbol}.{field}") * 1000.0)
+            for field in ("h", "l", "c")
+        )
         values.extend(
             (
                 np.rint(_number(bar.get("v"), f"{symbol}.v")),
                 np.rint(_number(bar.get("n") or 0, f"{symbol}.n")),
             )
         )
-        if timeframe == "1Day":
-            vwap = bar.get("vw")
-            values.append(
-                np.rint(
-                    (0.0 if vwap is None else _number(vwap, f"{symbol}.vw"))
-                    * 1000.0
-                )
+        vwap = bar.get("vw")
+        values.append(
+            np.rint(
+                (0.0 if vwap is None else _number(vwap, f"{symbol}.vw"))
+                * 1000.0
             )
+        )
         encoded.append(values)
     if not encoded:
         return np.empty((0, len(BAR_COLUMNS[timeframe])), dtype=dtype)
@@ -169,13 +158,28 @@ def encode_alpaca_bars(
     return array
 
 
+def validate_retained_bar_timestamps(base: np.ndarray, update: np.ndarray) -> None:
+    """Reject a replacement that drops any previously stored timestamp."""
+    if len(update) == 0 or int(update[-1, 0]) < int(base[-1, 0]):
+        raise ValueError("replacement ends before the stored endpoint")
+    positions = np.searchsorted(update[:, 0], base[:, 0])
+    if not np.array_equal(update[positions, 0], base[:, 0]):
+        raise ValueError("replacement is missing previously stored bar timestamps")
+
+
 def merge_bar_arrays(
     base: np.ndarray,
     update: np.ndarray,
     *,
     expected_columns: int | None = None,
+    anchor_seconds: int | None = None,
 ) -> np.ndarray | None:
-    """Merge an exactly matching overlap, or return ``None`` for full refresh."""
+    """Validate overlap and merge; changed values return ``None`` for full refresh.
+
+    With an explicit anchor, only that bar's values must match. The refreshed
+    tail may correct values but must retain every previously stored timestamp.
+    Missing anchor/coverage raises instead of accepting a potentially gapped file.
+    """
     for label, array in (("base", base), ("update", update)):
         if array.ndim != 2 or len(array) == 0:
             raise ValueError(f"invalid {label} bar shape: {array.shape}")
@@ -187,6 +191,18 @@ def merge_bar_arrays(
         raise ValueError(
             f"base/update bar column mismatch: {base.shape[1]} != {update.shape[1]}"
         )
+    if anchor_seconds is not None:
+        base_start = int(np.searchsorted(base[:, 0], anchor_seconds))
+        update_start = int(np.searchsorted(update[:, 0], anchor_seconds))
+        if base_start == len(base) or int(base[base_start, 0]) != anchor_seconds:
+            raise ValueError("expected anchor is absent from stored bars")
+        if update_start == len(update) or int(update[update_start, 0]) != anchor_seconds:
+            raise ValueError("expected anchor is missing from update; overlap cannot be verified")
+        tail = update[update_start:]
+        validate_retained_bar_timestamps(base[base_start:], tail)
+        if not np.array_equal(base[base_start], tail[0]):
+            return None
+        return np.vstack((base[:base_start], tail))
     first = int(update[0, 0])
     last = int(base[-1, 0])
     if first > last:

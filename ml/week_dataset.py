@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from trading_rl.market_data.schema import BAR_INDEX, validate_bar_columns
 import pandas as pd
 import torch
 from omegaconf import DictConfig
@@ -67,6 +68,7 @@ def forward_filled_prices(data_dir: str, sample_id: str, secs: np.ndarray) -> np
     and baseline in this directory resolves prices with.
     """
     source = np.load(f"{data_dir}/{sample_id}.npy", mmap_mode="r")
+    validate_bar_columns(source, "1Min", sample_id)
     position = forward_fill_positions(source, secs, sample_id)
     prices = np.asarray(source[position, 1], dtype=np.float64) / 1000.0
     return prices
@@ -237,8 +239,7 @@ class MarketWeekDataset(Dataset):
         secs = self.expected_secs(sample_id, int(row.first_index))
 
         source = np.load(f"{self.data_dir}/{sample_id}.npy", mmap_mode="r")
-        if source.ndim != 2 or source.shape[1] < 3:
-            raise ValueError(f"{sample_id} must contain [seconds, price_mills, volume]")
+        validate_bar_columns(source, "1Min", str(sample_id))
         source_secs = np.ascontiguousarray(source[:, 0]).astype(np.int64)
 
         # A missing bar means no new trade-derived observation, so the last
@@ -254,7 +255,7 @@ class MarketWeekDataset(Dataset):
         # decade of bars for every sample would dominate loader time.
         low, high = int(start.min()), int(stop.max())
         cumulative = np.concatenate(
-            ([0.0], np.cumsum(np.asarray(source[low:high, 2], dtype=np.float64)))
+            ([0.0], np.cumsum(np.asarray(source[low:high, BAR_INDEX["volume"]], dtype=np.float64)))
         )
         volumes = (cumulative[stop - low] - cumulative[start - low]).astype(np.float32)
 

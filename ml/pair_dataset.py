@@ -14,6 +14,7 @@ from datetime import datetime
 
 import fsspec
 import numpy as np
+from trading_rl.market_data.schema import BAR_INDEX, validate_bar_columns
 import pandas as pd
 import torch
 from omegaconf import DictConfig
@@ -70,8 +71,7 @@ class MarketPairDataset(Dataset):
     def _load(self, sample_id: str) -> np.ndarray:
         with fsspec.open(f"{self.data_dir}/{sample_id}.npy", "rb") as f:
             data = np.load(f)
-        if data.ndim != 2 or data.shape[1] < 3:
-            raise ValueError(f"{sample_id} must contain [seconds, price_mills, volume]")
+        validate_bar_columns(data, "1Min", str(sample_id))
         return data
 
     def _tail(self, data: np.ndarray, eod_sec: int, sample_id: str) -> np.ndarray:
@@ -116,8 +116,8 @@ class MarketPairDataset(Dataset):
 
         prices_a = segment_a[:, 1].astype(np.float32) / 1000.0
         prices_b = segment_b[:, 1].astype(np.float32) / 1000.0
-        volumes_a = segment_a[:, 2].astype(np.float32)
-        volumes_b = segment_b[:, 2].astype(np.float32)
+        volumes_a = segment_a[:, BAR_INDEX["volume"]].astype(np.float32)
+        volumes_b = segment_b[:, BAR_INDEX["volume"]].astype(np.float32)
         for name, prices in (("a", prices_a), ("b", prices_b)):
             if not np.isfinite(prices).all() or (prices <= 0).any():
                 raise ValueError(f"pair {sample_a}/{sample_b} leg {name} has non-positive prices")

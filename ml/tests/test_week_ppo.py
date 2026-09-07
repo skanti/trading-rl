@@ -7,6 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -81,7 +82,7 @@ def write_minute_npy(directory: Path, sample_id: str, sessions: list[date], seed
         (secs.astype(np.float64), np.round(prices * 1000.0), volumes.astype(np.float64)),
         axis=1,
     )
-    np.save(directory / f"{sample_id}.npy", array)
+    np.save(directory / f"{sample_id}.npy", ohlcv_fixture(array))
 
 
 def tiny_actor(window_size: int = 4) -> model.TradingActor:
@@ -328,6 +329,10 @@ class WeekDatasetTest(unittest.TestCase):
         sample = dataset[0]
         self.assertEqual(sample["prices"].shape, (dataset.context_ticks + dataset.rollout_size + 1,))
         self.assertEqual(sample["secs"].shape, sample["prices"].shape)
+        raw = np.load(self.directory / "AAA.npy")
+        timestamp = sample["secs"][dataset.context_ticks + 1]
+        bucket = (raw[:, 0] > timestamp - dataset.tick_seconds) & (raw[:, 0] <= timestamp)
+        self.assertEqual(sample["volumes"][dataset.context_ticks + 1], raw[bucket, 5].sum())
         validate_week_hours(
             sample["secs"][None, :],
             dataset.context_ticks,

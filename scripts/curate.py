@@ -7,6 +7,7 @@ import argparse
 
 from glob import glob
 import numpy as np
+from trading_rl.market_data.schema import BAR_INDEX, validate_bar_columns
 from tqdm import tqdm
 import pandas as pd
 import pyarrow
@@ -24,11 +25,12 @@ def load_npy(npy_path: str) -> np.ndarray:
     sample_id = Path(npy_path).stem
     name = rot13(sample_id)
     data = np.load(npy_path)
+    validate_bar_columns(data, "1Min", "minute bars")
     secs = data[:, 0]
     is_sorted = np.all(secs[:-1] < secs[1:])
 
     temp = data[:, 1] / 1000
-    vol = data[:, 2]
+    vol = data[:, BAR_INDEX["volume"]]
     ticks_num = data.shape[0]
 
     assert secs[0] > 0, f"Negative secs, sample_id={sample_id}"

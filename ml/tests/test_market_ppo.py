@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -179,13 +180,18 @@ class MarketPPOTest(unittest.TestCase):
             path = Path(tmp)
             secs = np.array([et_seconds(f"2025-01-02 09:{27 + i:02d}:00") for i in range(8)], dtype=np.int64)
             raw = np.stack((secs, np.arange(100000, 100800, 100), np.arange(1, 9), np.arange(8)), axis=1)
-            np.save(path / "ABC.npy", raw)
+            np.save(path / "ABC.npy", ohlcv_fixture(raw))
             days = pd.DataFrame([{"sample_id": "ABC", "sod_idx": 3, "eod_idx": 7}])
             dataset = MarketDayDataset(days, str(path), window_size=4, rollout_size=2)
             item = dataset[0]
             self.assertEqual(set(item), {"_id", "prices", "volumes", "secs"})
             self.assertEqual(item["prices"].shape, (6,))
             self.assertAlmostEqual(item["prices"][0], 100.0)
+            np.testing.assert_array_equal(item["volumes"], np.arange(1, 7))
+            # Legacy columns must fail instead of treating high prices as volume.
+            np.save(path / "ABC.npy", raw)
+            with self.assertRaisesRegex(ValueError, "OHLCV schema"):
+                dataset[0]
 
     def test_full_session_dataset_filters_incomplete_days_and_starts_at_open(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,8 +204,8 @@ class MarketPPOTest(unittest.TestCase):
                 ),
                 axis=1,
             )
-            np.save(path / "FULL.npy", raw)
-            np.save(path / "SHORT.npy", raw)
+            np.save(path / "FULL.npy", ohlcv_fixture(raw))
+            np.save(path / "SHORT.npy", ohlcv_fixture(raw))
             days = pd.DataFrame(
                 [
                     {"sample_id": "FULL", "ctx_idx": 0, "sod_idx": 3, "eod_idx": 7},
@@ -244,7 +250,7 @@ class MarketPPOTest(unittest.TestCase):
                 ),
                 axis=1,
             )
-            np.save(path, raw)
+            np.save(path, ohlcv_fixture(raw))
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
@@ -269,7 +275,7 @@ class MarketPPOTest(unittest.TestCase):
             raw = np.stack(
                 (secs, np.arange(100_000, 100_800, 100), np.ones(8, dtype=np.int64)), axis=1
             )
-            np.save(path / "GAP.npy", raw)
+            np.save(path / "GAP.npy", ohlcv_fixture(raw))
             days = pd.DataFrame([{"sample_id": "GAP", "ctx_idx": 0, "sod_idx": 3, "eod_idx": 7}])
             dataset = MarketDayDataset(
                 days,
@@ -287,7 +293,7 @@ class MarketPPOTest(unittest.TestCase):
             secs = np.array([0, 60, 120, 180, 240, 360, 420], dtype=np.int64)
             prices = np.array([100_000, 100_100, 100_200, 100_300, 100_400, 100_600, 100_700])
             volumes = np.arange(1, 8, dtype=np.int64)
-            np.save(path / "SPARSE.npy", np.stack((secs, prices, volumes), axis=1))
+            np.save(path / "SPARSE.npy", ohlcv_fixture(np.stack((secs, prices, volumes), axis=1)))
             days = pd.DataFrame(
                 [
                     {
@@ -344,7 +350,7 @@ class MarketPPOTest(unittest.TestCase):
             path = Path(tmp)
             secs = np.array([0, 60, 120, 360, 420, 540, 600], dtype=np.int64)
             prices = np.array([100_000, 100_100, 100_200, 100_600, 100_700, 100_900, 101_000])
-            np.save(path / "MISSING_DAY.npy", np.stack((secs, prices, np.ones(7)), axis=1))
+            np.save(path / "MISSING_DAY.npy", ohlcv_fixture(np.stack((secs, prices, np.ones(7)), axis=1)))
             calendar_days = pd.DataFrame(
                 [
                     {

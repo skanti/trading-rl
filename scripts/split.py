@@ -12,6 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 import pandas as pd
 from rich.logging import RichHandler
 from tqdm import tqdm
@@ -71,8 +72,7 @@ def split_npy(
     if not path.exists():
         return []
     data = np.load(path, mmap_mode="r")
-    if data.ndim != 2 or data.shape[1] < 3:
-        raise ValueError(f"{path} must contain [seconds, price, volume]")
+    validate_bar_columns(data, "1Min", str(path))
     # Keep timestamps contiguous: thousands of binary searches against a
     # strided mmap column are surprisingly expensive.
     secs = np.ascontiguousarray(data[:, 0])

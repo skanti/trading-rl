@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 import pandas as pd
 from tqdm import tqdm
 
@@ -22,8 +23,7 @@ def rows_for_file(
     rollout_size: int,
 ) -> list[tuple[str, str, int, int, int]]:
     data = np.load(npy_path, mmap_mode="r")
-    if data.ndim != 2 or data.shape[1] < 3:
-        raise ValueError(f"{npy_path} must contain [seconds, price_mills, volume]")
+    validate_bar_columns(data, "1Min", str(npy_path))
     secs = np.asarray(data[:, 0])
     if secs.size < window_size + rollout_size or not np.all(secs[:-1] < secs[1:]):
         return []

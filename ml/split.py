@@ -9,6 +9,7 @@ import logging
 
 from glob import glob
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 from tqdm import tqdm
 import pandas as pd
 from rich.logging import RichHandler
@@ -32,6 +33,7 @@ def split_npy(npy_path: str, sod: pd.DataFrame, eod: pd.DataFrame) -> list:
     if not os.path.exists(npy_path):
         return []
     data = np.load(npy_path)
+    validate_bar_columns(data, "1Min", "minute bars")
     secs = data[:, 0]
     ticks_num = data.shape[0]
     assert (secs >= 0).all(), f"Negative secs, sample_id={sample_id}"

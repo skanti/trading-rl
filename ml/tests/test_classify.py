@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -79,7 +80,7 @@ def write_minute_npy(directory: Path, sample_id: str, sessions: list[date], seed
     array = np.stack(
         (secs.astype(np.float64), np.round(prices * 1000.0), np.ones(secs.size)), axis=1
     )
-    np.save(directory / f"{sample_id}.npy", array)
+    np.save(directory / f"{sample_id}.npy", ohlcv_fixture(array))
 
 
 class RelativeFeatureTest(unittest.TestCase):

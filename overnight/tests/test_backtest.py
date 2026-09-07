@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 import pandas as pd
 from rich.console import Console
 
@@ -599,10 +600,10 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             )
             np.save(
                 daily_dir / "X.npy",
-                np.array(
+                ohlcv_fixture(np.array(
                     [[daily_second, 90_000, 110_000, 80_000, 95_000, 50, 10, 0]],
                     dtype=np.int64,
-                ),
+                )),
             )
             result = _symbol_daily_arrays(
                 "X",
@@ -617,7 +618,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
 
         self.assertEqual(result[1][0], 4_750.0)
 
-    def test_symbol_execution_prices_need_only_timestamp_and_price_columns(self):
+    def test_symbol_execution_prices_use_open_from_full_ohlcv_columns(self):
         session = pd.Timestamp("2026-01-05 04:00", tz="America/New_York")
         origin = pd.Timestamp("2010-01-01", tz="UTC")
         context_start = int((session.tz_convert("UTC") - origin).total_seconds())
@@ -630,7 +631,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             daily_dir.mkdir()
             np.save(
                 minute_dir / "X.npy",
-                np.array([[morning, 99_000], [entry, 100_000]], dtype=np.int64),
+                ohlcv_fixture(np.array([[morning, 99_000], [entry, 100_000]], dtype=np.int64)),
             )
 
             result = _symbol_daily_arrays(
@@ -670,7 +671,7 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         bars = np.column_stack((seconds, np.full(len(seconds), 100_000, dtype=np.int64)))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "SPY.npy"
-            np.save(path, bars)
+            np.save(path, ohlcv_fixture(bars))
             dates, context_sod = reference_session_calendar(
                 path, {date(2026, 1, 6): 13 * 60}
             )

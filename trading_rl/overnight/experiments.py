@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from ..market_data.schema import validate_bar_columns
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
@@ -126,7 +127,8 @@ def _symbol_minute_prices(
     if not path.exists():
         return sample_id, prices, staleness
     source = np.load(path, mmap_mode="r")
-    if source.ndim != 2 or source.shape[1] < 3 or not len(source):
+    validate_bar_columns(source, "1Min", str(path))
+    if not len(source):
         return sample_id, prices, staleness
     seconds = np.asarray(source[:, 0], dtype=np.int64)
     requested = np.concatenate(

@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -496,7 +497,7 @@ class MarketPairDataTest(unittest.TestCase):
     def _write_symbol(self, directory: Path, name: str, seconds: np.ndarray, base: float) -> None:
         prices = (base * (1.0 + 1e-4 * np.arange(seconds.size))) * 1000.0
         volumes = np.full(seconds.size, 500.0)
-        np.save(directory / f"{name}.npy", np.stack((seconds, prices, volumes), axis=1))
+        np.save(directory / f"{name}.npy", ohlcv_fixture(np.stack((seconds, prices, volumes), axis=1)))
 
     def _session_seconds(self, day: str) -> np.ndarray:
         start = et_seconds(f"{day} 09:30:00")
@@ -522,6 +523,8 @@ class MarketPairDataTest(unittest.TestCase):
             item = dataset[0]
             self.assertEqual(item["prices_a"].shape, (window + rollout,))
             self.assertEqual(item["prices_b"].shape, (window + rollout,))
+            np.testing.assert_array_equal(item["volumes_a"], np.full(window + rollout, 500.0))
+            np.testing.assert_array_equal(item["volumes_b"], np.full(window + rollout, 500.0))
             # Every returned tick exists in both legs, so no pre-market survives.
             self.assertEqual(np.intersect1d(item["secs"], premarket).size, 0)
             self.assertEqual(item["secs"][window - 1], session[0])

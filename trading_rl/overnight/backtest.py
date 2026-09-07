@@ -30,6 +30,7 @@ from tqdm import tqdm
 import requests
 
 from ..market_data.calendar import auction_close_minutes, short_entry_dates
+from ..market_data.schema import BAR_INDEX, validate_bar_columns, validate_bar_manifest
 from .price_utils import forward_fill_positions
 
 
@@ -682,7 +683,8 @@ def reference_session_calendar(
     if not reference_path.exists():
         raise FileNotFoundError(f"reference minute bars do not exist: {reference_path}")
     source = np.load(reference_path, mmap_mode="r")
-    if source.ndim != 2 or source.shape[1] < 2 or not len(source):
+    validate_bar_columns(source, "1Min", str(reference_path))
+    if not len(source):
         raise ValueError(f"invalid reference minute bars: {reference_path}")
     seconds = np.asarray(source[:, 0], dtype=np.int64)
     if (seconds < 0).any() or not np.all(seconds[:-1] < seconds[1:]):
@@ -749,34 +751,12 @@ def simulation_symbols(minute_data_dir: Path, daily_data_dir: Path) -> np.ndarra
 
 def _dataset_manifest(data_dir: Path, timeframe: str) -> dict[str, object]:
     """Validate the downloader manifest for one split-adjusted bar store."""
-    expected_columns = {
-        "1Min": ["seconds", "open_mills", "volume", "trades"],
-        "1Day": [
-            "seconds",
-            "open_mills",
-            "high_mills",
-            "low_mills",
-            "close_mills",
-            "volume",
-            "trades",
-            "vwap_mills",
-        ],
-    }
     manifest_path = data_dir / "_download_manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"bar dataset manifest does not exist: {manifest_path}")
     with manifest_path.open(encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if manifest.get("timeframe") != timeframe:
-        raise ValueError(
-            f"{manifest_path} has timeframe {manifest.get('timeframe')!r}; expected {timeframe!r}"
-        )
-    if manifest.get("adjustment") != "split":
-        raise ValueError(f"{manifest_path} must contain split-adjusted bars")
-    if manifest.get("columns") != expected_columns[timeframe]:
-        raise ValueError(
-            f"{manifest_path} has incompatible columns: {manifest.get('columns')!r}"
-        )
+    validate_bar_manifest(manifest, timeframe, str(manifest_path))
     return manifest
 
 
@@ -803,7 +783,7 @@ def _cache_metadata(
     exit_minute: int,
 ) -> dict[str, object]:
     return {
-        "version": 6,
+        "version": 7,
         "minute_data": _manifest_fingerprint(minute_data_dir, "1Min"),
         "daily_data": _manifest_fingerprint(daily_data_dir, "1Day"),
         "start_date": str(start_date.date()),
@@ -839,10 +819,7 @@ def _symbol_daily_arrays(
     daily_path = daily_data_dir / f"{storage_symbol}.npy"
     if daily_path.exists():
         daily = np.load(daily_path, mmap_mode="r")
-        if daily.ndim != 2 or daily.shape[1] != 8:
-            raise ValueError(
-                f"{daily_path} must contain seconds, OHLC mills, volume, trades, and VWAP mills"
-            )
+        validate_bar_columns(daily, "1Day", str(daily_path))
         if len(daily) and not np.all(daily[:-1, 0] < daily[1:, 0]):
             raise ValueError(f"{daily_path} timestamps must be strictly increasing")
 
@@ -865,9 +842,9 @@ def _symbol_daily_arrays(
             [date_positions.get(pd.Timestamp(date), -1) for date in daily_dates],
             dtype=np.int64,
         )
-        volume = np.asarray(daily[:, 5], dtype=np.float64)
-        vwap_mills = np.asarray(daily[:, 7], dtype=np.float64)
-        close_mills = np.asarray(daily[:, 4], dtype=np.float64)
+        volume = np.asarray(daily[:, BAR_INDEX["volume"]], dtype=np.float64)
+        vwap_mills = np.asarray(daily[:, BAR_INDEX["vwap_mills"]], dtype=np.float64)
+        close_mills = np.asarray(daily[:, BAR_INDEX["close_mills"]], dtype=np.float64)
         price_mills = np.where(
             np.isfinite(vwap_mills) & (vwap_mills > 0.0), vwap_mills, close_mills
         )
@@ -894,8 +871,7 @@ def _symbol_daily_arrays(
         )
 
     source = np.load(source_path, mmap_mode="r")
-    if source.ndim != 2 or source.shape[1] < 2:
-        raise ValueError(f"{sample_id} must contain seconds and price_mills")
+    validate_bar_columns(source, "1Min", str(source_path))
     source_seconds = np.asarray(source[:, 0], dtype=np.int64)
     if len(source) and not np.all(source_seconds[:-1] < source_seconds[1:]):
         raise ValueError(f"{source_path} timestamps must be strictly increasing")
@@ -2020,7 +1996,7 @@ def main() -> None:
     )
     cache_name = (
         f"liquidity_{cache_dates[0]:%Y%m%d}_{cache_dates[-1]:%Y%m%d}_"
-        f"e{args.entry_time:04d}_x{args.exit_time:04d}_v6.npz"
+        f"e{args.entry_time:04d}_x{args.exit_time:04d}_v7.npz"
     )
     cache_path = Path(args.cache_dir) / cache_name
     (

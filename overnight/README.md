@@ -113,9 +113,32 @@ stale path, since a session either produced a condition-O cross or did not.
 
 Existing `.npy` bar files can be extended without redownloading every ticker's full
 history. Filenames use plain symbols such as `AAPL.npy` and `BRK.B.npy`.
+Minute and daily files share schema version 2, with these column positions:
+`seconds, open_mills, high_mills, low_mills, close_mills, volume, trades, vwap_mills`.
+Prices and VWAP are integer thousandths of a dollar; timestamps are seconds since
+2010-01-01 UTC. Minute files use `int32` and daily files use `int64`. A null VWAP
+is stored as zero, the existing missing-VWAP sentinel. The downloader records
+`schema_version` and `columns` in `_download_manifest.json`.
+
+Old four-column minute files cannot supply the discarded OHLC/VWAP fields.
+Download them again into a new directory; the downloader rejects old or mixed
+layouts before making requests or overwriting files. For example, from the repo root:
+
+```bash
+MINUTE_BARS_DIR=/data/ppv1/updates/bars_1min_ohlcv_v2_2022-01-01 \
+  scripts/download_latest_bars_and_auctions.sh
+trading-backtest --since 2022-01-01 \
+  --data-dir /data/ppv1/updates/bars_1min_ohlcv_v2_2022-01-01
+```
+
+Set the same `MINUTE_BARS_DIR` on subsequent updates and point ML configurations
+at the new store. Existing eight-column daily files remain compatible. Existing
+models and the simulator still use minute open prices; they do not use a minute's
+completed high, low, close, or VWAP to decide at that minute's opening.
+
 The bulk downloader and live ranking refresh both use
 `trading_rl/market_data/bars.py` for
-Alpaca request construction and pagination, compact bar encoding, exact-overlap
+Alpaca request construction and pagination, compact bar encoding, overlap
 validation, and atomic array replacement. Their orchestration remains separate so
 the live path can require a specific completed session and fail closed without
 partially updating its cache.
@@ -152,13 +175,26 @@ python ../scripts/download_bars.py \
   --update_existing
 ```
 
-For an existing ticker, the downloader fetches a 30-calendar-day overlap, compares
-timestamps, split-adjusted open prices, volumes, and trade counts exactly, and appends
-only when the overlap matches. Any difference—including the historical rewrite caused
-by a new split—automatically escalates that ticker to a full retained-history refresh.
-Other tickers remain incremental. `--since` supplies the start for new ticker files;
-an existing file supplies its own retained start. Use `--overlap_days` to widen the
-verification window.
+For an existing minute-bar file, the downloader chooses an anchor from the stored
+data before requesting an update: the first stored timestamp within the configured
+overlap window (30 calendar days by default). It fetches from that anchor onward
+and compares all of the anchor's stored OHLC, volume, trade-count, and VWAP fields exactly.
+A matching anchor allows the entire tail to be replaced, accepting corrections to
+later bars even when no new timestamps are added. A changed anchor triggers a full
+retained-history refresh for that symbol.
+
+The expected anchor must be present, and the replacement must retain every stored
+timestamp in the replaced range and reach at least the stored endpoint. A full
+refresh must likewise retain every previously stored timestamp. Missing overlap,
+dropped rows, or a truncated replacement fail the symbol without overwriting its
+file; the command records `_failed_tickers.txt` and exits unsuccessfully if any
+symbol fails. These checks preserve known coverage, but do not assume a bar exists
+for every minute or prove that older, unqueried history is unchanged.
+
+Each symbol has its own anchor even in multi-symbol batches. `--since` supplies
+the start for new files; an existing file supplies its own retained start. Use
+`--overlap_days` to change the refreshed tail's length. Daily-bar updates continue
+to require an exactly matching overlap before appending.
 
 Use `--timeframe 1Day` for complete daily bars. Daily files retain timestamp,
 OHLC prices, volume, trade count, and VWAP; the exact column order is recorded in

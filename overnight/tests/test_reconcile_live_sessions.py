@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 from rich.console import Console
 
 from trading_rl.overnight.backtest import BAR_ORIGIN, EASTERN
@@ -96,13 +97,13 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             exit_day = date(2026, 8, 31)
             np.save(
                 minute_dir / "AAPL.npy",
-                np.asarray(
+                ohlcv_fixture(np.asarray(
                     [
                         [seconds(entry_day, time(15, 58)), 99_000, 100, 10],
                         [seconds(entry_day, time(15, 59)), 100_000, 100, 10],
                     ],
                     dtype=np.int32,
-                ),
+                )),
             )
             auctions = root / "auctions.npz"
             np.savez_compressed(
@@ -212,13 +213,13 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             exit_day = date(2026, 8, 31)
             np.save(
                 minute_dir / "AAPL.npy",
-                np.asarray(
+                ohlcv_fixture(np.asarray(
                     [
                         [seconds(entry_day, time(15, 59)), 100_000, 100, 10],
                         [seconds(exit_day, time(12, 45)), 109_000, 100, 10],
                     ],
                     dtype=np.int32,
-                ),
+                )),
             )
             auctions = root / "auctions.npz"
             np.savez_compressed(
@@ -332,14 +333,14 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             exit_day = date(2026, 8, 31)
             np.save(
                 minute_dir / "AAPL.npy",
-                np.asarray(
+                ohlcv_fixture(np.asarray(
                     [
                         [seconds(entry_day, time(15, 59)), 100_000, 100, 10],
                         [seconds(entry_day, time(16, 2)), 101_000, 100, 10],
                         [seconds(exit_day, time(9, 30)), 110_000, 100, 10],
                     ],
                     dtype=np.int32,
-                ),
+                )),
             )
             auctions = root / "auctions.npz"
             np.savez_compressed(

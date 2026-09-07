@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from itertools import islice
 import tarfile
@@ -28,7 +28,9 @@ from ..market_data.bars import (
     encode_alpaca_bars,
     merge_bar_arrays as merge_shared_bar_arrays,
     normalize_symbol,
+    validate_retained_bar_timestamps,
 )
+from ..market_data.schema import BAR_SCHEMA_VERSION, validate_bar_columns, validate_bar_manifest
 
 logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)
 logger = logging.getLogger("DOWNLOAD_BARS")
@@ -172,9 +174,7 @@ def dataframe_to_array(
     data: pd.DataFrame, name: str, timeframe: str = "1Min"
 ) -> np.ndarray | None:
     """Convert API bars through the shared compact on-disk encoder."""
-    required_columns = {"t", "o", "v"}
-    if timeframe == "1Day":
-        required_columns.update({"h", "l", "c"})
+    required_columns = {"t", "o", "h", "l", "c", "v", "vw"}
     missing_columns = required_columns.difference(data.columns)
     if missing_columns:
         logger.warning(
@@ -205,9 +205,21 @@ def save_as_npy(data: pd.DataFrame, out_path: str, timeframe: str = "1Min") -> b
     return True
 
 
-def merge_bar_arrays(base: np.ndarray, update: np.ndarray) -> np.ndarray | None:
-    """Merge through the shared exact-overlap implementation."""
-    return merge_shared_bar_arrays(base, update)
+def merge_bar_arrays(
+    base: np.ndarray, update: np.ndarray, *, anchor_seconds: int | None = None
+) -> np.ndarray | None:
+    """Merge through shared overlap validation, optionally using a minute anchor."""
+    return merge_shared_bar_arrays(base, update, anchor_seconds=anchor_seconds)
+
+
+def minute_update_anchor(base: np.ndarray, overlap_days: int) -> int:
+    """Choose the first stored bar in the overlap before making any request."""
+    if base.ndim != 2 or base.shape[1] != len(BAR_COLUMNS["1Min"]) or len(base) == 0:
+        raise ValueError(f"invalid stored minute-bar shape: {base.shape}")
+    if not (base[:-1, 0] < base[1:, 0]).all():
+        raise ValueError("stored minute-bar timestamps are not strictly increasing")
+    cutoff = int(base[-1, 0]) - int(overlap_days) * 86_400
+    return int(base[np.searchsorted(base[:, 0], cutoff), 0])
 
 
 def request_json(
@@ -316,7 +328,8 @@ def download_bars_alpaca_batch(
         ).astimezone(UTC) - timedelta(microseconds=1)
     else:
         dt_end = datetime.now(UTC) - ALPACA_SIP_DELAY
-    dt_start = dt_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    if timeframe == "1Day":
+        dt_start = dt_start.replace(hour=0, minute=0, second=0, microsecond=0)
     headers = {
         "APCA-API-KEY-ID": os.environ["ALPACA_DATA_KEY"],
         "APCA-API-SECRET-KEY": os.environ["ALPACA_DATA_SECRET"],
@@ -392,8 +405,12 @@ def download_bars_polygon(
             {
                 "t": datetime.fromtimestamp(bar["t"] / 1000, tz=UTC).isoformat(),
                 "o": bar["o"],
+                "h": bar["h"],
+                "l": bar["l"],
+                "c": bar["c"],
                 "v": bar["v"],
                 "n": bar.get("n", 0),
+                "vw": bar["vw"],
             }
         )
     df = pd.DataFrame(bars_clean)
@@ -435,6 +452,10 @@ def process_ticker(
             base_start = ANNO + timedelta(seconds=int(base[0, 0]))
             base_last = ANNO + timedelta(seconds=int(base[-1, 0]))
             update_since = max(base_start, base_last - timedelta(days=overlap_days))
+            anchor_seconds = None
+            if timeframe == "1Min":
+                anchor_seconds = minute_update_anchor(base, overlap_days)
+                update_since = ANNO + timedelta(seconds=anchor_seconds)
             update_df = (
                 initial_df
                 if initial_df is not None
@@ -448,7 +469,7 @@ def process_ticker(
             )
             if update_array is None:
                 return False
-            merged = merge_bar_arrays(base, update_array)
+            merged = merge_bar_arrays(base, update_array, anchor_seconds=anchor_seconds)
             if merged is not None:
                 save_array(merged, out_path)
                 logger.info(
@@ -460,7 +481,8 @@ def process_ticker(
                 return True
 
             logger.warning(
-                "Historical overlap changed; downloading full retained history, ticker=%s",
+                "Historical overlap changed%s; downloading full retained history, ticker=%s",
+                " at the anchor" if anchor_seconds is not None else "",
                 ticker,
             )
             full_df = download_ticker(ticker, source, base_start, timeframe)
@@ -472,6 +494,8 @@ def process_ticker(
             )
             if full_array is None:
                 return False
+            if timeframe == "1Min":
+                validate_retained_bar_timestamps(base, full_array)
             if int(full_array[-1, 0]) < int(base[-1, 0]):
                 logger.error(
                     "Full refresh ends before existing data; preserving old file, ticker=%s",
@@ -507,6 +531,7 @@ def initial_request_since(
     since: datetime,
     update_existing: bool,
     overlap_days: int,
+    timeframe: str = "1Min",
 ) -> datetime:
     """Return the initial range needed for a ticker's incremental request."""
     out_path = pathlib.Path(out_dir) / f"{storage_ticker(ticker)}.npy"
@@ -516,6 +541,8 @@ def initial_request_since(
         base = np.load(out_path, mmap_mode="r")
         if base.ndim != 2 or len(base) == 0:
             return since
+        if timeframe == "1Min":
+            return ANNO + timedelta(seconds=minute_update_anchor(base, overlap_days))
         base_start = ANNO + timedelta(seconds=int(base[0, 0]))
         base_last = ANNO + timedelta(seconds=int(base[-1, 0]))
         return max(base_start, base_last - timedelta(days=overlap_days))
@@ -664,6 +691,12 @@ def main(
     ALPACA_RATE_LIMITER = RateLimiter(requests_per_minute)
     os.makedirs(out_dir, exist_ok=True)
     manifest_path = pathlib.Path(out_dir) / DATASET_MANIFEST
+    if manifest_path.exists():
+        validate_bar_manifest(json.loads(manifest_path.read_text()), timeframe, str(manifest_path))
+    # Validate every existing file, including symbols outside today's shortlist,
+    # before any request or overwrite can create a mixed-layout dataset.
+    for existing_path in pathlib.Path(out_dir).glob("*.npy"):
+        validate_bar_columns(np.load(existing_path, mmap_mode="r"), timeframe, str(existing_path))
     if update_existing and manifest_path.exists():
         existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         existing_source = str(existing_manifest.get("source", ""))
@@ -705,7 +738,7 @@ def main(
                 index,
                 ticker,
                 initial_request_since(
-                    ticker, out_dir, since, update_existing, overlap_days
+                    ticker, out_dir, since, update_existing, overlap_days, timeframe
                 ),
             )
             for index, ticker in enumerate(tickers)
@@ -735,7 +768,9 @@ def main(
                 ThreadPoolExecutor(max_workers=workers_num) as pool,
                 tqdm(total=tickers_num, desc="Processing tickers") as progress,
             ):
-                for batch_outcomes in pool.map(batch_fn, task_batches):
+                futures = [pool.submit(batch_fn, tasks) for tasks in task_batches]
+                for future in as_completed(futures):
+                    batch_outcomes = future.result()
                     outcomes.extend(batch_outcomes)
                     progress.update(len(batch_outcomes))
         res = [False] * tickers_num
@@ -757,14 +792,18 @@ def main(
                 tqdm(map(fn, tickers), total=tickers_num, desc="Processing tickers")
             )
         else:
-            with ThreadPoolExecutor(max_workers=workers_num) as pool:
-                res = list(
-                    tqdm(
-                        pool.map(fn, tickers),
-                        total=tickers_num,
-                        desc="Processing tickers",
-                    )
-                )
+            res = [False] * tickers_num
+            with (
+                ThreadPoolExecutor(max_workers=workers_num) as pool,
+                tqdm(total=tickers_num, desc="Processing tickers") as progress,
+            ):
+                futures = {
+                    pool.submit(fn, ticker): index
+                    for index, ticker in enumerate(tickers)
+                }
+                for future in as_completed(futures):
+                    res[futures[future]] = future.result()
+                    progress.update(1)
     t1 = time.perf_counter()
     logger.removeFilter(deferred_summary)
 
@@ -785,6 +824,7 @@ def main(
         )
 
     manifest = {
+        "schema_version": BAR_SCHEMA_VERSION,
         "updated_at": datetime.now(UTC).isoformat(),
         "source": source,
         "timeframe": timeframe,
@@ -806,9 +846,13 @@ def main(
     os.replace(manifest_part, manifest_path)
 
     duration = t1 - t0
+    deferred_summary.write(logger)
+    if failed_tickers:
+        raise RuntimeError(
+            f"Bar download failed for {', '.join(failed_tickers)}; see {failed_path}"
+        )
     if archive:
         pack_to_archive(out_dir)
-    deferred_summary.write(logger)
     logger.info(f"Done, duration={duration:0.2f}s")
 
 

@@ -10,6 +10,7 @@ from datetime import datetime
 
 import fsspec
 import numpy as np
+from trading_rl.market_data.schema import BAR_INDEX, validate_bar_columns
 import pandas as pd
 import torch
 from omegaconf import DictConfig
@@ -441,7 +442,7 @@ class OnlinePairToyProvider:
 class MarketDayDataset(Dataset):
     """Return an N-tick context followed by T tradable price intervals.
 
-    Input ``.npy`` files contain at least ``[seconds, price_mills, volume]``.
+    Input ``.npy`` files use the eight-column OHLCV bar schema.
     Symbol identity and absolute price are intentionally not returned to the
     policy, preventing the easiest forms of symbol-specific memorization.
     ``eod_idx`` is treated as an inclusive index, as in the original dataset.
@@ -577,8 +578,7 @@ class MarketDayDataset(Dataset):
         else:
             with fsspec.open(sample_path, "rb") as f:
                 data = np.load(f)
-        if data.ndim != 2 or data.shape[1] < 3:
-            raise ValueError(f"{sample_path} must contain [seconds, price_mills, volume]")
+        validate_bar_columns(data, "1Min", str(sample_path))
 
         n, t = self.window_size, self.rollout_size
         sod_idx, eod_idx = int(sample.sod_idx), int(sample.eod_idx)
@@ -613,7 +613,7 @@ class MarketDayDataset(Dataset):
 
             prices = data[price_source, 1].astype(np.float32) / 1000.0
             volumes = np.zeros(n + t, dtype=np.float32)
-            volumes[exact] = data[exact_source[exact], 2].astype(np.float32)
+            volumes[exact] = data[exact_source[exact], BAR_INDEX["volume"]].astype(np.float32)
             secs = expected_secs
             if prices.size != n + t or volumes.size != n + t or secs.size != n + t:
                 raise ValueError(f"sample {sample_id} completion produced an invalid segment length")
@@ -648,7 +648,7 @@ class MarketDayDataset(Dataset):
             raise ValueError(f"sample {sample_id} ended unexpectedly at index {stop - 1}")
 
         prices = segment[:, 1].astype(np.float32) / 1000.0
-        volumes = segment[:, 2].astype(np.float32)
+        volumes = segment[:, BAR_INDEX["volume"]].astype(np.float32)
         secs = segment[:, 0].astype(np.int64)
         if self.require_full_session:
             session_secs = secs[n - 1 :]

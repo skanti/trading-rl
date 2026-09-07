@@ -14,6 +14,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf, DictConfig
 import pandas as pd
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 from rich.logging import RichHandler
 
 from . import model
@@ -44,6 +45,7 @@ def rot13(text: str) -> str:
 
 def load_npy(npy_path: str) -> pd.DataFrame:
     data = np.load(npy_path)
+    validate_bar_columns(data, "1Min", "minute bars")
 
     assert data.ndim == 2
     secs = data[:, 0].astype(np.int32)

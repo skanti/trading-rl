@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -10,10 +11,26 @@ import numpy as np
 
 
 from trading_rl.cli import download_bars
+from scripts.tests.bar_fixtures import ohlcv_fixture
 
 
 def bars(*rows: tuple[int, int, int, int]) -> np.ndarray:
-    return np.asarray(rows, dtype=np.int32)
+    return ohlcv_fixture(np.asarray(rows, dtype=np.int32))
+
+
+def minute_frame(array: np.ndarray):
+    return download_bars.pd.DataFrame(
+        {
+            "t": [download_bars.ANNO + download_bars.timedelta(seconds=int(t)) for t in array[:, 0]],
+            "o": array[:, 1] / 1000.0,
+            "h": array[:, 2] / 1000.0,
+            "l": array[:, 3] / 1000.0,
+            "c": array[:, 4] / 1000.0,
+            "v": array[:, 5],
+            "n": array[:, 6],
+            "vw": array[:, 7] / 1000.0,
+        }
+    )
 
 
 class BarUpdateTests(unittest.TestCase):
@@ -91,6 +108,10 @@ class BarUpdateTests(unittest.TestCase):
                 {
                     "t": "2026-08-27T19:59:00Z",
                     "o": 2_500_000.0,
+                    "h": 2_500_001.0,
+                    "l": 2_499_999.0,
+                    "c": 2_500_000.0,
+                    "vw": 2_500_000.0,
                     "v": 1_000,
                     "n": 100,
                 }
@@ -164,6 +185,96 @@ class BarUpdateTests(unittest.TestCase):
         )
         self.assertIsNone(download_bars.merge_bar_arrays(base, bars((4, 103, 13, 4))))
 
+    def test_matching_anchor_replaces_corrected_tail_even_without_new_bars(self):
+        base = bars((1, 100, 10, 1), (2, 101, 11, 2), (3, 102, 12, 3))
+        for extend in (False, True):
+            update = bars((2, 101, 11, 2), (3, 150, 25, 5))
+            if extend:
+                update = np.vstack((update, bars((4, 160, 26, 6))))
+            merged = download_bars.merge_bar_arrays(base, update, anchor_seconds=2)
+            np.testing.assert_array_equal(merged, np.vstack((base[:1], update)))
+
+    def test_any_changed_anchor_field_requires_full_refresh(self):
+        base = bars((1, 100, 10, 1), (2, 101, 11, 2), (3, 102, 12, 3))
+        for column in range(1, 8):
+            with self.subTest(column=column):
+                update = base[1:].copy()
+                update[0, column] += 1
+                self.assertIsNone(
+                    download_bars.merge_bar_arrays(base, update, anchor_seconds=2)
+                )
+
+    def test_expected_anchor_and_complete_stored_overlap_are_required(self):
+        base = bars((1, 100, 10, 1), (2, 101, 11, 2), (3, 102, 12, 3), (4, 103, 13, 4))
+        for update, message in (
+            (base[2:], "expected anchor"),
+            (bars((5, 104, 14, 5)), "expected anchor"),
+            (base[1:3], "stored endpoint"),
+            (base[[1, 3]], "missing previously stored"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                download_bars.merge_bar_arrays(base, update, anchor_seconds=2)
+
+    def test_minute_batches_validate_each_symbols_planned_anchor(self):
+        day = 86_400
+        aapl = bars((0, 100, 10, 1), (20 * day, 101, 11, 2), (40 * day, 102, 12, 3))
+        msft = bars((0, 200, 10, 1), (30 * day, 201, 11, 2), (40 * day, 202, 12, 3))
+        updates = {
+            "AAPL": bars((20 * day, 101, 11, 2), (40 * day, 110, 20, 4), (41 * day, 111, 21, 5)),
+            "MSFT": bars((20 * day, 199, 10, 1), (30 * day, 201, 11, 2), (40 * day, 210, 20, 4), (41 * day, 211, 21, 5)),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            np.save(output / "AAPL.npy", aapl)
+            np.save(output / "MSFT.npy", msft)
+            tickers_path = output / "tickers.txt"
+            tickers_path.write_text("AAPL\nMSFT\n")
+            with mock.patch.object(
+                download_bars, "download_bars_alpaca_batch",
+                return_value={symbol: minute_frame(array) for symbol, array in updates.items()},
+            ) as downloader:
+                download_bars.main(
+                    "alpaca", str(tickers_path), directory, download_bars.ANNO,
+                    workers_num=0, update_existing=True, batch_size=2,
+                )
+            downloader.assert_called_once_with(
+                ["AAPL", "MSFT"], download_bars.ANNO + download_bars.timedelta(days=20), "1Min"
+            )
+            np.testing.assert_array_equal(np.load(output / "AAPL.npy"), np.vstack((aapl[:1], updates["AAPL"])))
+            np.testing.assert_array_equal(np.load(output / "MSFT.npy"), np.vstack((msft[:1], updates["MSFT"][1:])))
+
+    def test_invalid_minute_replacements_fail_the_run_and_preserve_the_file(self):
+        day = 86_400
+        base = bars((0, 100, 10, 1), (20 * day, 101, 11, 2), (30 * day, 102, 12, 3), (40 * day, 103, 13, 4))
+        changed = base[1:].copy()
+        changed[:, 1] += 10
+        responses = {
+            "missing anchor": [base[2:]],
+            "missing interior timestamp": [base[[1, 3]]],
+            "truncated tail": [base[1:3]],
+            "full refresh drops prefix": [changed, changed],
+            "full refresh drops interior": [changed, base[[0, 1, 3]]],
+        }
+        for case, arrays in responses.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                stored = output / "AAPL.npy"
+                np.save(stored, base)
+                original = stored.read_bytes()
+                tickers_path = output / "tickers.txt"
+                tickers_path.write_text("AAPL\n")
+                with mock.patch.object(
+                    download_bars, "download_ticker",
+                    side_effect=[minute_frame(array) for array in arrays],
+                ) as downloader, self.assertRaisesRegex(RuntimeError, "AAPL"):
+                    download_bars.main(
+                        "alpaca", str(tickers_path), directory, download_bars.ANNO,
+                        workers_num=1, update_existing=True, batch_size=1,
+                    )
+                self.assertEqual(downloader.call_count, len(arrays))
+                self.assertEqual(stored.read_bytes(), original)
+                self.assertEqual((output / "_failed_tickers.txt").read_text(), "AAPL\n")
+
     def test_ticker_update_escalates_to_full_download_on_difference(self):
         day = 24 * 60 * 60
         base = bars(
@@ -214,6 +325,18 @@ class BarUpdateTests(unittest.TestCase):
             full_since = downloader.call_args_list[1].args[2]
             self.assertGreater(incremental_since, full_since)
             np.testing.assert_array_equal(np.load(path), full_refresh)
+
+    def test_minute_request_preserves_the_planned_anchor_timestamp(self):
+        anchor = download_bars.ANNO + download_bars.timedelta(hours=14, minutes=31)
+        with (
+            mock.patch.dict(
+                download_bars.os.environ,
+                {"ALPACA_DATA_KEY": "key", "ALPACA_DATA_SECRET": "secret"},
+            ),
+            mock.patch.object(download_bars, "request_json", return_value={"bars": {}}) as requester,
+        ):
+            download_bars.download_bars_alpaca_batch(["AAPL"], anchor, "1Min")
+        self.assertEqual(requester.call_args.args[2]["start"], anchor.isoformat())
 
     def test_alpaca_batch_collects_all_symbols_across_pages(self):
         pages = [
@@ -330,6 +453,51 @@ class BarUpdateTests(unittest.TestCase):
                 )
 
         self.assertEqual(scheduled, [["NVDA", "TSLA"], ["AAPL", "MSFT"]])
+
+    def test_progress_reports_finished_work_before_a_slow_first_download(self):
+        for batch_size in (1, 2):
+            with self.subTest(batch_size=batch_size), tempfile.TemporaryDirectory() as directory:
+                progress_seen = threading.Event()
+                slow_finished = threading.Event()
+                updates = []
+
+                def process(ticker, **_kwargs):
+                    if ticker == "SLOW":
+                        progress_seen.wait(timeout=5)
+                        slow_finished.set()
+                        return False
+                    return True
+
+                def process_batch(tasks, **kwargs):
+                    return [(index, process(ticker, **kwargs)) for index, ticker, _since in tasks]
+
+                def advance(count):
+                    updates.append((count, slow_finished.is_set()))
+                    progress_seen.set()
+
+                tickers = ["SLOW", "FAST"] if batch_size == 1 else ["SLOW", "NEXT", "FAST", "LAST"]
+                tickers_path = Path(directory) / "tickers.txt"
+                tickers_path.write_text("\n".join(tickers) + "\n")
+                output = Path(directory) / "bars"
+                with (
+                    mock.patch.object(download_bars, "process_ticker", side_effect=process),
+                    mock.patch.object(download_bars, "process_alpaca_batch", side_effect=process_batch),
+                    mock.patch.object(download_bars, "tqdm") as progress,
+                    self.assertRaisesRegex(RuntimeError, "SLOW"),
+                ):
+                    progress.return_value.__enter__.return_value.update.side_effect = advance
+                    download_bars.main(
+                        source="alpaca",
+                        tickers_path=str(tickers_path),
+                        out_dir=str(output),
+                        since=download_bars.ANNO,
+                        workers_num=2,
+                        batch_size=batch_size,
+                    )
+
+                self.assertEqual(updates[0], (batch_size, False))
+                self.assertEqual(sum(count for count, _ in updates), len(tickers))
+                self.assertEqual((output / "_failed_tickers.txt").read_text(), "SLOW\n")
 
     def test_failed_batch_is_split_to_isolate_a_bad_symbol(self):
         tasks = [

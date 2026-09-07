@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
@@ -47,6 +48,7 @@ def completed_sample(
 def exact_observation_mask(data_dir: Path, sample_id: str, secs: np.ndarray) -> np.ndarray:
     """Return true where the source has a bar rather than a completed minute."""
     raw = np.load(data_dir / f"{sample_id}.npy", mmap_mode="r")
+    validate_bar_columns(raw, "1Min", "minute bars")
     raw_secs = np.asarray(raw[:, 0], dtype=np.int64)
     locations = np.searchsorted(raw_secs, secs)
     exact = locations < raw_secs.size

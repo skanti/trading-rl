@@ -20,6 +20,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from ..market_data.schema import validate_bar_columns
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
@@ -213,7 +214,8 @@ def minute_open_price(
     if not path.exists():
         raise FileNotFoundError(f"minute bars do not exist for {symbol}: {path}")
     source = np.load(path, mmap_mode="r", allow_pickle=False)
-    if source.ndim != 2 or source.shape[1] < 3 or not len(source):
+    validate_bar_columns(source, "1Min", str(path))
+    if not len(source):
         raise ValueError(f"invalid minute bars for {symbol}: {path}")
     scheduled = datetime.combine(
         session_day,

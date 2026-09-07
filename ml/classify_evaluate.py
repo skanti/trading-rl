@@ -9,6 +9,7 @@ from pathlib import Path
 
 import fsspec
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 import pandas as pd
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -38,8 +39,7 @@ from .week_dataset import forward_fill_positions, read_universe
 def _cached_price_source(data_dir: str, sample_id: str) -> np.ndarray:
     """One mmap per symbol and loader process for a large minute sweep."""
     source = np.load(f"{data_dir}/{sample_id}.npy", mmap_mode="r")
-    if source.ndim != 2 or source.shape[1] < 3:
-        raise ValueError(f"{sample_id} must contain [seconds, price_mills, volume]")
+    validate_bar_columns(source, "1Min", str(sample_id))
     return source
 
 

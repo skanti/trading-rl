@@ -10,7 +10,7 @@ def forward_fill_positions(
 ) -> np.ndarray:
     """Locate the latest valid trade at or before every requested timestamp."""
     if source.ndim != 2 or source.shape[1] < 3:
-        raise ValueError(f"{sample_id} must contain [seconds, price_mills, volume]")
+        raise ValueError(f"{sample_id} must contain timestamp and open-price columns")
     # Keep the mmap-backed seconds column zero-copy; evaluation calls this for
     # many large windows and the stored int32 range is sufficient here.
     source_secs = np.asarray(source[:, 0])

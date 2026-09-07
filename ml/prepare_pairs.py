@@ -32,6 +32,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
+from trading_rl.market_data.schema import validate_bar_columns
 import pandas as pd
 from rich.logging import RichHandler
 from tqdm import tqdm
@@ -65,8 +66,7 @@ def scan_symbol(
     multi-year file.
     """
     data = np.load(npy_path, mmap_mode="r")
-    if data.ndim != 2 or data.shape[1] < 3:
-        raise ValueError(f"{npy_path} must contain [seconds, price_mills, volume]")
+    validate_bar_columns(data, "1Min", str(npy_path))
     empty = pd.DataFrame(columns=("sample_id", "date", "sod_sec", "eod_sec"))
     secs = np.asarray(data[:, 0])
     if secs.size < 2 or not np.all(secs[:-1] < secs[1:]):

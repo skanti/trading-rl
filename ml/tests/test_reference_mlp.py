@@ -4,6 +4,7 @@ from itertools import chain
 from pathlib import Path
 
 import numpy as np
+from scripts.tests.bar_fixtures import ohlcv_fixture
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -64,11 +65,11 @@ class ShiftedReferenceMLPTest(unittest.TestCase):
             spy_secs = np.array([0, 60, 120, 180, 300, 360, 420], dtype=np.int64)
             np.save(
                 path / "ASSET.npy",
-                np.stack((asset_secs, np.arange(100_000, 100_700, 100), np.ones(7)), axis=1),
+                ohlcv_fixture(np.stack((asset_secs, np.arange(100_000, 100_700, 100), np.ones(7)), axis=1)),
             )
             np.save(
                 path / "SPY.npy",
-                np.stack((spy_secs, np.arange(500_000, 500_700, 100), np.ones(7)), axis=1),
+                ohlcv_fixture(np.stack((spy_secs, np.arange(500_000, 500_700, 100), np.ones(7)), axis=1)),
             )
             rows = []
             for symbol in ("ASSET", "SPY"):

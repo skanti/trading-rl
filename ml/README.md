@@ -173,7 +173,11 @@ test invisible to the advantage estimate.
 
 ## Train on market data
 
-Input `.npy` files must contain at least `[seconds, price_mills, volume]`. Build
+Input `.npy` files use the eight-column OHLCV schema:
+`[seconds, open_mills, high_mills, low_mills, close_mills, volume, trades, vwap_mills]`.
+Loaders read volume from its named schema position and continue using open prices.
+Legacy three/four-column files are rejected; re-download their full history into
+a new store because the additional fields cannot be recovered locally. Build
 the day/index CSV (including expected extended- and regular-session times) once,
 then configure `DATA_DIR`, `EXP_DIR`, and the paths in [main.yaml](main.yaml):
 
