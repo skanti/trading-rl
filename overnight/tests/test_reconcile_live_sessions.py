@@ -12,6 +12,7 @@ from rich.console import Console
 
 from trading_rl.overnight.backtest import BAR_ORIGIN, EASTERN
 from trading_rl.overnight.broker_fees import summarize_broker_fees
+from trading_rl.overnight.reconciliation_prices import MissingBenchmarkData
 from trading_rl.overnight.reconcile_live_sessions import (
     attach_broker_fees,
     broker_fees_for_session,
@@ -58,12 +59,9 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             parser.parse_args([]).reconciliation_mode,
             "strict-schedule",
         )
-        self.assertEqual(
-            parser.parse_args(
-                ["--reconciliation-mode", "actual-time"]
-            ).reconciliation_mode,
-            "actual-time",
-        )
+        with patch("sys.stderr", new_callable=StringIO), self.assertRaises(SystemExit) as error:
+            parser.parse_args(["--reconciliation-mode", "actual-time"])
+        self.assertEqual(error.exception.code, 2)
         self.assertEqual(
             parser.parse_args(
                 ["--reconciliation-mode", "actual-time-minute-bar"]
@@ -110,6 +108,10 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 auctions,
                 format_version=np.asarray(1, dtype=np.int16),
                 split_adjusted=np.asarray(True),
+                split_symbol=np.asarray([], dtype=str),
+                split_ex_date=np.asarray([], dtype="datetime64[D]"),
+                split_old_rate=np.asarray([], dtype=float),
+                split_new_rate=np.asarray([], dtype=float),
                 symbol=np.asarray(["AAPL"]),
                 date=np.asarray([exit_day.isoformat()], dtype="datetime64[D]"),
                 session=np.asarray([0], dtype=np.uint8),
@@ -146,6 +148,7 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 summary,
                 minute_dir,
                 auctions,
+                entry_price_source="minute-open",
                 transaction_cost_bps=1.0,
             )
 
@@ -179,6 +182,10 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 nbbo,
                 format_version=np.asarray(1, dtype=np.int16),
                 split_adjusted=np.asarray(True),
+                split_symbol=np.asarray([], dtype=str),
+                split_ex_date=np.asarray([], dtype="datetime64[D]"),
+                split_old_rate=np.asarray([], dtype=float),
+                split_new_rate=np.asarray([], dtype=float),
                 symbol=np.asarray(["AAPL"]),
                 date=np.asarray([entry_day.isoformat()], dtype="datetime64[D]"),
                 target_timestamp=np.asarray(["2026-08-28T19:59:00Z"]),
@@ -195,14 +202,24 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 transaction_cost_bps=1.0,
             )
 
-            self.assertEqual(nbbo_result["entry_price_source"], "nbbo_ask")
+            self.assertEqual(nbbo_result["entry_price_source"], "nbbo-ask")
             self.assertEqual(
-                nbbo_result["rows"][0]["simulator_entry_source"], "nbbo_ask"
+                nbbo_result["rows"][0]["simulator_entry_source"], "nbbo-ask"
             )
             self.assertAlmostEqual(
                 nbbo_result["rows"][0]["simulator_entry_price"], 101.0
             )
             self.assertEqual(nbbo_result["warnings"], [])
+
+            # Existing quotes at a different scheduled time must not be used or
+            # reported as missing at that file's time rather than the entry time.
+            with np.load(nbbo, allow_pickle=False) as stored:
+                arrays = {key: stored[key] for key in stored.files}
+            arrays["target_timestamp"] = np.asarray(["2026-08-28T19:45:00Z"])
+            arrays["timestamp"] = np.asarray(["2026-08-28T19:44:59Z"])
+            np.savez_compressed(nbbo, **arrays)
+            with self.assertRaisesRegex(MissingBenchmarkData, "15:59 ET: file contains a 15:45 ET snapshot"):
+                reconcile_execution(summary, minute_dir, auctions, nbbo_path=nbbo)
 
     def test_off_schedule_exit_adds_per_symbol_actual_time_benchmarks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -226,6 +243,10 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 auctions,
                 format_version=np.asarray(1, dtype=np.int16),
                 split_adjusted=np.asarray(True),
+                split_symbol=np.asarray([], dtype=str),
+                split_ex_date=np.asarray([], dtype="datetime64[D]"),
+                split_old_rate=np.asarray([], dtype=float),
+                split_new_rate=np.asarray([], dtype=float),
                 symbol=np.asarray(["AAPL"]),
                 date=np.asarray([exit_day.isoformat()], dtype="datetime64[D]"),
                 session=np.asarray([0], dtype=np.uint8),
@@ -256,7 +277,10 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 },
             }
 
-            result = reconcile_execution(summary, minute_dir, auctions)
+            result = reconcile_execution(
+                summary, minute_dir, auctions, entry_price_source="minute-open",
+                exit_price_source="minute-open", actual_time_benchmark=True,
+            )
 
         timing = result["timing"]
         self.assertFalse(timing["schedule_comparable"])
@@ -267,13 +291,12 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             timing["exit"]["actual_time_benchmark"],
             {
                 "alignment": "per_symbol_fill_minute",
-                "price_source": "minute_bar_open",
+                "price_source": "minute-open",
             },
         )
         warning = result["warnings"][0]
-        self.assertIn("not opening-auction comparable", warning)
-        self.assertIn("1/1 orders were submitted", warning)
-        self.assertIn("1/1 symbols exceed the 1-min tolerance", warning)
+        self.assertIn("exit is off schedule for minute-open", warning)
+        self.assertIn("1 exceed the 1-min tolerance", warning)
         self.assertNotIn("AAPL", warning)
         row = result["rows"][0]
         self.assertEqual(row["actual_time_entry_bar_at"], "2026-08-28T15:59:00-04:00")
@@ -347,6 +370,10 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 auctions,
                 format_version=np.asarray(1, dtype=np.int16),
                 split_adjusted=np.asarray(True),
+                split_symbol=np.asarray([], dtype=str),
+                split_ex_date=np.asarray([], dtype="datetime64[D]"),
+                split_old_rate=np.asarray([], dtype=float),
+                split_new_rate=np.asarray([], dtype=float),
                 symbol=np.asarray(["AAPL"]),
                 date=np.asarray([exit_day.isoformat()], dtype="datetime64[D]"),
                 session=np.asarray([0], dtype=np.uint8),
@@ -375,11 +402,14 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 },
             }
 
-            result = reconcile_execution(summary, minute_dir, auctions)
+            result = reconcile_execution(
+                summary, minute_dir, auctions, entry_price_source="minute-open",
+                exit_price_source="minute-open", actual_time_benchmark=True,
+            )
             select_reporting_benchmark(result, prefer_actual_time=True)
 
         row = result["rows"][0]
-        self.assertEqual(row["simulator_entry_price"], 100.0)
+        self.assertEqual(row["simulator_entry_price"], 101.0)
         self.assertEqual(row["actual_time_entry_price"], 101.0)
         self.assertEqual(row["actual_time_exit_price"], 110.0)
         self.assertEqual(row["actual_time_entry_bar_at"], "2026-08-28T16:02:00-04:00")

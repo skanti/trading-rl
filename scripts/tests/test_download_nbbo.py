@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 import tempfile
+import json
+import numpy as np
 import unittest
 from unittest import mock
 
@@ -77,6 +79,69 @@ class DownloadNbboTest(unittest.TestCase):
         self.assertEqual(request.call_args_list[0].args[3], ["AAPL", "MSFT"])
         self.assertEqual(request.call_args_list[1].args[3], ["MSFT", "NVDA"])
 
+    def test_exit_targets_use_the_held_basket_on_its_exit_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades.csv"
+            path.write_text(
+                "entry_date,exit_date,sample_id\n"
+                "2026-09-03,2026-09-04,AAPL\n"
+                "2026-09-04,2026-09-08,MSFT\n"
+            )
+            targets = download_nbbo.targets_from_trade_csv(path, "exit_date")
+        self.assertEqual(targets, {
+            date(2026, 9, 4): {"AAPL"}, date(2026, 9, 8): {"MSFT"},
+        })
+
+    def test_missing_exit_date_does_not_fall_back_to_entry_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades.csv"
+            path.write_text("entry_date,sample_id\n2026-09-03,AAPL\n")
+            with self.assertRaisesRegex(ValueError, "exit_date"):
+                download_nbbo.targets_from_trade_csv(path, "exit_date")
+
+    def test_invalid_latest_quotes_search_earlier_pages_within_same_window(self):
+        invalid = {"quotes": {"AAPL": [
+            {"t": "2026-09-02T13:35:00Z", "bp": 101, "ap": 100, "bs": 1, "as": 2}
+        ]}}
+        valid = {"quotes": {"AAPL": [
+            {"t": "2026-09-02T13:34:58Z", "bp": 99, "ap": 100, "bs": 1, "as": 2}
+        ]}}
+        with mock.patch.object(download_nbbo, "_quote_request", side_effect=[
+            invalid, {**invalid, "next_page_token": "older"}, valid,
+        ]) as request:
+            rows = download_nbbo._download_quote_rows(
+                mock.Mock(), {}, {date(2026, 9, 2): {"AAPL"}}, time(9, 35),
+                100, 60, download_nbbo.RateLimiter(10_000),
+            )
+        self.assertEqual(rows[0]["timestamp"], "2026-09-02T13:34:58Z")
+        self.assertEqual(request.call_count, 3)
+        for call in request.call_args_list[1:]:
+            self.assertEqual(call.args[4], datetime(2026, 9, 2, 13, 34, tzinfo=timezone.utc))
+            self.assertEqual(call.args[5], datetime(2026, 9, 2, 13, 35, tzinfo=timezone.utc))
+            self.assertEqual(call.args[6], 1000)
+        self.assertEqual(request.call_args_list[2].kwargs, {"page_token": "older"})
+
+    def test_quote_request_forwards_pagination_to_alpaca(self):
+        target = datetime(2026, 9, 2, 13, 35, tzinfo=timezone.utc)
+        with mock.patch.object(download_nbbo, "_request_json", return_value={}) as request:
+            download_nbbo._quote_request(
+                mock.Mock(), {}, mock.Mock(), ["AAPL"], target, target, 1000,
+                page_token="older",
+            )
+        params = request.call_args.args[3]
+        self.assertEqual(params["page_token"], "older")
+        self.assertEqual(params["sort"], "desc")
+
+    def test_repeated_page_token_fails_instead_of_looping_forever(self):
+        with mock.patch.object(download_nbbo, "_quote_request", return_value={
+            "quotes": {"AAPL": []}, "next_page_token": "same",
+        }):
+            with self.assertRaisesRegex(ValueError, "repeated NBBO page token"):
+                download_nbbo._latest_valid_quote(
+                    mock.Mock(), {}, mock.Mock(), "AAPL", date(2026, 9, 2),
+                    datetime(2026, 9, 2, 13, 35, tzinfo=timezone.utc), 60,
+                )
+
     def test_selects_latest_quote_at_or_before_target(self):
         day = date(2026, 9, 2)
         target = datetime(2026, 9, 2, 19, 45, tzinfo=timezone.utc)
@@ -132,7 +197,7 @@ class DownloadNbboTest(unittest.TestCase):
             ],
         )
 
-    def test_missing_or_overly_stale_target_fails_the_download(self):
+    def test_missing_or_overly_stale_target_warns_and_skips(self):
         target = datetime(2026, 9, 2, 19, 45, tzinfo=timezone.utc)
         stale = {
             "quotes": {
@@ -148,10 +213,9 @@ class DownloadNbboTest(unittest.TestCase):
             }
         }
         with mock.patch.object(download_nbbo, "_quote_request", return_value=stale):
-            with self.assertRaisesRegex(
-                ValueError, r"within 60s.*2026-09-02:AAPL"
-            ):
-                download_nbbo._download_quote_rows(
+            missing = []
+            with self.assertLogs(download_nbbo.LOGGER, level="WARNING") as warnings:
+                rows = download_nbbo._download_quote_rows(
                     mock.Mock(),
                     {},
                     {date(2026, 9, 2): {"AAPL"}},
@@ -159,7 +223,12 @@ class DownloadNbboTest(unittest.TestCase):
                     100,
                     60,
                     download_nbbo.RateLimiter(10_000),
+                    missing,
                 )
+            self.assertEqual(rows, [])
+            self.assertEqual(missing[0]["symbol"], "AAPL")
+            self.assertEqual(missing[0]["date"], "2026-09-02")
+            self.assertIn("Skipping NBBO 2026-09-02:AAPL", warnings.output[0])
 
     def test_current_snapshot_is_deferred_until_sip_delay_passes(self):
         sessions, deferred = download_nbbo.eligible_sessions(
@@ -170,6 +239,63 @@ class DownloadNbboTest(unittest.TestCase):
 
         self.assertEqual(sessions, [])
         self.assertEqual(deferred, 1)
+
+    def test_download_writes_partial_dataset_and_missing_quote_manifest(self):
+        missing = [{"date": "2026-09-02", "symbol": "AAPL", "reason": "missing"}]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nbbo.npz"
+            with mock.patch.object(download_nbbo, "_fetch", return_value=(
+                [quote_row("MSFT", "2026-09-02", 100.)], 0, missing, {"2026-09-02"},
+            )), mock.patch.object(download_nbbo, "_request_headers", return_value={}), mock.patch.object(
+                download_nbbo, "_download_splits", return_value=[]
+            ):
+                result = download_nbbo.download_nbbo(
+                    {date(2026, 9, 2): {"AAPL", "MSFT"}}, "2026-09-02", "2026-09-02",
+                    output, time(15, 45),
+                )
+            manifest = json.loads(output.with_suffix(".json").read_text())
+            with np.load(output) as data:
+                self.assertEqual(data["symbol"].tolist(), ["MSFT"])
+        self.assertEqual(result, (2, 1, 0))
+        self.assertEqual(manifest["missing_quote_count"], 1)
+        self.assertEqual(manifest["missing_quotes"], missing)
+
+    def test_all_missing_refresh_removes_old_quotes_but_deferred_refresh_keeps_them(self):
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "nbbo.npz"
+                download_nbbo._write_dataset(
+                    output, [quote_row("AAPL", "2026-09-02", 100.)], [], ["AAPL"],
+                    "2026-09-02", "2026-09-02", time(15, 45), 60, 1, 1,
+                )
+                missing = [] if deferred else [{"date": "2026-09-02", "symbol": "AAPL"}]
+                refreshed = set() if deferred else {"2026-09-02"}
+                with mock.patch.object(download_nbbo, "_fetch", return_value=(
+                    [], int(deferred), missing, refreshed,
+                )), mock.patch.object(download_nbbo, "_request_headers", return_value={}), mock.patch.object(
+                    download_nbbo, "_download_splits", return_value=[]
+                ):
+                    download_nbbo.update_nbbo(
+                        output, "2026-09-02", {date(2026, 9, 2): {"AAPL"}}, 7, 100, 60, 180,
+                    )
+                self.assertEqual(len(download_nbbo._load_raw_rows(output)), int(deferred))
+                manifest = json.loads(output.with_suffix(".json").read_text())
+                self.assertEqual(manifest["missing_quote_count"], int(not deferred))
+
+    def test_fetch_accounts_for_missing_targets_without_aborting(self):
+        def download(_session, _headers, _targets, _target, _batch, _lookback, _limiter, missing):
+            missing.append({"date": "2026-09-02", "symbol": "AAPL"})
+            return []
+        with mock.patch.object(download_nbbo, "_download_quote_rows", side_effect=download), mock.patch.object(
+            download_nbbo, "_request_headers", return_value={}
+        ), mock.patch.object(download_nbbo, "eligible_sessions", return_value=([date(2026, 9, 2)], 0)):
+            rows, deferred, missing, attempted = download_nbbo._fetch(
+                {date(2026, 9, 2): {"AAPL"}}, "2026-09-02", "2026-09-02", time(9, 35), 100, 60, 180,
+            )
+        self.assertEqual(rows, [])
+        self.assertEqual(deferred, 0)
+        self.assertEqual(missing[0]["symbol"], "AAPL")
+        self.assertEqual(attempted, {"2026-09-02"})
 
 
 if __name__ == "__main__":

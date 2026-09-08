@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import sys
-import tempfile
 import time as time_module
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -36,8 +35,9 @@ from .config import (
 from .metrics import EASTERN
 
 from trading_rl.overnight.broker_fees import (
-    classify_broker_fee_summary,
-    summarize_broker_fees,
+    FeeActivityClient,
+    broker_fees_for_session,
+    cache_fee_activities,
 )
 from trading_rl.overnight.live_config import DEFAULT_LIVE_CONFIG_PATH
 
@@ -416,86 +416,28 @@ def first_trade_date(work_dir: Path) -> date | None:
     return None
 
 
-def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
-    """Durably replace a JSON cache without exposing a partial file to readers."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(dict(payload), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _cached_fee_summary(
-    path: Path,
-    exit_day: date,
-    as_of: datetime,
-) -> dict[str, object] | None:
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("activity_date") != exit_day.isoformat():
-        return None
-    try:
-        float(payload["cost"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    return classify_broker_fee_summary(payload, exit_day, as_of=as_of)
-
-
 def _session_fee_summary(
     work_dir: Path,
     entry_day: str,
     exit_day: date,
     fee_activities: Sequence[Mapping[str, object]] | None,
     as_of: datetime,
+    fee_client: FeeActivityClient | None = None,
+    force_refresh: bool = False,
 ) -> tuple[str, dict[str, object] | None]:
-    """Resolve confirmed fees, retaining a cache while Alpaca posts new rows."""
     cache_path = work_dir / entry_day / "fee_activities.json"
-    cached = _cached_fee_summary(cache_path, exit_day, as_of)
-    if fee_activities is None:
-        if cached is None:
-            return "unavailable", None
-        status = "confirmed" if cached.get("status") == "complete" else "pending"
-        return status, cached
-
-    fresh = summarize_broker_fees(fee_activities, exit_day, fetched_at=as_of)
-    has_fees = int(fresh.get("count") or 0) > 0
-    if cached is not None and int(cached.get("count") or 0) > 0 and not has_fees:
-        # A confirmed non-zero cache is safer than an unexpectedly empty account
-        # response (for example, a transient broker inconsistency or wrong account).
-        return "confirmed", cached
-    status = "confirmed" if fresh.get("status") == "complete" else "pending"
-    stable_fields = (
-        "status",
-        "count",
-        "net_amount",
-        "cost",
-        "breakdown",
-        "activities",
-    )
-    if cached is not None and all(
-        cached.get(field) == fresh.get(field) for field in stable_fields
-    ):
-        return status, cached
-    _atomic_json(cache_path, fresh)
-    return status, fresh
+    if fee_activities is not None:
+        summary = cache_fee_activities(cache_path, exit_day, fee_activities, as_of=as_of)
+    else:
+        summary, warning = broker_fees_for_session(
+            fee_client, cache_path, exit_day, as_of=as_of, force_refresh=force_refresh,
+        )
+        if fee_client is not None and warning and (
+            summary.get("status") != "pending" or "refresh failed" in warning
+        ):
+            LOGGER.warning("broker fees for %s: %s", entry_day, warning)
+    status = summary.get("status")
+    return "confirmed" if status == "complete" else str(status), summary
 
 
 def session_records(
@@ -504,6 +446,8 @@ def session_records(
     order_history: Sequence[Mapping[str, Any]] | None = None,
     fee_activities: Sequence[Mapping[str, object]] | None = None,
     fees_as_of: datetime | None = None,
+    fee_client: FeeActivityClient | None = None,
+    force_fee_refresh: bool = False,
 ) -> list[dict[str, Any]]:
     """Turn artifacts into rows whose net P&L uses confirmed Alpaca fees."""
     if not work_dir.exists():
@@ -516,6 +460,7 @@ def session_records(
     )
 
     candidates: dict[tuple[str, str], tuple[tuple[bool, bool, str], dict[str, Any]]] = {}
+    resolved_fees: dict[tuple[str, str], tuple[str, dict[str, object] | None]] = {}
     for directory in days:
         summary_path = directory / "summary.json"
         if not summary_path.exists():
@@ -570,13 +515,17 @@ def session_records(
         fee_summary: dict[str, object] | None = None
         if position.get("status") == "closed" and exit_date:
             try:
-                fee_status, fee_summary = _session_fee_summary(
-                    work_dir,
-                    entry_date,
-                    date.fromisoformat(exit_date),
-                    fee_activities,
-                    fees_as_of or datetime.now(tz=UTC),
-                )
+                if basket_key not in resolved_fees:
+                    resolved_fees[basket_key] = _session_fee_summary(
+                        work_dir,
+                        entry_date,
+                        date.fromisoformat(exit_date),
+                        fee_activities,
+                        fees_as_of or datetime.now(tz=UTC),
+                        fee_client=fee_client,
+                        force_refresh=force_fee_refresh,
+                    )
+                fee_status, fee_summary = resolved_fees[basket_key]
             except (OSError, TypeError, ValueError) as error:
                 LOGGER.warning("could not resolve broker fees for %s: %s", entry_date, error)
                 fee_status = "unavailable"
@@ -962,6 +911,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="print one snapshot and exit")
     parser.add_argument("--once", action="store_true", help="publish one snapshot and exit")
+    parser.add_argument(
+        "--refresh-broker-fees",
+        action="store_true",
+        help="bypass fee cache refresh intervals (use with --once for a one-time refresh)",
+    )
     parser.add_argument("--interval-seconds", type=float, default=120.0)
     parser.add_argument("--sessions-limit", type=int, default=120)
     parser.add_argument(
@@ -1031,26 +985,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 order_history = client.orders(after=f"{inception.isoformat()}T00:00:00Z")
             except Exception:  # noqa: BLE001 - fall back to durable artifact summaries
                 LOGGER.warning("could not load order history; using artifact session totals")
-        fee_activities = None
-        if inception is not None:
-            try:
-                fee_activities = client.account_activities(
-                    "FEE",
-                    after=inception - timedelta(days=1),
-                    until=reference.date() + timedelta(days=1),
-                )
-                LOGGER.info(
-                    "loaded %d Alpaca fee activit%s",
-                    len(fee_activities),
-                    "y" if len(fee_activities) == 1 else "ies",
-                )
-            except Exception:  # noqa: BLE001 - confirmed per-session caches remain usable
-                LOGGER.warning("could not load broker fees; using confirmed fee caches")
         all_sessions = session_records(
             work_dir,
             limit=None,
             order_history=order_history,
-            fee_activities=fee_activities,
+            fee_client=client,
+            force_fee_refresh=args.refresh_broker_fees,
             fees_as_of=reference,
         )
         sessions = all_sessions[:args.sessions_limit]

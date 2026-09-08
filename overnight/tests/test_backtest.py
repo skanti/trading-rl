@@ -1,5 +1,7 @@
 import unittest
+from contextlib import redirect_stderr
 from datetime import date
+import io
 from pathlib import Path
 import tempfile
 
@@ -12,7 +14,9 @@ from trading_rl.market_data.calendar import auction_close_minutes, short_entry_d
 from trading_rl.overnight.backtest import (
     DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
+    MINUTE_PRICE_COLUMNS,
     basket_quantities,
+    build_parser,
     causal_ema_log_liquidity,
     causal_turnover_stability,
     causal_completed_trading_days,
@@ -47,6 +51,63 @@ def write_auction_npz(path: Path, rows: list[dict[str, object]]) -> None:
         exchange=np.asarray([row["exchange"] for row in rows]),
         timestamp=np.asarray([row.get("timestamp", "") for row in rows]),
     )
+
+
+class BacktestCliTest(unittest.TestCase):
+    def test_canonical_options_parse(self):
+        parser = build_parser()
+        canonical = parser.parse_args([
+            "--minute-bars-dir", "/tmp/minute-bars",
+            "--daily-bars-dir", "/tmp/daily-bars",
+            "--min-trading-days", "50",
+            "--entry-price-source", "minute-open",
+            "--exit-price-source", "minute-open",
+        ])
+        self.assertEqual(canonical.minute_bars_dir, "/tmp/minute-bars")
+        self.assertEqual(canonical.daily_bars_dir, "/tmp/daily-bars")
+        self.assertEqual(canonical.min_trading_days, 50)
+        self.assertEqual(canonical.entry_price_source, "minute-open")
+        self.assertEqual(canonical.exit_price_source, "minute-open")
+
+    def test_legacy_spellings_are_rejected(self):
+        parser = build_parser()
+        for option, value in (
+            ("--data-dir", "/tmp/minute-bars"),
+            ("--minimum-trading-days", "50"),
+            ("--entry-price-source", "minute"),
+            ("--exit-price-source", "minute"),
+            ("--entry-price-source", "minute-bar"),
+            ("--exit-price-source", "minute-bar"),
+        ):
+            with self.subTest(option=option):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    parser.parse_args([option, value])
+                self.assertEqual(error.exception.code, 2)
+
+    def test_defaults_preserve_execution_sources_and_history_filters(self):
+        args = build_parser().parse_args([])
+        self.assertEqual(args.entry_price_source, "minute-open")
+        self.assertEqual(args.exit_price_source, "opening-auction")
+        self.assertEqual(args.min_history_days, 20)
+        self.assertEqual(args.min_trading_days, 100)
+
+    def test_sources_remain_specific_to_entry_and_exit(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "--entry-price-source", "nbbo-ask",
+            "--exit-price-source", "opening-auction",
+        ])
+        self.assertEqual(args.entry_price_source, "nbbo-ask")
+        self.assertEqual(args.exit_price_source, "opening-auction")
+        for option, value in (
+            ("--entry-price-source", "opening-auction"),
+            ("--exit-price-source", "nbbo-ask"),
+            ("--exit-price-source", "typo"),
+        ):
+            with self.subTest(option=option, value=value):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    parser.parse_args([option, value])
+                self.assertEqual(error.exception.code, 2)
 
 
 class OvernightLiquidityBaselineTest(unittest.TestCase):
@@ -367,6 +428,24 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertAlmostEqual(whole_summary["average_capital_utilization"], 0.8)
         self.assertAlmostEqual(fractional_summary["average_capital_utilization"], 1.0)
 
+        canonical_trades, canonical_summary = run_backtest(
+            **common, entry_price_source="minute-open", exit_price_source="minute-open"
+        )
+        self.assertEqual(set(canonical_trades.entry_price_source), {"minute-open"})
+        self.assertEqual(set(canonical_trades.exit_price_source), {"minute-open"})
+        self.assertEqual(canonical_summary["entry_price_source"], "minute-open")
+        self.assertEqual(canonical_summary["exit_price_source"], "minute-open")
+        for source in ("entry_price_source", "exit_price_source"):
+            for value in ("minute", "minute-bar"):
+                with self.subTest(source=source, value=value):
+                    with self.assertRaisesRegex(ValueError, source):
+                        run_backtest(**common, **{source: value})
+            for value in MINUTE_PRICE_COLUMNS:
+                with self.subTest(source=source, value=value):
+                    trades, summary = run_backtest(**common, **{source: value})
+                    self.assertEqual(set(trades[source]), {value})
+                    self.assertEqual(summary[source], value)
+
     def test_short_session_is_skipped_for_entry_but_remains_the_prior_exit(self):
         dates = pd.DatetimeIndex(
             ["2026-11-24", "2026-11-25", "2026-11-27", "2026-11-30", "2026-12-01"]
@@ -458,11 +537,8 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         morning_prices = np.array([[100.0, 101.0, 101.0]] * 4)
         staleness = np.zeros_like(entry_prices)
 
-        with self.assertRaisesRegex(
-            ValueError,
-            r"fresh scheduled NBBO entry on 2026-08-26: HIGH",
-        ):
-            run_backtest(
+        with self.assertLogs("trading_rl.overnight.backtest", level="WARNING") as warnings:
+            trades, summary = run_backtest(
                 dates=dates,
                 symbols=symbols,
                 dollar_volume=dollar_volume,
@@ -482,6 +558,12 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
                 liquidity_scheme="dollar_ema",
                 entry_price_source="nbbo-ask",
             )
+
+        self.assertTrue(trades.empty)
+        self.assertEqual(summary["ending_equity"], 1.0)
+        self.assertEqual(summary["skipped_missing_prices"], 1)
+        self.assertIn("HIGH", warnings.output[0])
+        self.assertNotIn("LOW", warnings.output[0])
 
     def test_completed_trading_day_count_is_strictly_lagged(self):
         volume = np.array(
@@ -564,15 +646,32 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             "spy_overnight_metrics": metrics,
             "spy_buy_and_hold_metrics": metrics,
         }
-        console = Console(record=True, width=100, color_system=None)
-        print_summary_table(summary, console)
-        rendered = console.export_text()
+        for entry in (*MINUTE_PRICE_COLUMNS, "nbbo-ask"):
+            for exit_source in (*MINUTE_PRICE_COLUMNS, "opening-auction", "nbbo-bid"):
+                with self.subTest(entry=entry, exit=exit_source):
+                    summary["entry_price_source"] = entry
+                    summary["exit_price_source"] = exit_source
+                    summary["entry_time_eastern"] = "15:45"
+                    summary["exit_time_eastern"] = "09:30 next trading session"
+                    console = Console(file=io.StringIO(), record=True, width=160, color_system=None)
+                    print_summary_table(summary, console)
+                    rendered = console.export_text()
 
-        self.assertIn("Overnight liquidity baseline", rendered)
-        self.assertIn("Top 50", rendered)
-        self.assertIn("SPY overnight", rendered)
-        self.assertIn("SPY buy & hold", rendered)
-        self.assertNotIn('"strategy_metrics"', rendered)
+                    self.assertIn("Overnight liquidity baseline", rendered)
+                    self.assertIn("Top 50", rendered)
+                    self.assertIn("SPY overnight", rendered)
+                    self.assertIn("SPY buy & hold", rendered)
+                    self.assertNotIn('"strategy_metrics"', rendered)
+                    self.assertRegex(rendered, rf"Entry price source\s+{entry}:.*15:45")
+                    self.assertRegex(rendered, rf"Exit price source\s+{exit_source}:.*09:30")
+                    if entry in MINUTE_PRICE_COLUMNS and entry != "minute-open":
+                        self.assertIn("15:45–15:46 Eastern (hypothetical fill)", rendered)
+                    if exit_source in MINUTE_PRICE_COLUMNS and exit_source != "minute-open":
+                        self.assertIn("09:30–09:31 Eastern (hypothetical fill)", rendered)
+                    if entry == "nbbo-ask":
+                        self.assertIn("latest causal SIP ask", rendered)
+                    if exit_source == "opening-auction":
+                        self.assertIn("primary opening auction", rendered)
 
     def test_liquidity_scores_support_only_live_ranking_schemes(self):
         dollar = np.array([[100.0, 1_000.0], [110.0, 900.0], [120.0, 800.0]])

@@ -27,7 +27,16 @@ the Admin SDK, which bypasses rules.
 
 The chart is dated by basket exit day and compounds strategy net P&L: closed-basket fill
 P&L less confirmed Alpaca `FEE` account activities booked on the exit date. The daemon
-caches those activities beside the live summary. Newly closed sessions appear
+caches those activities beside the live summary in
+`<work-dir>/<entry-date>/fee_activities.json`, shared with `trading-reconcile`.
+Dashboard polls use the cache: pending fees and exit dates within the last seven
+calendar days are checked hourly; older confirmed dates are checked weekly for
+corrections. Each request covers only a due session's exit-date window, rather than
+the full account history. Successful checks update `last_checked_at` even when the
+fees are unchanged. Use `trading-dashboard --once --refresh-broker-fees` to bypass
+these intervals. Failed checks retain the cache, and an empty response cannot erase
+previously observed fees. An empty cache becomes confirmed zero only after a
+successful check beyond the posting grace period. Newly closed sessions appear
 immediately using gross fill P&L with zero fees assumed. Performance buckets and digest
 emails label these results as `provisional`; the final chart segment is dashed, and
 provisional sessions remain excluded from risk statistics until fees post, normally the

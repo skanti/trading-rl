@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -735,6 +735,83 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(confirmed_zero["fee_status"], "confirmed")
         self.assertEqual(confirmed_zero["fee_cost"], 0.0)
         self.assertEqual(confirmed_zero["realized_pnl"], 10.0)
+
+
+class FeeCacheIntegrationTest(unittest.TestCase):
+    def write_session(self, root, entry_day, exit_day):
+        payload = {
+            "trading_day": entry_day,
+            "position": {
+                "status": "closed", "entry_date": entry_day, "exit_date": exit_day,
+                "entry_orders": {"NVDA": order(10, 100)},
+                "exit_orders": {"NVDA": order(10, 101)},
+            },
+        }
+        folder = root / entry_day
+        folder.mkdir()
+        (folder / "summary.json").write_text(json.dumps(payload))
+        return payload
+
+    def test_dashboard_and_reconciler_share_cache_and_force_refresh(self):
+        from trading_rl.overnight.reconcile_live_sessions import broker_fees_for_session
+
+        now = datetime(2026, 9, 2, 16, tzinfo=timezone.utc)
+        client = mock.Mock()
+        client.account_activities.return_value = [
+            {"activity_type": "FEE", "date": "2026-09-01", "net_amount": "-0.21"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self.write_session(root, "2026-08-31", "2026-09-01")
+            # Entry and exit artifact copies must not cause duplicate requests,
+            # including when the user explicitly bypasses the cache interval.
+            (root / "2026-09-01").mkdir()
+            (root / "2026-09-01" / "summary.json").write_text(json.dumps(payload))
+            records = session_records(root, fee_client=client, fees_as_of=now)
+            self.assertEqual(len(records), 1)
+            self.assertAlmostEqual(records[0]["fee_cost"], 0.21)
+            client.account_activities.assert_called_once_with(
+                "FEE", after=date(2026, 8, 31), until=date(2026, 9, 5),
+            )
+            cache = root / "2026-08-31" / "fee_activities.json"
+            cached, warning = broker_fees_for_session(client, cache, date(2026, 9, 1), as_of=now)
+            self.assertEqual(cached["cost"], 0.21)
+            self.assertIsNone(warning)
+            session_records(root, fee_client=client, fees_as_of=now + timedelta(minutes=2))
+            client.account_activities.assert_called_once()
+
+            client.account_activities.return_value[0]["net_amount"] = "-0.25"
+            broker_fees_for_session(client, cache, date(2026, 9, 1), as_of=now, force_refresh=True)
+            records = session_records(root, fee_client=client, fees_as_of=now)
+            self.assertEqual(records[0]["fee_cost"], 0.25)
+            self.assertEqual(client.account_activities.call_count, 2)
+            session_records(root, fee_client=client, fees_as_of=now, force_fee_refresh=True)
+            self.assertEqual(client.account_activities.call_count, 3)
+
+    def test_poll_refreshes_only_due_dates(self):
+        now = datetime(2026, 9, 2, 16, tzinfo=timezone.utc)
+        client = mock.Mock()
+        client.account_activities.return_value = [
+            {"activity_type": "FEE", "date": day, "net_amount": "-0.21"}
+            for day in ("2026-08-04", "2026-09-01")
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(root, "2026-08-03", "2026-08-04")
+            self.write_session(root, "2026-08-31", "2026-09-01")
+            session_records(root, fee_client=client, fees_as_of=now)
+            self.assertEqual(client.account_activities.call_count, 2)
+            client.reset_mock()
+            session_records(root, fee_client=client, fees_as_of=now + timedelta(hours=1))
+            client.account_activities.assert_called_once_with(
+                "FEE", after=date(2026, 8, 31), until=date(2026, 9, 5),
+            )
+
+    def test_cli_exposes_explicit_fee_refresh(self):
+        from trading_rl.overnight.reconcile_live_sessions import build_parser as reconcile_parser
+
+        self.assertTrue(build_parser().parse_args(["--once", "--refresh-broker-fees"]).refresh_broker_fees)
+        self.assertTrue(reconcile_parser().parse_args(["--refresh-broker-fees"]).refresh_broker_fees)
 
 
 class SafetyTest(unittest.TestCase):

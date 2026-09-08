@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -31,8 +32,16 @@ import requests
 
 from ..market_data.calendar import auction_close_minutes, short_entry_dates
 from ..market_data.schema import BAR_INDEX, validate_bar_columns, validate_bar_manifest
-from .price_utils import forward_fill_positions
 
+
+LOGGER = logging.getLogger(__name__)
+
+MINUTE_PRICE_COLUMNS = {
+    f"minute-{field}": BAR_INDEX[f"{field}_mills"]
+    for field in ("open", "high", "low", "close", "vwap")
+}
+ENTRY_PRICE_SOURCES = (*MINUTE_PRICE_COLUMNS, "nbbo-ask")
+EXIT_PRICE_SOURCES = (*MINUTE_PRICE_COLUMNS, "opening-auction", "nbbo-bid")
 
 REFERENCE_SYMBOL = "SPY"
 DEFAULT_TRANSACTION_COST_BPS = 1.0
@@ -55,6 +64,7 @@ DEFAULT_DATA_DIR = "/data/ppv1/updates/bars_1min_2022-01-01"
 DEFAULT_DAILY_DATA_DIR = "/data/ppv1/updates/bars_1day_2022-01-01"
 DEFAULT_AUCTIONS_PATH = "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
 DEFAULT_NBBO_PATH = "/data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz"
+DEFAULT_EXIT_NBBO_PATH = "/data/ppv1/updates/alpaca_nbbo_0935_2022-01-01.npz"
 DEFAULT_SECURITY_MASTER_CACHE = "/tmp/trading/baseline_cache/nasdaq_security_master.json"
 NASDAQ_SYMBOL_DIRECTORY_URLS = (
     "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
@@ -70,6 +80,21 @@ OPERATING_TRUST_PATTERN = re.compile(
     r"\b(common stock|reit|realty|properties|property|commercial|residential|mortgage)\b",
     re.IGNORECASE,
 )
+
+
+def resolve_transaction_cost_bps(
+    value: float | None, entry_price_source: str, exit_price_source: str,
+) -> float:
+    """Default additional costs by source pair, preserving explicit overrides."""
+    if value is None:
+        value = (
+            0.0
+            if (entry_price_source, exit_price_source) == ("nbbo-ask", "opening-auction")
+            else DEFAULT_TRANSACTION_COST_BPS
+        )
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("transaction_cost_bps must be finite and non-negative")
+    return float(value)
 
 
 def _security_symbol(sample_id: str) -> str:
@@ -218,12 +243,16 @@ def load_opening_auction_prices(
     return prices
 
 
-def load_scheduled_nbbo_asks(
+def load_scheduled_nbbo_prices(
     path: Path,
     dates: pd.DatetimeIndex,
     symbols: np.ndarray,
+    side: str,
+    target_minute: int | None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Build adjusted scheduled-ask and quote-age matrices from an NBBO NPZ."""
+    """Load one quote side at the configured clock; missing rows remain unavailable."""
+    if side not in {"bid", "ask"}:
+        raise ValueError("NBBO side must be bid or ask")
     if path.suffix.lower() != ".npz":
         raise ValueError(f"NBBO data must use the split-adjusted NPZ format: {path}")
     with np.load(path, allow_pickle=False) as data:
@@ -232,9 +261,9 @@ def load_scheduled_nbbo_asks(
             "date",
             "target_timestamp",
             "timestamp",
-            "ask_price",
-            "raw_ask_price",
-            "ask_exchange",
+            f"{side}_price",
+            f"raw_{side}_price",
+            f"{side}_exchange",
         }
         missing = required.difference(data.files)
         if missing:
@@ -253,9 +282,9 @@ def load_scheduled_nbbo_asks(
         stamps = pd.to_datetime(
             np.asarray(data["timestamp"]).astype(str, copy=False), utc=True
         )
-        asks = np.asarray(data["ask_price"], dtype=np.float64)
-        raw_asks = np.asarray(data["raw_ask_price"], dtype=np.float64)
-        exchanges = np.asarray(data["ask_exchange"]).astype(str, copy=False)
+        quote_prices = np.asarray(data[f"{side}_price"], dtype=np.float64)
+        raw_prices = np.asarray(data[f"raw_{side}_price"], dtype=np.float64)
+        exchanges = np.asarray(data[f"{side}_exchange"]).astype(str, copy=False)
         wanted_dates = np.asarray(pd.DatetimeIndex(dates), dtype="datetime64[D]")
         wanted_symbols = np.asarray(
             [_security_symbol(sample_id) for sample_id in symbols], dtype=str
@@ -263,17 +292,30 @@ def load_scheduled_nbbo_asks(
         selected = (
             np.isin(date_values, wanted_dates)
             & np.isin(symbol_values, wanted_symbols)
-            & np.isfinite(asks)
-            & (asks > 0.0)
+            & np.isfinite(quote_prices)
+            & (quote_prices > 0.0)
         )
+        local_targets = targets[selected].tz_convert("America/New_York")
+        if (
+            (target_minute is not None and
+             ((local_targets.hour * 60 + local_targets.minute) != target_minute).any())
+            or (local_targets.second != 0).any()
+            or (local_targets.microsecond != 0).any()
+            or (local_targets.nanosecond != 0).any()
+            or not np.array_equal(
+                local_targets.tz_localize(None).normalize().to_numpy(dtype="datetime64[D]"),
+                date_values[selected],
+            )
+        ):
+            raise ValueError(f"{path} NBBO target timestamps do not match the configured time/date")
         if (stamps[selected] > targets[selected]).any():
             raise ValueError(f"{path} contains a post-target NBBO quote")
         rows = pd.DataFrame(
             {
                 "symbol": symbol_values[selected],
                 "date": pd.to_datetime(date_values[selected]),
-                "price": asks[selected],
-                "raw_price": raw_asks[selected],
+                "price": quote_prices[selected],
+                "raw_price": raw_prices[selected],
                 "staleness_minutes": (
                     (targets[selected] - stamps[selected]).total_seconds() / 60.0
                 ),
@@ -297,6 +339,13 @@ def load_scheduled_nbbo_asks(
         "staleness_minutes"
     ].to_numpy()[valid]
     return prices, staleness, rows
+
+
+def load_scheduled_nbbo_asks(
+    path: Path, dates: pd.DatetimeIndex, symbols: np.ndarray,
+    target_minute: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    return load_scheduled_nbbo_prices(path, dates, symbols, "ask", target_minute)
 
 
 # "Alphabet Inc. - Class C Capital Stock" and "Alphabet Inc. - Class A Common Stock"
@@ -781,9 +830,14 @@ def _cache_metadata(
     end_date: pd.Timestamp,
     entry_minute: int,
     exit_minute: int,
+    entry_price_source: str = "minute-open",
+    exit_price_source: str = "minute-open",
 ) -> dict[str, object]:
     return {
-        "version": 7,
+        "version": 8,
+        "entry_price_source": entry_price_source,
+        "exit_price_source": exit_price_source,
+        "minute_price_timing": "bar-start-labelled execution window",
         "minute_data": _manifest_fingerprint(minute_data_dir, "1Min"),
         "daily_data": _manifest_fingerprint(daily_data_dir, "1Day"),
         "start_date": str(start_date.date()),
@@ -802,6 +856,8 @@ def _symbol_daily_arrays(
     entry_minute: int,
     exit_minute: int,
     date_count: int,
+    entry_price_source: str = "minute-open",
+    exit_price_source: str = "minute-open",
 ) -> tuple[
     str,
     np.ndarray,
@@ -876,33 +932,29 @@ def _symbol_daily_arrays(
     if len(source) and not np.all(source_seconds[:-1] < source_seconds[1:]):
         raise ValueError(f"{source_path} timestamps must be strictly increasing")
 
-    # Prices are requested for every exchange session, including a selected
-    # stock's first missing session. Keeping the last observable mark is causal;
-    # the caller applies separate entry and exit staleness limits.
-    session_starts = context_sod
-    entry_secs = session_starts + (int(entry_minute) - EXTENDED_OPEN_MINUTE) * 60
-    morning_secs = session_starts + (int(exit_minute) - EXTENDED_OPEN_MINUTE) * 60
-    requested = np.concatenate((entry_secs, morning_secs))
-    available = np.searchsorted(source_seconds, requested, side="right") > 0
-    prices = np.full(len(requested), np.nan, dtype=np.float64)
-    staleness = np.full(len(requested), np.inf, dtype=np.float64)
-    if available.any():
-        price_positions = forward_fill_positions(source, requested[available], sample_id)
-        observed_seconds = np.asarray(source[price_positions, 0], dtype=np.int64)
-        observed_prices = np.asarray(source[price_positions, 1], dtype=np.float64) / 1000.0
-        valid_price = np.isfinite(observed_prices) & (observed_prices > 0.0)
-        target_positions = np.flatnonzero(available)
-        prices[target_positions[valid_price]] = observed_prices[valid_price]
-        staleness[target_positions[valid_price]] = (
-            requested[target_positions[valid_price]] - observed_seconds[valid_price]
-        ) / 60.0
-    split = date_count
-    entry = prices[:split]
-    morning = prices[split:]
-    entry_prices[:] = entry
-    morning_prices[:] = morning
-    entry_staleness[:] = staleness[:split]
-    morning_staleness[:] = staleness[split:]
+    # Non-open fields describe hypothetical execution over the labelled minute.
+    # Never select a later bar; missing fields use only an earlier valid value
+    # of the same field, with its age passed to the existing staleness checks.
+    # External NBBO/auction prices replace these baseline arrays in main().
+    for minute, price_source, prices, staleness in (
+        (entry_minute, entry_price_source, entry_prices, entry_staleness),
+        (exit_minute, exit_price_source, morning_prices, morning_staleness),
+    ):
+        bar_source = (
+            "minute-open"
+            if price_source in {"nbbo-ask", "nbbo-bid", "opening-auction"}
+            else price_source
+        )
+        column = MINUTE_PRICE_COLUMNS[bar_source]
+        values = source[:, column]
+        valid_positions = np.flatnonzero(np.isfinite(values) & (values > 0))
+        valid_seconds = source_seconds[valid_positions]
+        requested = context_sod + (int(minute) - EXTENDED_OPEN_MINUTE) * 60
+        positions = np.searchsorted(valid_seconds, requested, side="right") - 1
+        available = positions >= 0
+        observed_positions = valid_positions[positions[available]]
+        prices[available] = np.asarray(values[observed_positions], dtype=np.float64) / 1000.0
+        staleness[available] = (requested[available] - source_seconds[observed_positions]) / 60.0
     return (
         sample_id,
         dollar_liquidity,
@@ -921,6 +973,8 @@ def build_daily_cache(
     entry_minute: int,
     exit_minute: int,
     workers: int,
+    entry_price_source: str = "minute-open",
+    exit_price_source: str = "minute-open",
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -951,6 +1005,8 @@ def build_daily_cache(
             entry_minute,
             exit_minute,
             len(dates),
+            entry_price_source,
+            exit_price_source,
         )
 
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
@@ -993,6 +1049,8 @@ def load_or_build_cache(
     exit_minute: int,
     workers: int,
     rebuild: bool,
+    entry_price_source: str = "minute-open",
+    exit_price_source: str = "minute-open",
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -1024,6 +1082,8 @@ def load_or_build_cache(
         entry_minute,
         exit_minute,
         workers,
+        entry_price_source,
+        exit_price_source,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=cache_path.parent, suffix=".npz", delete=False) as temporary:
@@ -1107,6 +1167,13 @@ def liquidity_scores(
     raise ValueError(f"unknown liquidity scheme: {scheme}")
 
 
+def _benchmark_metrics(returns: pd.Series) -> dict[str, object]:
+    if np.isfinite(returns.to_numpy()).all():
+        return strategy_metrics(returns)
+    return {key: 0 if key == "periods" else float("nan")
+            for key in strategy_metrics(np.zeros(1))}
+
+
 def _metric_text(summary: dict[str, object]) -> str:
     minimum_trading_days = int(summary["minimum_completed_trading_days"])
     if summary["liquidity_scheme"] == "dollar_ema":
@@ -1139,7 +1206,7 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
     comparison.add_column("SPY buy & hold", justify="right")
     strategy_trades = int(summary["trades"])
     spy_overnight_trades = int(spy_overnight["periods"])
-    trade_counts = (strategy_trades, spy_overnight_trades, 1)
+    trade_counts = (strategy_trades, spy_overnight_trades, int(spy_buy_hold["periods"] > 0))
     best_trade_count = min(trade_counts)
     comparison.add_row(
         "Round trips",
@@ -1179,7 +1246,7 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         )
         formatted = []
         for value in values:
-            text = f"{value:.{precision}f}{suffix}"
+            text = "n/a" if np.isnan(value) else f"{value:.{precision}f}{suffix}"
             if np.isfinite(value) and np.isclose(value, winning_value):
                 text = f"[bold]{text}[/bold]"
             formatted.append(text)
@@ -1206,12 +1273,41 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         _metric_text(summary),
     )
     details.add_row("Cost", f"{summary['transaction_cost_bps_per_side']:.2f} bps per side")
-    details.add_row(
-        "Exit pricing",
-        "split-adjusted primary opening auction (Alpaca SIP condition O)"
-        if summary.get("exit_price_source") == "opening-auction"
-        else f"Alpaca SIP minute-bar open at {str(summary['exit_time_eastern']).split()[0]}",
-    )
+    source_descriptions = {
+        **{
+            source: f"Alpaca SIP minute-bar {source.removeprefix('minute-')}"
+            for source in MINUTE_PRICE_COLUMNS
+        },
+        "nbbo-ask": "latest causal SIP ask",
+        "nbbo-bid": "latest causal SIP bid",
+        "opening-auction": "split-adjusted primary opening auction (Alpaca SIP condition O)",
+    }
+    for side in ("entry", "exit"):
+        source = summary[f"{side}_price_source"]
+        clock = str(summary[f"{side}_time_eastern"]).split()[0]
+        timing = f"at {clock} Eastern"
+        if source in MINUTE_PRICE_COLUMNS and source != "minute-open":
+            hour, minute = map(int, clock.split(":"))
+            end_minute = (hour * 60 + minute + 1) % (24 * 60)
+            timing = (
+                f"during {clock}–{end_minute // 60:02d}:{end_minute % 60:02d} Eastern "
+                "(hypothetical fill)"
+            )
+        details.add_row(
+            f"{side.title()} price source",
+            f"{source}: {source_descriptions[source]} {timing}",
+        )
+    if summary.get("skipped_missing_prices", 0):
+        details.add_row(
+            "WARNING: missing prices",
+            f"{summary['skipped_missing_prices']} symbol/date positions skipped across "
+            f"{summary['missing_price_sessions']} sessions; original allocations held as cash. "
+            "Missing exits are retrospective exclusions.",
+        )
+    if summary.get("missing_benchmark_sessions", 0):
+        details.add_row("WARNING: benchmark gaps",
+                        f"{summary['missing_benchmark_sessions']} sessions unavailable; "
+                        "benchmark aggregate metrics are not reported")
     if summary.get("budget") is not None:
         details.add_row(
             "Position sizing",
@@ -1376,7 +1472,7 @@ def run_backtest(
     reference_symbol: str = REFERENCE_SYMBOL,
     share_mode: str = "fractional",
     budget: float | None = None,
-    entry_price_source: str = "minute-bar",
+    entry_price_source: str = "minute-open",
     exit_price_source: str = "opening-auction",
     execution_exchange_mask: np.ndarray | None = None,
     entry_session_mask: np.ndarray | None = None,
@@ -1387,10 +1483,10 @@ def run_backtest(
         raise ValueError("minimum_trading_days must be positive")
     if share_mode not in {"fractional", "whole"}:
         raise ValueError("share_mode must be 'fractional' or 'whole'")
-    if entry_price_source not in {"minute-bar", "nbbo-ask"}:
-        raise ValueError("entry_price_source must be 'minute-bar' or 'nbbo-ask'")
-    if exit_price_source not in {"minute", "opening-auction"}:
-        raise ValueError("exit_price_source must be 'minute' or 'opening-auction'")
+    if entry_price_source not in ENTRY_PRICE_SOURCES:
+        raise ValueError(f"entry_price_source must be one of {ENTRY_PRICE_SOURCES}")
+    if exit_price_source not in EXIT_PRICE_SOURCES:
+        raise ValueError(f"exit_price_source must be one of {EXIT_PRICE_SOURCES}")
     if budget is not None and (not np.isfinite(budget) or float(budget) <= 0.0):
         raise ValueError("budget must be finite and positive")
     if share_mode == "whole" and budget is None:
@@ -1425,6 +1521,11 @@ def run_backtest(
     cost = 2.0 * float(transaction_cost_bps) / 10_000.0
 
     pieces: list[pd.DataFrame] = []
+    session_records: list[dict[str, object]] = []
+    skipped_prices: list[dict[str, object]] = []
+    missing_benchmark_dates: list[str] = []
+    entry_age_limit = min(max_entry_staleness_minutes, 1) if entry_price_source == "nbbo-ask" else max_entry_staleness_minutes
+    exit_age_limit = min(max_exit_staleness_minutes, 1) if exit_price_source == "nbbo-bid" else max_exit_staleness_minutes
     spy_returns: list[float] = []
     spy_exit_prices: list[float] = []
     current_equity = simulation_budget
@@ -1438,7 +1539,7 @@ def run_backtest(
         # selected for each session, not a price for every security in the ranking
         # universe.  Ranking on that sparse price matrix would let a missing quote
         # silently replace an intended member with a lower-ranked name.  Rank first
-        # in NBBO mode, then require every selected member to have its scheduled ask.
+        # in NBBO mode, then skip unavailable members without replacing their ranks.
         ranking_entries = (
             np.ones_like(executable_entries)
             if entry_price_source == "nbbo-ask"
@@ -1464,45 +1565,50 @@ def run_backtest(
         selected_ranks = np.arange(1, int(top) + 1)
         selected_entries = entry_prices[date_index, selected]
         selected_entry_staleness = entry_staleness[date_index, selected]
+        exits = morning_prices[date_index + 1, selected]
+        exit_staleness = morning_staleness[date_index + 1, selected]
         missing_entry = (
-            ~np.isfinite(selected_entries)
-            | (selected_entries <= 0.0)
+            ~np.isfinite(selected_entries) | (selected_entries <= 0.0)
             | ~np.isfinite(selected_entry_staleness)
-            | (selected_entry_staleness > int(max_entry_staleness_minutes))
+            | (selected_entry_staleness > entry_age_limit)
         )
-        if missing_entry.any():
-            missing = symbols[selected[missing_entry]]
-            raise ValueError(
-                f"selected symbols lack a fresh scheduled NBBO entry on "
-                f"{dates[date_index].date()}: " + ", ".join(missing.tolist())
-            )
+        missing_exit = (
+            ~np.isfinite(exits) | (exits <= 0.0)
+            | ~np.isfinite(exit_staleness) | (exit_staleness > exit_age_limit)
+        )
+        missing = missing_entry | missing_exit
+        for index in np.flatnonzero(missing):
+            reason = ", ".join(side for side, mask in (("entry", missing_entry), ("exit", missing_exit)) if mask[index])
+            record = {
+                "symbol": str(symbols[selected[index]]),
+                "entry_date": str(dates[date_index].date()),
+                "exit_date": str(dates[date_index + 1].date()),
+                "reason": f"missing or stale {reason} price",
+            }
+            skipped_prices.append(record)
+            LOGGER.warning("Skipping %s (%s -> %s): %s; allocation remains cash",
+                           record["symbol"], record["entry_date"], record["exit_date"], record["reason"])
         session_budget = current_equity
-        quantities = basket_quantities(selected_entries, session_budget, share_mode)
+        quantities = np.zeros(len(selected), dtype=np.float64)
+        valid = ~missing
+        if valid.any():
+            # Preserve the original per-stock allocation, including skipped slots.
+            quantities[valid] = basket_quantities(
+                selected_entries[valid], session_budget * (valid.sum() / int(top)), share_mode
+            )
         executed = quantities > 0.0
         skipped = int((~executed).sum())
-        if not executed.any():
+        if not executed.any() and not missing.any():
             raise ValueError(
                 f"equity ${session_budget:,.2f} cannot buy one share from the selected "
                 f"basket on {dates[date_index].date()}"
             )
         selected = selected[executed]
-        selected_local = selected_local[executed]
         selected_ranks = selected_ranks[executed]
         selected_entries = selected_entries[executed]
         quantities = quantities[executed]
-        exits = morning_prices[date_index + 1, selected]
-        exit_staleness = morning_staleness[date_index + 1, selected]
-        missing_exit = (
-            ~np.isfinite(exits)
-            | (exits <= 0.0)
-            | (exit_staleness > int(max_exit_staleness_minutes))
-        )
-        if missing_exit.any():
-            missing = stock_symbols[selected_local[missing_exit]]
-            raise ValueError(
-                f"selected symbols lack a fresh next-session exit on {dates[date_index].date()}: "
-                + ", ".join(missing.tolist())
-            )
+        exits = exits[executed]
+        exit_staleness = exit_staleness[executed]
         gross = exits / selected_entries - 1.0
         entry_notional = quantities * selected_entries
         exit_notional = quantities * exits
@@ -1513,6 +1619,16 @@ def run_backtest(
         session_net_pnl = float(net_pnl.sum())
         session_return = session_net_pnl / session_budget
         current_equity = session_budget + session_net_pnl
+        session_records.append({
+            "entry_date": str(dates[date_index].date()),
+            "exit_date": str(dates[date_index + 1].date()),
+            "portfolio_start_equity": session_budget,
+            "portfolio_end_equity": current_equity,
+            "portfolio_return": session_return,
+            "capital_deployed": float(entry_notional.sum()),
+            "skipped_selections": skipped,
+            "skipped_missing_prices": int(missing.sum()),
+        })
         pieces.append(
             pd.DataFrame(
                 {
@@ -1550,20 +1666,28 @@ def run_backtest(
         spy_entry = entry_prices[date_index, reference_index]
         spy_exit = morning_prices[date_index + 1, reference_index]
         if (
-            not np.isfinite(spy_entry)
-            or not np.isfinite(spy_exit)
-            or entry_staleness[date_index, reference_index] > int(max_entry_staleness_minutes)
-            or morning_staleness[date_index + 1, reference_index] > int(max_exit_staleness_minutes)
+            not np.isfinite(spy_entry) or spy_entry <= 0.0
+            or not np.isfinite(spy_exit) or spy_exit <= 0.0
+            or not np.isfinite(entry_staleness[date_index, reference_index])
+            or not np.isfinite(morning_staleness[date_index + 1, reference_index])
+            or entry_staleness[date_index, reference_index] > entry_age_limit
+            or morning_staleness[date_index + 1, reference_index] > exit_age_limit
         ):
-            raise ValueError(f"{reference_symbol} lacks a fresh entry or exit on {dates[date_index].date()}")
-        spy_returns.append(float(spy_exit / spy_entry - 1.0 - cost))
-        spy_exit_prices.append(float(spy_exit))
+            day = str(dates[date_index].date())
+            missing_benchmark_dates.append(day)
+            LOGGER.warning("%s benchmark unavailable for %s -> %s: missing or stale price",
+                           reference_symbol, day, dates[date_index + 1].date())
+            spy_returns.append(float("nan"))
+            spy_exit_prices.append(float("nan"))
+        else:
+            spy_returns.append(float(spy_exit / spy_entry - 1.0 - cost))
+            spy_exit_prices.append(float(spy_exit))
 
     trades = pd.concat(pieces, ignore_index=True)
-    deployed_by_entry = trades.groupby("entry_date", sort=True).entry_notional.sum()
-    equity_by_entry = trades.groupby("entry_date", sort=True).portfolio_start_equity.first()
-    utilization_by_entry = deployed_by_entry / equity_by_entry
-    unlevered_daily = trades.groupby("entry_date", sort=True).portfolio_return.first()
+    sessions = pd.DataFrame(session_records).set_index("entry_date")
+    deployed_by_entry = sessions.capital_deployed
+    utilization_by_entry = deployed_by_entry / sessions.portfolio_start_equity
+    unlevered_daily = sessions.portfolio_return
 
     # Leverage is not a free scalar. Scaling returns alone leaves the Sharpe ratio
     # unchanged, so it would say nothing. What makes it a real trade-off is the borrow
@@ -1574,7 +1698,7 @@ def run_backtest(
     # rate / 360 per CALENDAR day, so a Friday entry held to Monday is charged three
     # days, not one. Deriving the accrual from each trade's actual entry-to-exit span
     # captures weekends and holidays instead of assuming a flat trading-day divisor.
-    exit_by_entry = trades.groupby("entry_date", sort=True).exit_date.first()
+    exit_by_entry = sessions.exit_date
     holding_days = pd.Series(
         (pd.to_datetime(exit_by_entry.values) - pd.to_datetime(exit_by_entry.index)).days,
         index=exit_by_entry.index,
@@ -1601,16 +1725,17 @@ def run_backtest(
     spy_buy_hold_returns[-1] -= side_cost
     spy_buy_hold_daily = pd.Series(spy_buy_hold_returns, index=daily.index, dtype=np.float64)
     difference_buy_hold = daily - spy_buy_hold_daily
-    memberships = [set(group.sample_id) for _, group in trades.groupby("entry_date", sort=True)]
+    by_date = {day: set(group.sample_id) for day, group in trades.groupby("entry_date", sort=True)}
+    memberships = [by_date.get(day, set()) for day in sessions.index]
     replacements = [
         len(current - previous) for previous, current in zip(memberships, memberships[1:])
     ]
     retentions = [
-        len(current & previous) / len(current)
+        len(current & previous) / len(current) if current else 1.0
         for previous, current in zip(memberships, memberships[1:])
     ]
     jaccards = [
-        len(current & previous) / len(current | previous)
+        len(current & previous) / len(current | previous) if current | previous else 1.0
         for previous, current in zip(memberships, memberships[1:])
     ]
     # A levered book is force-liquidated when equity / position value falls through the
@@ -1636,10 +1761,10 @@ def run_backtest(
         keys = [resolved[symbol] for symbol in group.sample_id]
         same_issuer_days += len(keys) != len(set(keys))
 
-    executed_basket_sizes = trades.groupby("entry_date", sort=True).size()
+    executed_basket_sizes = trades.groupby("entry_date", sort=True).size().reindex(sessions.index, fill_value=0)
     position_weights = trades.entry_notional / trades.groupby("entry_date").entry_notional.transform("sum")
     weight_spreads = position_weights.groupby(trades.entry_date).agg(lambda values: values.max() - values.min())
-    skipped_by_entry = trades.groupby("entry_date", sort=True).skipped_selections.first()
+    skipped_by_entry = sessions.skipped_selections
 
     liquidity_descriptions = {
         "dollar_ema": "completed regular-session dollar volume",
@@ -1654,7 +1779,7 @@ def run_backtest(
         "exit_price_source": exit_price_source,
         "first_entry_date": str(pd.Timestamp(daily.index[0]).date()),
         "last_entry_date": str(pd.Timestamp(daily.index[-1]).date()),
-        "last_exit_date": str(trades.exit_date.iloc[-1]),
+        "last_exit_date": str(sessions.exit_date.iloc[-1]),
         "top": int(top),
         "basket_size": int(top),
         "share_mode": share_mode,
@@ -1668,6 +1793,13 @@ def run_backtest(
         "minimum_executed_basket_size": int(executed_basket_sizes.min()),
         "skipped_selections": int(skipped_by_entry.sum()),
         "skipped_short_entry_sessions": skipped_short_entries,
+        "skipped_missing_prices": len(skipped_prices),
+        "skipped_price_details": skipped_prices,
+        "missing_price_sessions": int((sessions.skipped_missing_prices > 0).sum()),
+        "all_cash_sessions": int((executed_basket_sizes == 0).sum()),
+        "missing_benchmark_sessions": len(missing_benchmark_dates),
+        "missing_benchmark_dates": missing_benchmark_dates,
+        "daily_portfolio": sessions.reset_index().to_dict("records"),
         "average_position_weight_spread": float(weight_spreads.mean()),
         "liquidity_metric": liquidity_descriptions[liquidity_scheme],
         "ema_span_sessions": int(ema_span),
@@ -1700,8 +1832,8 @@ def run_backtest(
         else 1.0,
         "average_daily_membership_jaccard": float(np.mean(jaccards)) if jaccards else 1.0,
         "strategy_metrics": strategy_metrics(daily),
-        "spy_overnight_metrics": strategy_metrics(spy_daily),
-        "spy_buy_and_hold_metrics": strategy_metrics(spy_buy_hold_daily),
+        "spy_overnight_metrics": _benchmark_metrics(spy_daily),
+        "spy_buy_and_hold_metrics": _benchmark_metrics(spy_buy_hold_daily),
         "versus_spy": {
             "mean_excess_return": float(difference.mean()),
             "median_excess_return": float(difference.median()),
@@ -1720,7 +1852,7 @@ def run_backtest(
     return trades, summary
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Backtest the causal overnight basket used by live trading."
@@ -1755,7 +1887,7 @@ def main() -> None:
     )
     parser.add_argument("--min-history-days", type=int, default=20)
     parser.add_argument(
-        "--minimum-trading-days",
+        "--min-trading-days",
         type=int,
         default=100,
         help="minimum completed observed sessions before a stock can be selected",
@@ -1769,20 +1901,21 @@ def main() -> None:
     parser.add_argument("--entry-time", type=_parse_clock, default=_parse_clock("15:45"))
     parser.add_argument(
         "--entry-price-source",
-        choices=("minute-bar", "nbbo-ask"),
-        default="minute-bar",
-        help="minute-bar uses the configured 1-min bar open; nbbo-ask uses the latest "
-        "causal SIP ask at the scheduled 15:45 entry (default: minute-bar)",
+        choices=ENTRY_PRICE_SOURCES,
+        default="minute-open",
+        help="minute-* selects a field of the bar starting at --entry-time; non-open "
+        "fields model hypothetical fills over that minute, known only at its end. "
+        "nbbo-ask uses the latest causal SIP ask at 15:45 (default: minute-open)",
     )
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:30"))
     parser.add_argument(
         "--exit-price-source",
-        choices=("minute", "opening-auction"),
+        choices=EXIT_PRICE_SOURCES,
         default="opening-auction",
-        help="opening-auction uses the Alpaca SIP condition-O cross, which is the price a "
-        "market order received before Nasdaq's 09:28 cutoff actually fills at; minute uses "
-        "the configured minute-bar open, which is the first consolidated print and is not "
-        "reachable by any order type",
+        help="opening-auction uses the primary opening cross; minute-* selects a field "
+        "of the bar starting at --exit-time. Non-open fields model hypothetical fills "
+        "over that minute, known only at its end; nbbo-bid uses the latest causal SIP bid "
+        "at --exit-time (default: opening-auction)",
     )
     parser.add_argument(
         "--auctions-path",
@@ -1795,10 +1928,15 @@ def main() -> None:
         help="split-adjusted NPZ written by scripts/download_nbbo.py",
     )
     parser.add_argument(
+        "--exit-nbbo-path",
+        default=DEFAULT_EXIT_NBBO_PATH,
+        help="split-adjusted NBBO NPZ for --exit-price-source nbbo-bid",
+    )
+    parser.add_argument(
         "--transaction-cost-bps",
         type=float,
-        default=DEFAULT_TRANSACTION_COST_BPS,
-        help="transaction cost in basis points per side (default: 1.0)",
+        default=None,
+        help="additional cost in bps per side (default: 0.0 for nbbo-ask → opening-auction; 1.0 otherwise)",
     )
     parser.add_argument(
         "--share-mode",
@@ -1820,7 +1958,7 @@ def main() -> None:
         help="maximum age of the causal exit mark; avoids dropping a selected name with lookahead",
     )
     parser.add_argument(
-        "--data-dir",
+        "--minute-bars-dir",
         default=DEFAULT_DATA_DIR,
         help="split-adjusted 1-minute bars used for execution prices",
     )
@@ -1885,7 +2023,18 @@ def main() -> None:
         action="store_true",
         help="print the per-symbol trade-frequency and average-return table",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
+    try:
+        args.transaction_cost_bps = resolve_transaction_cost_bps(
+            args.transaction_cost_bps, args.entry_price_source, args.exit_price_source,
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.leverage < 1.0:
         parser.error("--leverage must be at least 1.0")
@@ -1910,10 +2059,10 @@ def main() -> None:
         (args.months is not None and args.months < 1)
         or args.ema_span < 1
         or args.min_history_days < 1
-        or args.minimum_trading_days < 1
+        or args.min_trading_days < 1
     ):
         parser.error(
-            "months, ema-span, min-history-days, and minimum-trading-days must be positive"
+            "months, ema-span, min-history-days, and min-trading-days must be positive"
         )
     if args.liquidity_scheme == "turnover_stability" and args.ema_span < 2:
         parser.error("--ema-span must be at least 2 for turnover stability")
@@ -1938,7 +2087,7 @@ def main() -> None:
             f"auction data required for official session-close filtering does not exist: "
             f"{auction_path}"
         )
-    data_dir = Path(args.data_dir)
+    data_dir = Path(args.minute_bars_dir)
     daily_data_dir = Path(args.daily_bars_dir)
     known_session_closes = auction_close_minutes(auction_path, None)
     all_dates, all_context_sod = reference_session_calendar(
@@ -1964,7 +2113,7 @@ def main() -> None:
     warmup = max(
         3 * int(args.ema_span),
         int(args.min_history_days) + 1,
-        int(args.minimum_trading_days) + 1,
+        int(args.min_trading_days) + 1,
     )
     scan_start_index = max(0, first_entry_index - warmup)
     cache_dates = all_dates[scan_start_index : end_index + 1]
@@ -1993,10 +2142,13 @@ def main() -> None:
         pd.Timestamp(cache_dates[-1]),
         args.entry_time,
         args.exit_time,
+        args.entry_price_source,
+        args.exit_price_source,
     )
     cache_name = (
         f"liquidity_{cache_dates[0]:%Y%m%d}_{cache_dates[-1]:%Y%m%d}_"
-        f"e{args.entry_time:04d}_x{args.exit_time:04d}_v7.npz"
+        f"e{args.entry_time:04d}_{args.entry_price_source}_"
+        f"x{args.exit_time:04d}_{args.exit_price_source}_v8.npz"
     )
     cache_path = Path(args.cache_dir) / cache_name
     (
@@ -2017,6 +2169,8 @@ def main() -> None:
         args.exit_time,
         args.workers,
         args.rebuild_cache,
+        args.entry_price_source,
+        args.exit_price_source,
     )
     unfiltered_candidates = int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum()))
     excluded_asset_reasons: dict[str, int] = {}
@@ -2081,7 +2235,7 @@ def main() -> None:
         if not nbbo_path.exists():
             parser.error(f"NBBO data does not exist: {nbbo_path}")
         entry_prices, entry_staleness, nbbo_rows = load_scheduled_nbbo_asks(
-            nbbo_path, cache_dates, symbols
+            nbbo_path, cache_dates, symbols, args.entry_time
         )
         print(
             f"NBBO entries: loaded {len(nbbo_rows):,} causal 15:45 SIP asks from "
@@ -2120,6 +2274,14 @@ def main() -> None:
             f"auction exits: loaded {official_opens:,} primary opening prices from "
             f"{auction_path}"
         )
+    if args.exit_price_source == "nbbo-bid":
+        exit_nbbo_path = Path(args.exit_nbbo_path)
+        if not exit_nbbo_path.exists():
+            parser.error(f"exit NBBO data does not exist: {exit_nbbo_path}")
+        morning_prices, morning_staleness, nbbo_exit_rows = load_scheduled_nbbo_prices(
+            exit_nbbo_path, cache_dates, symbols, "bid", args.exit_time
+        )
+        print(f"NBBO exits: loaded {len(nbbo_exit_rows):,} causal SIP bids from {exit_nbbo_path}")
     trades, summary = run_backtest(
         dates=cache_dates,
         symbols=symbols,
@@ -2133,7 +2295,7 @@ def main() -> None:
         top=args.top,
         ema_span=args.ema_span,
         min_history_days=args.min_history_days,
-        minimum_trading_days=args.minimum_trading_days,
+        minimum_trading_days=args.min_trading_days,
         transaction_cost_bps=args.transaction_cost_bps,
         issuers=build_issuer_map(symbols, security_master),
         dedupe_share_classes=args.dedupe_share_classes,

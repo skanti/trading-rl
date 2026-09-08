@@ -1,16 +1,15 @@
-"""Reconcile completed live baskets with the simulator's observable prices.
+"""Reconcile completed live fills with explicitly selected benchmark prices.
 
-The live side uses durable order fills and account snapshots. The scheduled modeled
-side uses the causal SIP NBBO ask at entry and the primary condition-O opening auction
-on the next session. Actual-time forensic reconciliation remains based on 1-min bar
-opens. Results are written per session as JSON and CSV so execution drift stays auditable.
+Missing or stale benchmarks exclude the whole session from matched comparisons.
+Scheduled mode uses the archived entry schedule and selected exit time; forensic
+mode uses the selected minute fields at each actual fill minute.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time
 import json
 import math
 import os
@@ -19,36 +18,32 @@ import re
 import tempfile
 from typing import Any, Mapping, Sequence
 
-import numpy as np
-from ..market_data.schema import validate_bar_columns
-import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
 from .backtest import (
-    BAR_ORIGIN,
     DEFAULT_AUCTIONS_PATH,
     DEFAULT_DATA_DIR,
     DEFAULT_NBBO_PATH,
+    DEFAULT_EXIT_NBBO_PATH,
+    ENTRY_PRICE_SOURCES,
+    EXIT_PRICE_SOURCES,
+    MINUTE_PRICE_COLUMNS,
     EASTERN,
     _dataset_manifest,
-    _official_opening_auctions,
-    _security_symbol,
-    load_scheduled_nbbo_asks,
+    resolve_transaction_cost_bps,
 )
-from .broker_fees import classify_broker_fee_summary, summarize_broker_fees
+from .broker_fees import broker_fees_for_session
+from .reconciliation_prices import MissingBenchmarkData, load_benchmark_prices
 from .live import (
     OPENING_AUCTION_CUTOFF,
-    REGULAR_MARKET_OPEN,
     AlpacaClient,
     completed_liquidity_ranking,
     load_credentials,
 )
-from .price_utils import forward_fill_positions
 
 
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
-DEFAULT_TRANSACTION_COST_BPS = 1.0
 DEFAULT_SCHEDULE_TOLERANCE_MINUTES = 1.0
 SCHEDULED_REPORTING_BENCHMARK = "scheduled_strategy"
 ACTUAL_TIME_REPORTING_BENCHMARK = "actual_time_1_min"
@@ -203,55 +198,6 @@ def attach_broker_fees(
     )
 
 
-def minute_open_price(
-    data_dir: Path,
-    symbol: str,
-    session_day: date,
-    minute: int,
-) -> tuple[float, float]:
-    """Return the same causal minute open and staleness used by the simulator."""
-    path = data_dir / f"{_security_symbol(symbol)}.npy"
-    if not path.exists():
-        raise FileNotFoundError(f"minute bars do not exist for {symbol}: {path}")
-    source = np.load(path, mmap_mode="r", allow_pickle=False)
-    validate_bar_columns(source, "1Min", str(path))
-    if not len(source):
-        raise ValueError(f"invalid minute bars for {symbol}: {path}")
-    scheduled = datetime.combine(
-        session_day,
-        time(minute // 60, minute % 60),
-        tzinfo=EASTERN,
-    )
-    target = int((scheduled.astimezone(UTC) - BAR_ORIGIN).total_seconds())
-    position = int(
-        forward_fill_positions(source, np.asarray([target], dtype=np.int64), symbol)[0]
-    )
-    observed = int(source[position, 0])
-    price = _number(source[position, 1], f"{symbol} minute open") / 1000.0
-    return price, (target - observed) / 60.0
-
-
-def opening_auction_rows(
-    auctions_path: Path,
-    exit_day: date,
-    symbols: Sequence[str],
-) -> dict[str, dict[str, float | str]]:
-    official = _official_opening_auctions(
-        auctions_path,
-        pd.DatetimeIndex([pd.Timestamp(exit_day)]),
-        np.asarray(symbols, dtype=str),
-    )
-    rows: dict[str, dict[str, float | str]] = {}
-    for row in official.to_dict("records"):
-        symbol = str(row["symbol"]).upper()
-        rows[symbol] = {
-            "adjusted_price": _number(row["price"], f"{symbol} adjusted auction"),
-            "raw_price": _number(row["raw_price"], f"{symbol} raw auction"),
-            "exchange": str(row["exchange"]),
-        }
-    return rows
-
-
 def _filled_order(
     orders: Mapping[str, object], symbol: str, side: str
 ) -> tuple[float, float]:
@@ -312,6 +258,9 @@ def execution_timing(
     exit_day: date,
     entry_minute: int,
     tolerance_minutes: float,
+    *,
+    exit_minute: int = 570,
+    exit_price_source: str = "opening-auction",
 ) -> tuple[dict[str, object], list[str]]:
     """Classify whether live fills are comparable to the modeled schedule."""
     if tolerance_minutes < 0.0:
@@ -321,7 +270,7 @@ def execution_timing(
         time(entry_minute // 60, entry_minute % 60),
         tzinfo=EASTERN,
     )
-    exit_target = datetime.combine(exit_day, REGULAR_MARKET_OPEN, tzinfo=EASTERN)
+    exit_target = datetime.combine(exit_day, time(exit_minute // 60, exit_minute % 60), tzinfo=EASTERN)
     auction_cutoff = datetime.combine(exit_day, OPENING_AUCTION_CUTOFF, tzinfo=EASTERN)
     entry_fills, missing_entry_fills = _order_timestamps(
         entry_orders, symbols, "entry", "filled_at"
@@ -379,7 +328,8 @@ def execution_timing(
     timing: dict[str, object] = {
         "tolerance_minutes": float(tolerance_minutes),
         "schedule_comparable": bool(
-            entry_fill_comparable and opening_auction_comparable
+            entry_fill_comparable and (opening_auction_comparable
+                                       if exit_price_source == "opening-auction" else exit_fill_comparable)
         ),
         "entry": {
             "benchmark": "scheduled_minute_open",
@@ -397,13 +347,14 @@ def execution_timing(
             "comparable": entry_fill_comparable,
             "actual_time_benchmark": {
                 "alignment": "per_symbol_fill_minute",
-                "price_source": "minute_bar_open",
+                "price_source": "minute-open",
             },
         },
         "exit": {
-            "benchmark": "primary_opening_auction",
+            "benchmark": exit_price_source,
+            "scheduled_at": exit_target.isoformat(),
             "auction_cutoff_at": auction_cutoff.isoformat(),
-            "opening_cross_at": exit_target.isoformat(),
+            "opening_cross_at": datetime.combine(exit_day, time(9, 30), tzinfo=EASTERN).isoformat(),
             "first_submission_at": min(exit_submissions.values())
             .astimezone(EASTERN)
             .isoformat()
@@ -430,7 +381,7 @@ def execution_timing(
             "opening_auction_comparable": opening_auction_comparable,
             "actual_time_benchmark": {
                 "alignment": "per_symbol_fill_minute",
-                "price_source": "minute_bar_open",
+                "price_source": "minute-open",
             },
         },
     }
@@ -456,7 +407,13 @@ def execution_timing(
             "include timing drift, not only execution slippage"
         )
 
-    if not opening_auction_comparable:
+    if exit_price_source != "opening-auction" and not exit_fill_comparable:
+        warnings.append(
+            f"exit is off schedule for {exit_price_source} at {_clock_text(exit_minute)} ET: "
+            f"{len(missing_exit_fills)} symbols lack fill timestamps; "
+            f"{len(exit_exceeded)} exceed the {tolerance_minutes:g}-min tolerance"
+        )
+    if exit_price_source == "opening-auction" and not opening_auction_comparable:
         reasons: list[str] = []
         if missing_exit_submissions:
             reasons.append(
@@ -482,8 +439,7 @@ def execution_timing(
         warnings.append(
             "exit is not opening-auction comparable: "
             + "; ".join(reasons)
-            + "; the auction result remains a scheduled-strategy counterfactual, "
-            "not ordinary execution slippage"
+            + "; a comparison with the auction would include timing drift"
         )
     return timing, warnings
 
@@ -493,6 +449,8 @@ def summary_execution_timing(
     *,
     entry_minute_override: int | None = None,
     schedule_tolerance_minutes: float = DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
+    exit_minute: int = 570,
+    exit_price_source: str = "opening-auction",
 ) -> tuple[dict[str, object], list[str]]:
     """Classify a closed session's timing without requiring market data."""
     position = summary.get("position") or {}
@@ -516,6 +474,8 @@ def summary_execution_timing(
         exit_day,
         entry_minute,
         schedule_tolerance_minutes,
+        exit_minute=exit_minute,
+        exit_price_source=exit_price_source,
     )
 
 
@@ -536,11 +496,19 @@ def reconcile_execution(
     *,
     nbbo_path: Path | None = None,
     entry_minute_override: int | None = None,
-    transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS,
-    max_entry_staleness_minutes: float = 10.0,
+    transaction_cost_bps: float | None = None,
+    max_entry_staleness_minutes: float = 1.0,
     schedule_tolerance_minutes: float = DEFAULT_SCHEDULE_TOLERANCE_MINUTES,
-    actual_time_benchmark: bool | None = None,
+    actual_time_benchmark: bool = False,
+    entry_price_source: str = "nbbo-ask",
+    exit_price_source: str = "opening-auction",
+    exit_minute: int = 570,
+    exit_nbbo_path: Path | None = None,
+    max_exit_staleness_minutes: float = 1.0,
 ) -> dict[str, object]:
+    transaction_cost_bps = resolve_transaction_cost_bps(
+        transaction_cost_bps, entry_price_source, exit_price_source,
+    )
     position = summary.get("position") or {}
     if not isinstance(position, Mapping) or position.get("status") != "closed":
         raise ValueError("session does not contain a closed position")
@@ -558,132 +526,75 @@ def reconcile_execution(
         summary,
         entry_minute_override=entry_minute_override,
         schedule_tolerance_minutes=schedule_tolerance_minutes,
+        exit_minute=exit_minute,
+        exit_price_source=exit_price_source,
     )
-    auctions = opening_auction_rows(auctions_path, exit_day, symbols)
-    scheduled_nbbo: dict[str, Mapping[str, object]] = {}
-    if nbbo_path is not None and nbbo_path.exists():
-        _prices, _staleness, nbbo_rows = load_scheduled_nbbo_asks(
-            nbbo_path,
-            pd.DatetimeIndex([pd.Timestamp(entry_day)]),
-            np.asarray(symbols),
-        )
-        scheduled_nbbo = {
-            str(row.symbol): row._asdict()
-            for row in nbbo_rows.itertuples(index=False)
-            if (
-                row.target_timestamp.astimezone(EASTERN).hour * 60
-                + row.target_timestamp.astimezone(EASTERN).minute
+    if entry_price_source not in ENTRY_PRICE_SOURCES or exit_price_source not in EXIT_PRICE_SOURCES:
+        raise ValueError("unknown entry or exit price source")
+    if exit_price_source == "opening-auction" and exit_minute != 570:
+        raise ValueError("opening-auction requires a 09:30 exit")
+    if actual_time_benchmark and (
+        entry_price_source not in MINUTE_PRICE_COLUMNS or exit_price_source not in MINUTE_PRICE_COLUMNS
+    ):
+        raise ValueError("actual-time-minute-bar requires explicit minute-* entry and exit sources")
+    timing["entry"]["benchmark"] = entry_price_source
+    for side, source in (("entry", entry_price_source), ("exit", exit_price_source)):
+        timing[side]["actual_time_benchmark"]["price_source"] = source
+    calculate_actual_time = actual_time_benchmark
+    entry_targets = {symbol: (entry_day, entry_minute) for symbol in symbols}
+    exit_targets = {symbol: (exit_day, exit_minute) for symbol in symbols}
+    if calculate_actual_time:
+        for symbol in symbols:
+            for side, orders, targets in (("entry", entry_orders, entry_targets), ("exit", exit_orders, exit_targets)):
+                stamp = _fill_bar_timestamp(orders, symbol, side)
+                targets[symbol] = (stamp.date(), stamp.hour * 60 + stamp.minute)
+    entry_path = nbbo_path if entry_price_source == "nbbo-ask" else data_dir
+    exit_path = (auctions_path if exit_price_source == "opening-auction"
+                 else exit_nbbo_path if exit_price_source == "nbbo-bid" else data_dir)
+    missing = []
+    marks = {}
+    for side, source, path, targets, max_age in (
+        ("entry", entry_price_source, entry_path, entry_targets, max_entry_staleness_minutes),
+        ("exit", exit_price_source, exit_path, exit_targets, max_exit_staleness_minutes),
+    ):
+        try:
+            marks[side] = load_benchmark_prices(
+                source, path, targets, max_staleness_minutes=max_age, split_path=auctions_path,
             )
-            == entry_minute
-        }
-    exit_timing = timing["exit"]
-    if not isinstance(exit_timing, Mapping):
-        raise TypeError("exit timing must be a mapping")
-    calculate_actual_time = (
-        not bool(timing["schedule_comparable"])
-        if actual_time_benchmark is None
-        else actual_time_benchmark
-    )
+        except MissingBenchmarkData as error:
+            missing.append(f"{side}: {error}")
+    if missing:
+        raise MissingBenchmarkData(" | ".join(missing))
 
     rows: list[dict[str, object]] = []
     warnings = list(timing_warnings)
-    actual_time_entry_benchmark_failures = 0
-    actual_time_exit_benchmark_failures = 0
     quantity_mismatch_count = 0
-    scheduled_nbbo_failures = 0
     for symbol in symbols:
         entry_qty, actual_entry = _filled_order(entry_orders, symbol, "entry")
         exit_qty, actual_exit = _filled_order(exit_orders, symbol, "exit")
-        auction = auctions.get(_security_symbol(symbol))
-        if auction is None:
-            raise ValueError(
-                f"opening auction is unavailable for {symbol} on {exit_day}"
-            )
-        simulated_exit = float(auction["adjusted_price"])
-        raw_auction = float(auction["raw_price"])
-        adjustment = raw_auction / simulated_exit
-        nbbo = scheduled_nbbo.get(_security_symbol(symbol))
-        if nbbo is not None:
-            simulated_entry = float(nbbo["price"])
-            comparable_entry = float(nbbo["raw_price"])
-            staleness = float(nbbo["staleness_minutes"])
-            scheduled_entry_source = "nbbo_ask"
-        else:
-            scheduled_nbbo_failures += 1
-            simulated_entry, staleness = minute_open_price(
-                data_dir, symbol, entry_day, entry_minute
-            )
-            comparable_entry = simulated_entry * adjustment
-            scheduled_entry_source = "minute_bar_open_fallback"
-        if staleness > max_entry_staleness_minutes:
-            raise ValueError(
-                f"{symbol} entry mark is {staleness:.1f} minutes stale, exceeding "
-                f"{max_entry_staleness_minutes:.1f}"
-            )
-        actual_time_entry_at = None
-        actual_time_entry = None
-        actual_time_entry_comparable = None
-        actual_time_entry_staleness = None
-        actual_time_entry_slippage = None
-        if calculate_actual_time:
-            try:
-                actual_time_entry_at = _fill_bar_timestamp(
-                    entry_orders, symbol, "entry"
-                )
-                actual_time_entry_minute = (
-                    actual_time_entry_at.hour * 60 + actual_time_entry_at.minute
-                )
-                actual_time_entry, actual_time_entry_staleness = minute_open_price(
-                    data_dir,
-                    symbol,
-                    actual_time_entry_at.date(),
-                    actual_time_entry_minute,
-                )
-                if actual_time_entry_staleness > max_entry_staleness_minutes:
-                    raise ValueError(
-                        f"actual-time entry mark is {actual_time_entry_staleness:.1f} "
-                        f"minutes stale, exceeding {max_entry_staleness_minutes:.1f}"
-                    )
-                actual_time_entry_comparable = actual_time_entry * adjustment
-                actual_time_entry_slippage = (
-                    actual_entry / actual_time_entry_comparable - 1.0
-                ) * 10_000.0
-            except (OSError, TypeError, ValueError):
-                actual_time_entry_benchmark_failures += 1
-
-        actual_time_exit_at = None
-        actual_time_exit = None
-        actual_time_exit_comparable = None
-        actual_time_exit_staleness = None
-        actual_time_exit_slippage = None
+        entry_mark = marks["entry"][symbol]
+        exit_mark = marks["exit"][symbol]
+        simulated_entry = entry_mark.price
+        comparable_entry = entry_mark.raw_price
+        simulated_exit = exit_mark.price
+        comparable_exit = exit_mark.raw_price
+        staleness = entry_mark.staleness_minutes
+        scheduled_entry_source = entry_price_source
+        actual_time_entry_at = _fill_bar_timestamp(entry_orders, symbol, "entry") if calculate_actual_time else None
+        actual_time_exit_at = _fill_bar_timestamp(exit_orders, symbol, "exit") if calculate_actual_time else None
+        actual_time_entry = simulated_entry if calculate_actual_time else None
+        actual_time_exit = simulated_exit if calculate_actual_time else None
+        actual_time_entry_comparable = comparable_entry if calculate_actual_time else None
+        actual_time_exit_comparable = comparable_exit if calculate_actual_time else None
+        actual_time_entry_staleness = staleness if calculate_actual_time else None
+        actual_time_exit_staleness = exit_mark.staleness_minutes if calculate_actual_time else None
+        actual_time_entry_slippage = (actual_entry / comparable_entry - 1.0) * 10_000 if calculate_actual_time else None
+        actual_time_exit_slippage = (actual_exit / comparable_exit - 1.0) * 10_000 if calculate_actual_time else None
         actual_time_simulated_return = None
         actual_time_simulated_pnl = None
         actual_time_simulated_cost = None
         actual_time_entry_execution_pnl_impact = None
         actual_time_exit_execution_pnl_impact = None
-        if calculate_actual_time:
-            try:
-                actual_time_exit_at = _fill_bar_timestamp(exit_orders, symbol, "exit")
-                actual_time_exit_minute = (
-                    actual_time_exit_at.hour * 60 + actual_time_exit_at.minute
-                )
-                actual_time_exit, actual_time_exit_staleness = minute_open_price(
-                    data_dir,
-                    symbol,
-                    actual_time_exit_at.date(),
-                    actual_time_exit_minute,
-                )
-                if actual_time_exit_staleness > max_entry_staleness_minutes:
-                    raise ValueError(
-                        f"actual-time exit mark is {actual_time_exit_staleness:.1f} "
-                        f"minutes stale, exceeding {max_entry_staleness_minutes:.1f}"
-                    )
-                actual_time_exit_comparable = actual_time_exit * adjustment
-                actual_time_exit_slippage = (
-                    actual_exit / actual_time_exit_comparable - 1.0
-                ) * 10_000.0
-            except (OSError, TypeError, ValueError):
-                actual_time_exit_benchmark_failures += 1
 
         actual_entry_notional = entry_qty * actual_entry
         actual_exit_notional = exit_qty * actual_exit
@@ -693,9 +604,9 @@ def reconcile_execution(
         simulated_pnl = actual_entry_notional * simulated_return
         simulated_exit_notional = actual_entry_notional + simulated_pnl
         entry_execution_pnl_impact = actual_entry_notional * (
-            raw_auction / actual_entry - 1.0 - simulated_return
+            comparable_exit / actual_entry - 1.0 - simulated_return
         )
-        exit_execution_pnl_impact = entry_qty * (actual_exit - raw_auction)
+        exit_execution_pnl_impact = entry_qty * (actual_exit - comparable_exit)
         quantity_pnl_impact = (exit_qty - entry_qty) * actual_exit
         simulated_cost = (
             float(transaction_cost_bps)
@@ -751,8 +662,8 @@ def reconcile_execution(
                 "actual_time_entry_slippage_bps": actual_time_entry_slippage,
                 "actual_exit_price": actual_exit,
                 "simulator_exit_price": simulated_exit,
-                "simulator_exit_price_comparable": raw_auction,
-                "exit_slippage_bps": (actual_exit / raw_auction - 1.0) * 10_000.0,
+                "simulator_exit_price_comparable": comparable_exit,
+                "exit_slippage_bps": (actual_exit / comparable_exit - 1.0) * 10_000.0,
                 "actual_time_exit_bar_at": actual_time_exit_at.isoformat()
                 if actual_time_exit_at is not None
                 else None,
@@ -780,7 +691,9 @@ def reconcile_execution(
                 "actual_time_exit_execution_pnl_impact": (
                     actual_time_exit_execution_pnl_impact
                 ),
-                "auction_exchange": auction["exchange"],
+                "exit_exchange": exit_mark.exchange,
+                "simulator_exit_source": exit_price_source,
+                "exit_staleness_minutes": exit_mark.staleness_minutes,
                 "actual_entry_notional": actual_entry_notional,
                 "actual_exit_notional": actual_exit_notional,
                 "actual_gross_return": actual_return,
@@ -799,27 +712,6 @@ def reconcile_execution(
             }
         )
 
-    if actual_time_entry_benchmark_failures:
-        warnings.append(
-            "actual-time entry 1-min benchmark is unavailable for "
-            f"{actual_time_entry_benchmark_failures}/{len(symbols)} symbols"
-        )
-    if scheduled_nbbo_failures and nbbo_path is not None:
-        reason = (
-            f"NBBO data does not exist at {nbbo_path}"
-            if not nbbo_path.exists()
-            else "the scheduled quote is unavailable"
-        )
-        warnings.append(
-            f"scheduled 15:45 NBBO ask is unavailable for "
-            f"{scheduled_nbbo_failures}/{len(symbols)} symbols ({reason}); "
-            "used the scheduled 1-min bar open fallback"
-        )
-    if actual_time_exit_benchmark_failures:
-        warnings.append(
-            "actual-time exit 1-min benchmark is unavailable for "
-            f"{actual_time_exit_benchmark_failures}/{len(symbols)} symbols"
-        )
     if quantity_mismatch_count:
         warnings.append(
             f"entry and exit quantities differ for {quantity_mismatch_count}/"
@@ -845,9 +737,7 @@ def reconcile_execution(
         float(row["entry_quantity"]) * float(row["simulator_exit_price_comparable"])
         for row in rows
     )
-    actual_time_benchmarks_available = calculate_actual_time and not (
-        actual_time_entry_benchmark_failures or actual_time_exit_benchmark_failures
-    )
+    actual_time_benchmarks_available = calculate_actual_time
     actual_time_entry_at_entry_quantities = (
         sum(
             float(row["entry_quantity"])
@@ -890,15 +780,10 @@ def reconcile_execution(
         "entry_date": entry_day.isoformat(),
         "exit_date": exit_day.isoformat(),
         "entry_time": _clock_text(entry_minute),
-        "entry_price_source": (
-            "nbbo_ask"
-            if scheduled_nbbo_failures == 0
-            else "minute_bar_open_fallback"
-            if scheduled_nbbo_failures == len(symbols)
-            else "nbbo_ask_with_minute_bar_fallback"
-        ),
-        "exit_price_source": "primary_opening_auction",
-        "reporting_benchmark": SCHEDULED_REPORTING_BENCHMARK,
+        "entry_price_source": entry_price_source,
+        "exit_price_source": exit_price_source,
+        "exit_time": _clock_text(exit_minute),
+        "reporting_benchmark": ACTUAL_TIME_REPORTING_BENCHMARK if calculate_actual_time else SCHEDULED_REPORTING_BENCHMARK,
         "transaction_cost_bps_per_side": float(transaction_cost_bps),
         "symbols": symbols,
         "timing": timing,
@@ -1196,63 +1081,6 @@ def _atomic_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     os.replace(temporary_path, path)
 
 
-def broker_fees_for_session(
-    client: AlpacaClient | None,
-    cache_path: Path,
-    exit_day: date,
-    *,
-    unavailable_reason: str | None = None,
-    as_of: datetime | None = None,
-) -> tuple[dict[str, object], str | None]:
-    cached: dict[str, object] | None = None
-    if cache_path.exists():
-        try:
-            payload = json.loads(cache_path.read_text())
-            if (
-                isinstance(payload, dict)
-                and payload.get("activity_date") == exit_day.isoformat()
-            ):
-                cached = classify_broker_fee_summary(payload, exit_day, as_of=as_of)
-        except (OSError, TypeError, ValueError):
-            cached = None
-
-    if client is None:
-        if cached is not None:
-            return cached, f"using cached broker fees because {unavailable_reason}"
-        return {
-            "status": "unavailable",
-            "activity_date": exit_day.isoformat(),
-            "reason": unavailable_reason or "broker fee retrieval is unavailable",
-        }, unavailable_reason
-
-    query_after = exit_day - timedelta(days=1)
-    query_until = exit_day + timedelta(days=4)
-    try:
-        activities = client.account_activities(
-            "FEE", after=query_after, until=query_until
-        )
-        summary = summarize_broker_fees(activities, exit_day, fetched_at=as_of)
-        summary["query"] = {
-            "after": query_after.isoformat(),
-            "until": query_until.isoformat(),
-        }
-        _atomic_json(cache_path, summary)
-        warning = (
-            "broker fees have not posted yet; reconciliation remains provisional"
-            if summary.get("status") == "pending"
-            else None
-        )
-        return summary, warning
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        if cached is not None:
-            return cached, f"broker fee refresh failed; using cache: {error}"
-        return {
-            "status": "unavailable",
-            "activity_date": exit_day.isoformat(),
-            "reason": str(error),
-        }, f"broker fees are unavailable: {error}"
-
-
 def format_usd(value: object, *, signed: bool = False) -> str:
     amount = float(value)
     if signed:
@@ -1401,7 +1229,7 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
         for result in results
     )
     scheduled_entry_sources = sorted(
-        {str(result.get("entry_price_source") or "minute_bar_open_fallback") for result in results}
+        {str(result.get("entry_price_source") or "unspecified") for result in results}
     )
     entry_notional = total("actual_entry_notional")
     actual_gross = total("actual_gross_pnl")
@@ -1412,6 +1240,7 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     summary: dict[str, object] = {
         "sessions": count,
         "scheduled_entry_price_sources": scheduled_entry_sources,
+        "scheduled_exit_price_sources": sorted({str(result.get("exit_price_source") or "unspecified") for result in results}),
         "trades": sum(len(result.get("symbols") or []) for result in results),
         "first_entry_date": min(str(result["entry_date"]) for result in results),
         "last_exit_date": max(str(result["exit_date"]) for result in results),
@@ -1504,18 +1333,15 @@ def print_overview(
     results: Sequence[Mapping[str, object]],
     *,
     skipped_sessions: Sequence[tuple[date, Sequence[str]]] = (),
+    missing_sessions: Sequence[tuple[date, str]] = (),
 ) -> None:
     summary = summarize_results(results)
     sessions = int(summary["sessions"])
     fee_sessions = int(summary["fee_confirmed_sessions"])
     actual_time_sessions = int(summary["actual_time_benchmark_sessions"])
     scheduled_sources = summary["scheduled_entry_price_sources"]
-    if scheduled_sources == ["nbbo_ask"]:
-        scheduled_entry_label = "15:45 ET SIP NBBO ask"
-    elif scheduled_sources == ["minute_bar_open_fallback"]:
-        scheduled_entry_label = "Scheduled 1-min bar open fallback"
-    else:
-        scheduled_entry_label = "Scheduled NBBO / 1-min fallback"
+    scheduled_entry_label = ", ".join(scheduled_sources)
+    scheduled_exit_label = ", ".join(summary["scheduled_exit_price_sources"])
     comparison = Table(
         title="Reconciliation overview",
         caption=f"{summary['first_entry_date']} → {summary['last_exit_date']}",
@@ -1575,7 +1401,7 @@ def print_overview(
         (
             scheduled_entry_label
             if not actual_time_sessions
-            else "Actual-time 1-min bar open"
+            else f"At fill minute: {scheduled_entry_label}"
             if actual_time_sessions == sessions
             else f"Per-session ({actual_time_sessions} actual-time)"
         ),
@@ -1585,9 +1411,9 @@ def print_overview(
         "Exit price",
         "Fills",
         (
-            "Opening auction"
+            scheduled_exit_label
             if not actual_time_sessions
-            else "Actual-time 1-min bar open"
+            else f"At fill minute: {scheduled_exit_label}"
             if actual_time_sessions == sessions
             else f"Per-session ({actual_time_sessions} actual-time)"
         ),
@@ -1630,7 +1456,7 @@ def print_overview(
                 warning.startswith("entry is off schedule") for warning in warnings
             )
             exit_mismatch = any(
-                warning.startswith("exit is not opening-auction comparable")
+                warning.startswith(("exit is not opening-auction comparable", "exit is off schedule"))
                 for warning in warnings
             )
             if entry_mismatch and exit_mismatch:
@@ -1651,6 +1477,9 @@ def print_overview(
             "—",
             displayed_context,
         )
+    if missing_sessions:
+        comparison.add_row("Missing-price sessions", str(len(missing_sessions)), "Excluded",
+                           "Whole baskets excluded from both actual and simulated totals")
     comparison.add_row(
         "Trades",
         str(summary["trades"]),
@@ -1663,11 +1492,14 @@ def print_overview(
         "Execution differences and P&L bps are weighted by deployed capital. "
         "Gross P&L and execution differences exclude transaction costs.[/dim]"
     )
+    if any(source in MINUTE_PRICE_COLUMNS and source != "minute-open"
+           for source in [*scheduled_sources, *summary["scheduled_exit_price_sources"]]):
+        CONSOLE.print("[dim]Minute high/low/close/VWAP model hypothetical fills over the selected minute; "
+                      "these values are known only at its end.[/dim]")
     if actual_time_sessions:
         CONSOLE.print(
-            f"[dim]The headline simulator uses actual-time 1-min bar opens for "
-            f"{actual_time_sessions}/{sessions} sessions; scheduled-strategy "
-            "counterfactuals remain in the reconciliation artifacts.[/dim]"
+            f"[dim]The simulator uses the selected minute fields at each actual fill minute "
+            f"for {actual_time_sessions}/{sessions} sessions.[/dim]"
         )
     if fee_sessions:
         CONSOLE.print(
@@ -1684,25 +1516,23 @@ def _actual_time_bar_label(result: Mapping[str, object], side: str) -> str:
         for row in result.get("rows") or []
         if isinstance(row, Mapping) and row.get(f"actual_time_{side}_bar_at")
     )
+    source = str(result.get(f"{side}_price_source") or "unspecified")
     if not stamps:
-        return "Actual-time 1-min bar open"
+        return f"At fill minute: {source}"
     first = stamps[0]
     last = stamps[-1]
     if first == last:
-        return f"{first:%Y-%m-%d %H:%M} ET 1-min bar open"
+        return f"{first:%Y-%m-%d %H:%M} ET {source}"
     if first.date() == last.date():
-        return f"{first:%Y-%m-%d %H:%M}–{last:%H:%M} ET 1-min bar opens"
-    return f"{first:%Y-%m-%d %H:%M}–{last:%Y-%m-%d %H:%M} ET 1-min bar opens"
+        return f"{first:%Y-%m-%d %H:%M}–{last:%H:%M} ET {source}"
+    return f"{first:%Y-%m-%d %H:%M}–{last:%Y-%m-%d %H:%M} ET {source}"
 
 
-def _scheduled_entry_label(result: Mapping[str, object]) -> str:
-    source = result.get("entry_price_source")
-    entry_time = str(result.get("entry_time") or "15:45")
-    if source == "nbbo_ask":
-        return f"{entry_time} ET SIP NBBO ask"
-    if source == "nbbo_ask_with_minute_bar_fallback":
-        return f"{entry_time} ET NBBO / 1-min fallback"
-    return f"{entry_time} ET 1-min bar open fallback"
+def _scheduled_price_label(result: Mapping[str, object], side: str) -> str:
+    source = str(result.get(f"{side}_price_source") or "unspecified")
+    clock = str(result.get(f"{side}_time") or "unspecified")
+    suffix = " (minute-wide hypothetical fill)" if source in MINUTE_PRICE_COLUMNS and source != "minute-open" else ""
+    return f"{clock} ET {source}{suffix}"
 
 
 def print_result(
@@ -1747,17 +1577,6 @@ def print_result(
             bps=gross_difference_bps,
         ),
     )
-    if use_actual_time:
-        comparison.add_row(
-            "Scheduled counterfactual",
-            format_usd(actual_gross_pnl, signed=True),
-            format_usd(totals["simulator_gross_pnl"], signed=True),
-            pnl_comparison_context(
-                totals["actual_minus_simulator_gross_pnl"],
-                label="gross P&L",
-                bps=totals["actual_minus_simulator_bps"],
-            ),
-        )
     modeled_cost = _reported_total(
         result,
         "simulator_transaction_cost",
@@ -1824,7 +1643,7 @@ def print_result(
         (
             _actual_time_bar_label(result, "entry")
             if use_actual_time
-            else _scheduled_entry_label(result)
+            else _scheduled_price_label(result, "entry")
         ),
         execution_context(
             totals[
@@ -1842,7 +1661,7 @@ def print_result(
         (
             _actual_time_bar_label(result, "exit")
             if use_actual_time
-            else "Opening auction"
+            else _scheduled_price_label(result, "exit")
         ),
         execution_context(
             totals[
@@ -1877,13 +1696,13 @@ def print_result(
     CONSOLE.print(
         "[dim]Gross P&L and execution differences exclude transaction costs. "
         "Entry price differences are actual fills versus "
-        + ("1-min bar opens" if use_actual_time else _scheduled_entry_label(result))
+        + (_actual_time_bar_label(result, "entry") if use_actual_time else _scheduled_price_label(result, "entry"))
         + "; positive "
         "means paid more. Exit differences are fills versus "
         + (
-            "the 1-min bar open at the actual fill time"
+            _actual_time_bar_label(result, "exit")
             if use_actual_time
-            else "official opening auctions"
+            else _scheduled_price_label(result, "exit")
         )
         + "; positive means received more.[/dim]"
     )
@@ -1943,14 +1762,38 @@ def print_result(
             )
         CONSOLE.print(detail)
         CONSOLE.print(
-            "[dim]Entry price Δ: actual fill vs 1-min bar open; positive means "
+            "[dim]Entry price Δ: actual fill vs selected entry benchmark; positive means "
             "paid more. Exit price Δ: actual fill vs selected exit benchmark; "
             "positive means received more. P&L impacts sum to Actual − simulator.[/dim]"
         )
-    for warning in list(result.get("warnings") or []) + list(
-        ranking.get("warnings") or [] if isinstance(ranking, Mapping) else []
-    ):
-        CONSOLE.print(f"[yellow]Warning:[/yellow] {warning}")
+
+
+def print_warnings(
+    results: Sequence[Mapping[str, object]],
+    skipped_sessions: Sequence[tuple[date, Sequence[str]]],
+    missing_sessions: Sequence[tuple[date, str]] = (),
+) -> None:
+    """Render all session warnings together after the reconciliation tables."""
+    messages: list[tuple[str, str]] = []
+    for entry_day, warnings in skipped_sessions:
+        reason = " ".join(warnings) or "execution timing is not schedule comparable"
+        messages.append((
+            entry_day.isoformat(),
+            f"skipped by strict schedule policy: {reason} Re-run with "
+            "--reconciliation-mode actual-time-minute-bar --entry-price-source minute-open "
+            "--exit-price-source minute-open to produce a forensic reconciliation.",
+        ))
+    messages.extend((day.isoformat(), f"skipped entire session: {reason}") for day, reason in missing_sessions)
+    for result in results:
+        warnings = list(result.get("warnings") or [])
+        ranking = result.get("ranking_replay") or {}
+        if isinstance(ranking, Mapping):
+            warnings.extend(ranking.get("warnings") or [])
+        messages.extend((str(result["entry_date"]), str(warning)) for warning in warnings)
+    if messages:
+        CONSOLE.print()
+        for entry_day, warning in sorted(messages, key=lambda item: item[0]):
+            CONSOLE.print(f"[yellow]Warning ({entry_day}):[/yellow] {warning}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1965,9 +1808,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="reconcile every closed session on or after YYYY-MM-DD",
     )
-    parser.add_argument("--data-dir", type=Path, default=Path(DEFAULT_DATA_DIR))
+    parser.add_argument("--minute-bars-dir", type=Path, default=Path(DEFAULT_DATA_DIR))
+    parser.add_argument("--entry-price-source", choices=ENTRY_PRICE_SOURCES, default="nbbo-ask")
+    parser.add_argument("--exit-price-source", choices=EXIT_PRICE_SOURCES, default="opening-auction")
+    parser.add_argument("--exit-time", type=parse_clock, default=570)
+    parser.add_argument("--exit-nbbo-path", type=Path, default=Path(DEFAULT_EXIT_NBBO_PATH))
+    parser.add_argument("--max-exit-staleness-minutes", type=float, default=1.0,
+                        help="NBBO age limit in minutes, capped at 1; minute sources require an exact bar")
     parser.add_argument(
-        "--auctions-path", type=Path, default=Path(DEFAULT_AUCTIONS_PATH)
+        "--auctions-path", type=Path, default=Path(DEFAULT_AUCTIONS_PATH),
+        help="opening-auction NPZ; its split ledger also converts minute prices to raw fill units",
     )
     parser.add_argument(
         "--nbbo-path",
@@ -1986,10 +1836,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transaction-cost-bps",
         type=float,
-        default=DEFAULT_TRANSACTION_COST_BPS,
-        help="simulator assumption per side; actual fills remain gross",
+        default=None,
+        help="additional simulator cost in bps per side (default: 0.0 for nbbo-ask → opening-auction; 1.0 otherwise)",
     )
-    parser.add_argument("--max-entry-staleness-minutes", type=float, default=10.0)
+    parser.add_argument("--max-entry-staleness-minutes", type=float, default=1.0,
+                        help="NBBO age limit in minutes, capped at 1; minute sources require an exact bar")
     parser.add_argument(
         "--schedule-tolerance-minutes",
         type=float,
@@ -1998,12 +1849,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reconciliation-mode",
-        choices=("strict-schedule", "actual-time-minute-bar", "actual-time"),
+        choices=("strict-schedule", "actual-time-minute-bar"),
         default="strict-schedule",
         help=(
             "strict-schedule skips off-schedule sessions; actual-time-minute-bar uses each "
-            "symbol's 1-min bar opens at its entry and exit fill times "
-            "(actual-time is a compatibility alias; default: strict-schedule)"
+            "symbol's selected minute fields at its entry and exit fill times; "
+            "requires minute-* entry and exit sources "
+            "(default: strict-schedule)"
         ),
     )
     parser.add_argument("--skip-ranking-replay", action="store_true")
@@ -2017,6 +1869,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="broker fee request timeout; defaults to the effective live config",
+    )
+    parser.add_argument(
+        "--refresh-broker-fees",
+        action="store_true",
+        help="refresh selected sessions' Alpaca fees even when their caches are fresh",
     )
     parser.add_argument(
         "--skip-broker-fees",
@@ -2039,16 +1896,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        args.transaction_cost_bps = resolve_transaction_cost_bps(
+            args.transaction_cost_bps, args.entry_price_source, args.exit_price_source,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if args.entry_date and args.since:
         parser.error("--entry-date and --since are mutually exclusive")
     if (
         args.transaction_cost_bps < 0.0
         or args.max_entry_staleness_minutes < 0.0
+        or args.max_exit_staleness_minutes < 0.0
         or args.schedule_tolerance_minutes < 0.0
     ):
         parser.error("cost, staleness, and tolerance values must be non-negative")
     if args.request_timeout_seconds is not None and args.request_timeout_seconds <= 0.0:
         parser.error("--request-timeout-seconds must be positive")
+    if args.exit_price_source == "opening-auction" and args.exit_time != 570:
+        parser.error("--exit-price-source opening-auction requires --exit-time 09:30")
+    if args.reconciliation_mode == "actual-time-minute-bar" and (
+        args.entry_price_source not in MINUTE_PRICE_COLUMNS or args.exit_price_source not in MINUTE_PRICE_COLUMNS
+    ):
+        parser.error("actual-time-minute-bar requires explicit minute-* entry and exit price sources")
     summaries = discover_closed_summaries(args.work_dir)
     if args.entry_date:
         selected_days = [args.entry_date] if args.entry_date in summaries else []
@@ -2070,6 +1940,8 @@ def main() -> None:
                     summary,
                     entry_minute_override=args.entry_time,
                     schedule_tolerance_minutes=args.schedule_tolerance_minutes,
+                    exit_minute=args.exit_time,
+                    exit_price_source=args.exit_price_source,
                 )
             except (TypeError, ValueError) as error:
                 parser.error(f"cannot classify {entry_day} schedule: {error}")
@@ -2078,25 +1950,17 @@ def main() -> None:
             else:
                 skipped_sessions.append((entry_day, warnings))
         selected_days = comparable_days
-        for entry_day, warnings in skipped_sessions:
-            reason = " ".join(warnings) or "execution timing is not schedule comparable"
-            CONSOLE.print(
-                f"[yellow]Warning ({entry_day}):[/yellow] skipped by strict schedule "
-                f"policy: {reason} Re-run with --reconciliation-mode "
-                "actual-time-minute-bar "
-                "to produce a forensic reconciliation."
-            )
         if not selected_days:
             CONSOLE.print(
                 f"No schedule-comparable sessions to reconcile; skipped "
                 f"{len(skipped_sessions)} session"
                 f"{'s' if len(skipped_sessions) != 1 else ''}."
             )
+            print_warnings([], skipped_sessions)
             return
 
-    _dataset_manifest(args.data_dir, "1Min")
-    if not args.auctions_path.exists():
-        parser.error(f"auction data does not exist: {args.auctions_path}")
+    if (args.entry_price_source in MINUTE_PRICE_COLUMNS or args.exit_price_source in MINUTE_PRICE_COLUMNS) and args.minute_bars_dir.exists():
+        _dataset_manifest(args.minute_bars_dir, "1Min")
 
     broker_client: AlpacaClient | None = None
     broker_unavailable_reason: str | None = None
@@ -2122,13 +1986,14 @@ def main() -> None:
 
     output_dir = args.output_dir or args.work_dir / "reconciliations"
     failures = 0
+    missing_sessions: list[tuple[date, str]] = []
     completed_results: list[dict[str, object]] = []
     for entry_day in selected_days:
         summary_path, summary = summaries[entry_day]
         try:
             result = reconcile_execution(
                 summary,
-                args.data_dir,
+                args.minute_bars_dir,
                 args.auctions_path,
                 nbbo_path=args.nbbo_path,
                 entry_minute_override=args.entry_time,
@@ -2136,6 +2001,11 @@ def main() -> None:
                 max_entry_staleness_minutes=args.max_entry_staleness_minutes,
                 schedule_tolerance_minutes=args.schedule_tolerance_minutes,
                 actual_time_benchmark=not strict_schedule,
+                entry_price_source=args.entry_price_source,
+                exit_price_source=args.exit_price_source,
+                exit_minute=args.exit_time,
+                exit_nbbo_path=args.exit_nbbo_path,
+                max_exit_staleness_minutes=args.max_exit_staleness_minutes,
             )
             select_reporting_benchmark(result, prefer_actual_time=not strict_schedule)
             if args.skip_broker_fees:
@@ -2148,15 +2018,16 @@ def main() -> None:
             else:
                 fee_summary, fee_warning = broker_fees_for_session(
                     broker_client,
-                    summary_path.parent / "fee_activities.json",
+                    args.work_dir / entry_day.isoformat() / "fee_activities.json",
                     parse_day(str(result["exit_date"])),
                     unavailable_reason=broker_unavailable_reason,
+                    force_refresh=args.refresh_broker_fees,
                 )
             attach_broker_fees(result, fee_summary)
             if fee_warning:
                 result["warnings"].append(fee_warning)
 
-            result["version"] = 6
+            result["version"] = 7
             result["generated_at"] = datetime.now(tz=UTC).isoformat()
             result["live_summary_path"] = str(summary_path)
             if not args.skip_ranking_replay:
@@ -2180,21 +2051,27 @@ def main() -> None:
             completed_results.append(result)
             if args.show_session_details or args.show_symbol_breakdown:
                 print_result(result, show_symbol_breakdown=args.show_symbol_breakdown)
+        except MissingBenchmarkData as error:
+            missing_sessions.append((entry_day, str(error)))
+            _atomic_json(output_dir / f"{entry_day.isoformat()}.json", {
+                "status": "skipped", "entry_date": entry_day.isoformat(),
+                "entry_price_source": args.entry_price_source,
+                "exit_price_source": args.exit_price_source,
+                "reason": str(error),
+            })
+            (output_dir / f"{entry_day.isoformat()}.csv").unlink(missing_ok=True)
         except (OSError, TypeError, ValueError) as error:
             failures += 1
             CONSOLE.print(f"[red]{entry_day}: reconciliation failed:[/red] {error}")
     if completed_results:
-        print_overview(completed_results, skipped_sessions=skipped_sessions)
-        if not (args.show_session_details or args.show_symbol_breakdown):
-            for result in completed_results:
-                ranking = result.get("ranking_replay") or {}
-                warnings = list(result.get("warnings") or [])
-                if isinstance(ranking, Mapping):
-                    warnings.extend(ranking.get("warnings") or [])
-                for warning in warnings:
-                    CONSOLE.print(
-                        f"[yellow]Warning ({result['entry_date']}):[/yellow] {warning}"
-                    )
+        print_overview(completed_results, skipped_sessions=skipped_sessions, missing_sessions=missing_sessions)
+    elif missing_sessions:
+        CONSOLE.print(
+            f"No sessions with complete benchmark prices to reconcile; "
+            f"skipped {len(missing_sessions)} sessions."
+        )
+    print_warnings(completed_results, skipped_sessions, missing_sessions)
+    if completed_results:
         CONSOLE.print(
             f"Wrote {len(completed_results)} reconciliation"
             f"{'s' if len(completed_results) != 1 else ''} to {output_dir}"

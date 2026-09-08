@@ -27,7 +27,7 @@ forms remain as compatibility launchers.
 Exits default to `--exit-price-source opening-auction` at `--exit-time 09:30`,
 because that is the price a live order actually receives: Nasdaq routes any
 market order reaching the broker before 09:28 into the opening cross. The
-`minute` source prices the first consolidated print instead, which no order type
+`minute-open` source prices the first consolidated print instead, which no order type
 can target and which sits about 0.9 bps above the cross (36 months, t = -7.1),
 so it flatters a backtest by roughly three annualized points.
 
@@ -37,14 +37,17 @@ Run the tests from this directory:
 python -m unittest discover -s tests
 ```
 
-Transaction costs default to 1 basis point per side, or 2 basis points for a
-complete entry-and-exit round trip. Override this with `--transaction-cost-bps`.
+Additional transaction costs default to **0.0 bps per side** for
+`nbbo-ask` → `opening-auction`, and **1.0 bp per side** for other source pairs,
+in both the backtester and reconciler. An explicit `--transaction-cost-bps`
+always overrides this default. Zero assumes no additional fees or slippage beyond
+the selected prices; reconciliation still reports actual broker fees separately.
 The potentially long per-symbol trade-frequency table is hidden by default;
 include `--show-symbol-trade-frequency` when that breakdown is needed.
 
 Every simulated stock must have at least 100 completed observed trading
 sessions before it can be selected. The current session is not counted. Change
-this causal listing-history filter with `--minimum-trading-days`; the default
+this causal listing-history filter with `--min-trading-days`; the default
 excludes recent IPOs such as SPCX until they establish 100 sessions.
 
 The log transform and default 10-session EMA keep earnings, index-rebalance,
@@ -56,8 +59,40 @@ The first run combines split-adjusted daily bars from
 `/data/ppv1/updates/bars_1min_2022-01-01`, then writes a date-by-symbol cache
 under `/tmp/trading/baseline_cache`. The daily bars drive the causal liquidity
 ranking; minute bars are used only for entry/exit prices. Override the two stores
-with `--daily-bars-dir` and `--data-dir`, respectively. Subsequent runs with the
+with `--daily-bars-dir` and `--minute-bars-dir`, respectively. Subsequent runs with the
 same inputs and date range reuse the cache.
+
+Both `--entry-price-source` and `--exit-price-source` accept `minute-open`,
+`minute-high`, `minute-low`, `minute-close`, and `minute-vwap`. Entry defaults to
+`minute-open` and also supports `nbbo-ask`; exit defaults to `opening-auction`
+and also supports `nbbo-bid`.
+For example:
+
+```bash
+trading-backtest --since 2022-01-01 \
+  --entry-price-source minute-vwap \
+  --exit-price-source minute-close
+```
+
+Times label the **start of the execution bar**: `--entry-time 15:45` with
+`minute-close` uses the 15:45–15:46 bar's close. Close, high, low, and VWAP are
+known only once that minute finishes. These options model hypothetical fills
+within that minute, not prices observable at its start. High/low are hindsight
+scenarios, and VWAP is not a guaranteed fill. Basket quantities also use the
+selected price, so sizing with these fields is hypothetical. Liquidity ranking
+still uses only completed prior sessions. The final report shows the selected
+sources and marks non-open minute fields as hypothetical execution windows;
+trade CSVs and summary JSON record the exact source names.
+
+Missing or nonpositive values use the latest earlier valid value of the **same
+field**, subject to the existing staleness limits. Minute VWAP never silently
+falls back to open or close. Staleness measures age from the selected bar's start;
+an exact target bar has zero staleness. No later bar is used. With no prior valid
+value, the price stays unavailable. Cache keys include both selected sources.
+
+Use `--minute-bars-dir` for the execution bar store and `--min-trading-days` for
+the listing-history filter. The old `minute`, `minute-bar`, `--data-dir`, and
+`--minimum-trading-days` spellings are not accepted by the backtester.
 
 Use `--since YYYY-MM-DD` instead of `--months` to anchor the first eligible entry
 session to a fixed date. The two options are mutually exclusive; for example:
@@ -106,7 +141,7 @@ no fresh print exists at the exit time, the backtest uses the latest causal mark
 up to 24 hours old and reports its staleness in both the trade CSV and summary.
 This is preferable to silently replacing the stock with next-morning lookahead,
 but such a stale mark is not evidence that a live order could have filled there.
-This fallback applies to `--exit-price-source minute`; the auction source has no
+This fallback applies to all `minute-*` exit sources; the auction source has no
 stale path, since a session either produced a condition-O cross or did not.
 
 ### Incremental minute-bar updates
@@ -128,7 +163,7 @@ layouts before making requests or overwriting files. For example, from the repo 
 MINUTE_BARS_DIR=/data/ppv1/updates/bars_1min_ohlcv_v2_2022-01-01 \
   scripts/download_latest_bars_and_auctions.sh
 trading-backtest --since 2022-01-01 \
-  --data-dir /data/ppv1/updates/bars_1min_ohlcv_v2_2022-01-01
+  --minute-bars-dir /data/ppv1/updates/bars_1min_ohlcv_v2_2022-01-01
 ```
 
 Set the same `MINUTE_BARS_DIR` on subsequent updates and point ML configurations
@@ -276,7 +311,7 @@ exact `(entry_date, sample_id)` basket as the NBBO download schedule:
 ```bash
 trading-backtest \
   --since 2024-01-01 \
-  --entry-price-source minute-bar \
+  --entry-price-source minute-open \
   --output-csv /tmp/overnight_nbbo_targets.csv
 
 download-nbbo \
@@ -290,15 +325,61 @@ selected basket rather than crossing every symbol that appeared during the entir
 window with every date. Basket rotation is therefore preserved: a multi-month run may
 contain many unique symbols, but normally only that day's 12 targets plus the SPY
 benchmark are queried in a single batch. Any target without a valid quote inside
-`--lookback-seconds` (60 seconds by default) aborts the download before the dataset is
-replaced. Version-1 broad-union NBBO files must be rebuilt once with the target CSV.
+`--lookback-seconds` (60 seconds by default) is skipped with a warning. Valid quotes
+are saved, and the JSON manifest records `missing_quote_count` and the exact
+`missing_quotes` symbol/date pairs. Version-1 broad-union NBBO files must be rebuilt once with the target CSV.
 
 Use the resulting dataset in a backtest with `--entry-price-source nbbo-ask`; the
-backward-compatible default remains `minute-bar`. The NBBO source requires
+default remains `minute-open`. The NBBO source requires
 `--entry-time 15:45`. A buy is benchmarked at the ask, while the existing
 transaction-cost assumption remains separately visible. Set `NBBO_TARGETS_PATH` to
 the same trade CSV when running the all-in-one downloader wrapper; without it the
 wrapper explicitly skips the optional NBBO update.
+
+For exit-price research, select each held basket's **exit date** explicitly:
+
+```bash
+download-nbbo \
+  --targets-from-trades /tmp/nbbo_targets.csv \
+  --target-date-column exit_date \
+  --target-time 09:35 \
+  --output /data/ppv1/updates/alpaca_nbbo_0935_2022-01-01.npz
+```
+
+The default `--target-date-column entry_date` is for entry quotes. Changing only
+the clock to 09:35 would request the afternoon basket on the wrong morning.
+Run the simulator against the exit bids with:
+
+```bash
+trading-backtest --top 12 --since 2023-01-01 --budget 10000 \
+  --share-mode fractional --entry-time 15:45 --exit-time 09:35 \
+  --entry-price-source minute-open --exit-price-source nbbo-bid \
+  --exit-nbbo-path /data/ppv1/updates/alpaca_nbbo_0935_2022-01-01.npz
+```
+
+The loader verifies that the dataset's target timestamps match the configured
+exit time. `--nbbo-path` separately supplies entry asks when using `nbbo-ask`. If the latest quote is invalid, the downloader searches
+earlier quotes, including additional pages, within the same configured lookback.
+If that entire window contains no valid quote, the symbol/date is skipped with a
+warning; the freshness window is not widened automatically. An update also
+removes previously stored quotes for an attempted date when every quote is now
+missing. Dates deferred by the SIP delay retain their existing rows.
+
+In the backtest, selected stocks with missing or stale entry/exit prices are
+skipped for that round trip, without replacement by lower-ranked stocks. Their
+original equal-weight allocations remain cash; the remaining stocks are not
+reweighted. NBBO quotes older than 60 seconds remain unavailable even when the
+generic minute-mark staleness limit is larger. A stock can trade again on the
+next date with valid prices. A fully skipped basket stays in the daily equity
+series as a zero-return cash session.
+
+Warnings identify the symbol, entry date, exit date and missing side. The final
+report shows skipped position/session counts; `--summary-json` additionally
+includes `skipped_price_details` and `daily_portfolio` (including cash-only
+sessions). The trade CSV contains only executed positions. Missing exit-price
+exclusions are retrospective data exclusions and can bias comparisons; report
+them alongside results. If SPY has missing prices, portfolio simulation continues
+with a warning and the affected benchmark aggregate metrics are unavailable.
 
 Afternoon entries are skipped on shortened sessions whose official close is at or
 before the configured entry time. Historical runs read the close from the auction NPZ
@@ -579,34 +660,51 @@ The Nasdaq security-master cache is also kept under the work root.
 
 ### Reconcile live sessions with the simulator
 
-`reconcile_live_sessions.py` replays a completed basket using only information the
-simulator can observe: the split-adjusted causal SIP NBBO ask at the scheduled 15:45
-entry and the next session's primary condition-O opening auction. If a scheduled NBBO
-snapshot is missing, it warns once with an aggregate count and falls back to the 1-min
-bar open for only those symbols. It compares those prices
-with the actual filled quantities and prices, separately reports the configured
-transaction-cost assumption and the broker-equity residual, and re-runs the shared
-liquidity ranker from that entry day's archived `ticks.jsonl`. The default console
-report is one overview table across the selected period: dollar values are cumulative
-totals and execution differences are deployed-capital-weighted basis points. Fee-based
-actual net results use only fee-confirmed sessions and show their coverage. Entry-fill,
-exit-fill, and quantity-mismatch P&L impacts remain available in the detailed artifacts.
-Reconciliation also checks fill timestamps against the scheduled entry minute and the
-09:30 opening cross, and verifies that exit orders were submitted before the 09:28
-auction cutoff. A deviation beyond 1 min marks the session as not schedule
-comparable. Strict schedule filtering is enabled by default: the whole session is
-excluded from reconciliation and aggregate results, with a warning explaining whether
-its entry, exit, or both were off schedule. Configure the tolerance with
-`--schedule-tolerance-minutes`. Use
-`--reconciliation-mode actual-time-minute-bar` to produce a forensic reconciliation
-of a botched session (`actual-time` remains an alias). In that mode, the headline P&L and
-execution comparison aligns every symbol's entry and exit to the open price of the
-1-min bar containing that symbol's fill. The scheduled entry bar and opening auction
-remain in the artifacts and detailed report as the scheduled-strategy counterfactual,
-rather than being presented as ordinary execution slippage.
-Actual-time mode never mixes benchmark types across a date range: if either actual-time
-leg is unavailable for a session, that date fails reconciliation instead of falling
-back to its scheduled prices.
+`trading-reconcile` compares completed live fills with explicitly selected benchmark
+prices. It shares the backtester's source names: `--entry-price-source` accepts
+`nbbo-ask` and `minute-open/high/low/close/vwap`; `--exit-price-source` accepts
+`opening-auction`, `nbbo-bid`, and those same minute fields. Defaults are `nbbo-ask`
+and `opening-auction`. Entry time comes from the archived live schedule, so a 15:59
+session requires a 15:59 NBBO snapshot even if the default file contains 15:45 data.
+`--exit-time` defaults to 09:30; opening-auction requires that time. Use `--nbbo-path`
+for entry quotes and `--exit-nbbo-path` for exit quotes. `--minute-bars-dir` selects the
+bar directory (there is no `--data-dir` alias). Minute prices use the split ledger in
+`--auctions-path` to convert adjusted prices to raw fill units; an auction print on
+the comparison date is not required when an auction price is not selected. Keep the
+bar and split-ledger datasets updated to the same adjustment horizon.
+
+There are no automatic price-source substitutions. Missing required prices,
+missing split coverage, wrong-time NBBO snapshots, or stale quotes skip the **whole
+session** from both actual and simulated totals. Minute sources require the exact
+requested bar and a valid value in the selected field; they never use an earlier
+bar or another field. NBBO quotes must be causal and at most 60 seconds old; the
+entry/exit staleness arguments can tighten that limit. Malformed data remains an
+error. Skipped dates and reasons appear beneath all tables; missing-price skips are
+also saved as `status: skipped` JSON artifacts, replacing prior results and removing
+any prior CSV for that date. Coverage counts remain visible because skipping missing
+data can itself bias the evaluated sample.
+
+The report shows actual filled quantities and prices, the transaction-cost
+assumption, broker-equity residual, and a replay of the liquidity ranking from
+archived `ticks.jsonl`. Dollar values are cumulative totals; execution differences
+are weighted by deployed capital. Fee-based net comparisons use the same
+fee-confirmed sessions on both sides. Minute high/low/close/VWAP are hypothetical
+fills over the selected minute, known only at its end.
+
+Strict schedule filtering remains the default. Fills must match the scheduled entry
+and selected exit time within `--schedule-tolerance-minutes` (default 1). Only an
+opening-auction exit additionally requires submission before the 09:28 auction
+cutoff. For a forensic comparison at each symbol's actual fill minute, explicitly
+select minute sources:
+
+```bash
+trading-reconcile --since 2026-08-28 \
+  --reconciliation-mode actual-time-minute-bar \
+  --entry-price-source minute-open --exit-price-source minute-open
+```
+
+Forensic mode uses those selected fields directly and requires both legs for the
+whole basket. It does not substitute scheduled prices or mix in auction/NBBO sources.
 
 With no date it reconciles the latest closed session. Select one session or a range with:
 
@@ -628,10 +726,17 @@ By default the reconciler authenticates with the same Alpaca environment variabl
 `live.py`, reads the trading endpoint from `WORK_DIR/effective_config.json`, and queries
 `FEE` account activities around the exit date. Exit-date fees are cached in the entry
 session's `fee_activities.json`, embedded in the reconciliation JSON, and used for the
-actual net P&L. Bulk regulatory fees are account-day amounts and may not identify an
+actual net P&L. This cache and its refresh policy are shared with the dashboard:
+pending fees and exit dates within the last seven calendar days refresh hourly;
+older confirmed dates refresh weekly. Use `--refresh-broker-fees` to force a check
+for the selected sessions. Successful checks update `last_checked_at` even if the
+fees have not changed; failures preserve cached data. Empty observations require a
+successful check after the posting grace period to confirm zero fees, and do not
+erase previously observed nonempty fee activities.
+Bulk regulatory fees are account-day amounts and may not identify an
 individual order, so the report labels that scope explicitly. Use `--skip-broker-fees`
 for a fully offline gross reconciliation or `--trading-url` for an explicit endpoint.
-The simulator's default one-basis-point cost per side remains a separate modeled
+The simulator's source-dependent transaction cost remains a separate modeled
 deduction. Account-equity residuals stay separate from confirmed Alpaca fee activities,
 and gross actual-versus-simulator execution attribution always excludes costs.
 
