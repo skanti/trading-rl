@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { areaPath, buildScale, gridValues, linePath, tickIndices } from '~/utils/chart'
-import { formatAxisCurrency, formatCurrency, formatDay, formatSignedCurrency, formatSignedPercent } from '~/utils/format'
+import { formatAxisCurrency, formatCurrency, formatDay, formatSignedCurrency, formatSignedPercent, toneClass } from '~/utils/format'
 import type { EquityPoint } from '~/types/dashboard'
 
 const props = withDefaults(defineProps<{
@@ -47,9 +47,6 @@ const geometry = computed(() => ({
 const anchor = computed(() => props.baseline ?? props.points[0]?.equity ?? 0)
 const realizedLatest = computed(() => props.points[props.points.length - 1]?.equity ?? 0)
 const confirmedPoints = computed(() => props.points.filter(point => !point.provisional))
-const confirmedLatest = computed(() =>
-  confirmedPoints.value[confirmedPoints.value.length - 1]?.equity ?? anchor.value
-)
 const latestProvisional = computed(() => Boolean(props.points[props.points.length - 1]?.provisional))
 const openPoint = computed<EquityPoint | null>(() => {
   if (!props.openPositions || !props.points.length) return null
@@ -67,8 +64,14 @@ const displayPoints = computed(() => openPoint.value
   : props.points)
 const scale = computed(() => buildScale(displayPoints.value, geometry.value))
 const latest = computed(() => displayPoints.value[displayPoints.value.length - 1]?.equity ?? 0)
-const gaining = computed(() => confirmedLatest.value >= anchor.value)
-const seriesColor = computed(() => gaining.value ? '#34d399' : '#fb7185')
+const palette = computed(() => {
+  const change = latest.value - anchor.value
+  if (change > 0) return { stroke: '#34d399', fill: '#10b981' }
+  if (change < 0) return { stroke: '#fb7185', fill: '#f43f5e' }
+  return { stroke: '#94a3b8', fill: '#64748b' }
+})
+const seriesColor = computed(() => palette.value.stroke)
+const gradientId = useId()
 const sessionCount = computed(() => props.sessions ?? Math.max(0, props.points.length - 1))
 
 const line = computed(() => {
@@ -197,7 +200,7 @@ function shortDay(day: string | null | undefined): string {
           <div class="min-w-0 text-right">
             <p
               class="numeric whitespace-nowrap text-[clamp(0.875rem,4vw,1.5rem)] font-semibold"
-              :class="(active?.change ?? (latest - anchor)) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+              :class="toneClass(active?.change ?? (latest - anchor))"
             >
               {{ formatSignedCurrency(active?.change ?? (latest - anchor)) }}
               ({{ formatSignedPercent(active?.changePct ?? (anchor ? (latest - anchor) / anchor : 0)) }})
@@ -232,7 +235,7 @@ function shortDay(day: string | null | undefined): string {
         >
           <defs>
             <linearGradient
-              :id="gaining ? 'equity-up' : 'equity-down'"
+              :id="gradientId"
               x1="0"
               y1="0"
               x2="0"
@@ -240,12 +243,12 @@ function shortDay(day: string | null | undefined): string {
             >
               <stop
                 offset="0%"
-                :stop-color="gaining ? '#10b981' : '#f43f5e'"
+                :stop-color="palette.fill"
                 stop-opacity="0.28"
               />
               <stop
                 offset="100%"
-                :stop-color="gaining ? '#10b981' : '#f43f5e'"
+                :stop-color="palette.fill"
                 stop-opacity="0"
               />
             </linearGradient>
@@ -286,7 +289,7 @@ function shortDay(day: string | null | undefined): string {
 
           <path
             :d="area"
-            :fill="`url(#${gaining ? 'equity-up' : 'equity-down'})`"
+            :fill="`url(#${gradientId})`"
           />
           <path
             :d="line"

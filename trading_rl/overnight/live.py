@@ -80,7 +80,7 @@ DEFAULT_EXCHANGES = frozenset({"NASDAQ"})
 # Nasdaq stops accepting market orders for the opening cross at 09:28, so an exit has
 # to reach Alpaca before then. Submission opens early enough to absorb Alpaca's own
 # queuing: sub-one-share orders are parked for a pre-open batch release around 09:15.
-EXIT_SUBMISSION_OPEN = time(8, 0)
+EXIT_SUBMISSION_OPEN = time(6, 0)
 OPENING_AUCTION_CUTOFF = time(9, 28)
 REGULAR_MARKET_OPEN = time(9, 30)
 TERMINAL_ORDER_STATUSES = frozenset(
@@ -2674,7 +2674,7 @@ def build_parser(
     parser.add_argument(
         "--exit-time",
         type=parse_clock,
-        default=parse_clock("08:00"),
+        default=parse_clock("06:00"),
         help="ET time to submit the exit. Market orders reaching Alpaca before Nasdaq's "
         "09:28 cutoff fill at the official opening cross, so the value only needs to be "
         "early enough to absorb queuing delays -- sub-one-share orders are held for a "

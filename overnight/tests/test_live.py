@@ -353,6 +353,19 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         self.assertIn("2 orders / 2 selected", output)
         self.assertIn("100.0% of budget", output)
 
+    def test_exit_submission_window_starts_at_0600(self):
+        parser = build_parser()
+        for share_mode in ("fractional", "whole"):
+            with self.subTest(share_mode=share_mode):
+                args = parser.parse_args(["exit", "--share-mode", share_mode])
+                self.assertEqual(args.exit_time.strftime("%H:%M"), "06:00")
+                self.assertIsInstance(_validate_args(parser, args), StrategyConfig)
+                args = parser.parse_args(
+                    ["exit", "--share-mode", share_mode, "--exit-time", "05:59"]
+                )
+                with self.assertRaises(SystemExit):
+                    _validate_args(parser, args)
+
     def test_exit_time_accepts_0900(self):
         parser = build_parser()
         args = parser.parse_args(["exit", "--exit-time", "09:00"])
@@ -459,11 +472,16 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
         )
 
     def test_preopen_exit_clock_allows_queued_orders(self):
-        preopen = FakeClockBroker("2026-08-25T09:00:00-04:00", False)
+        preopen = FakeClockBroker("2026-08-25T06:00:00-04:00", False)
         regular = FakeClockBroker("2026-08-25T09:30:00-04:00", True)
 
         self.assertFalse(_validate_exit_clock(preopen, date(2026, 8, 25)))
         self.assertTrue(_validate_exit_clock(regular, date(2026, 8, 25)))
+
+    def test_exit_clock_rejects_before_0600(self):
+        early = FakeClockBroker("2026-08-25T05:59:59-04:00", False)
+        with self.assertRaisesRegex(RuntimeError, "between 06:00 and 16:00 ET"):
+            _validate_exit_clock(early, date(2026, 8, 25))
 
     def test_daily_artifacts_write_market_data_logs_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:

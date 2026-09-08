@@ -5,7 +5,7 @@ schedule:
   time_zone: "America/New_York"
   ranking_time: "14:00"
   entry_time: "15:45"
-  exit_time: "08:00"
+  exit_time: "06:00"
   minimum_ranking_lead_minutes: 20
   entry_grace_seconds: 75
 

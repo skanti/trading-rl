@@ -444,7 +444,7 @@ position weights.
 
 `live.py` applies the same causal liquidity idea to an
 Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-12
-basket at 15:45, and submits its exit at 08:00 on the next trading session.
+basket at 15:45, and submits its exit at 06:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
 weekends and exchange holidays instead of attempting scheduled actions.
 Before ranking, it refreshes every symbol already present in the broad
@@ -610,7 +610,7 @@ cannot replace or suppress the live daemon's scheduled ranking:
 ```bash
 python live.py preview \
   --top 10 \
-  --exit-time 08:00 \
+  --exit-time 06:00 \
   --capital-fraction 0.95
 ```
 
@@ -619,7 +619,7 @@ and participate in the primary exchange's opening auction. Nasdaq applies the sa
 09:28 cutoff to plain market orders, so a fractional `market` + `day` exit reaches
 the cross too and fills at the Nasdaq Official Opening Price -- measured across 22
 live fills on 2026-08-28 and 2026-08-31, every one matched the cross exactly, in
-both share modes. The default 08:00
+both share modes. The default 06:00
 exit time leaves a safety margin before that cutoff. Fractional exits remain
 `day` market orders because Alpaca does not support OPG for fractional shares.
 The daemon records `exit_queued` without canceling working orders on the normal
