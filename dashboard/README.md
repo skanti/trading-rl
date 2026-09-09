@@ -52,6 +52,12 @@ sections from the live runner's `effective_config.json` on every poll, falling b
 pipeline times from that snapshot, including CLI overrides, so parameters no longer
 need to be copied into dashboard config or baked into a new frontend build.
 
+The schedule shows a countdown beside the **Next market open** milestone using the
+published exchange calendar. Queued exits display **Queued successfully** on the
+exit-orders milestone while the market-open countdown continues. After the open,
+queued positions display **Awaiting fills** until execution is confirmed. Countdown
+updates run in the browser every 30 seconds and need no extra broker requests.
+
 ## Configuration
 
 [`config.yaml`](./config.yaml) holds the Firebase project and web config plus the

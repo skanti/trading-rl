@@ -158,13 +158,12 @@ def encode_alpaca_bars(
     return array
 
 
-def validate_retained_bar_timestamps(base: np.ndarray, update: np.ndarray) -> None:
-    """Reject a replacement that drops any previously stored timestamp."""
+def validate_bar_replacement_range(base: np.ndarray, update: np.ndarray) -> None:
+    """Require the stored range's boundaries while accepting revised interior bars."""
     if len(update) == 0 or int(update[-1, 0]) < int(base[-1, 0]):
         raise ValueError("replacement ends before the stored endpoint")
-    positions = np.searchsorted(update[:, 0], base[:, 0])
-    if not np.array_equal(update[positions, 0], base[:, 0]):
-        raise ValueError("replacement is missing previously stored bar timestamps")
+    if int(update[0, 0]) > int(base[0, 0]):
+        raise ValueError("replacement starts after the stored start")
 
 
 def merge_bar_arrays(
@@ -177,8 +176,8 @@ def merge_bar_arrays(
     """Validate overlap and merge; changed values return ``None`` for full refresh.
 
     With an explicit anchor, only that bar's values must match. The refreshed
-    tail may correct values but must retain every previously stored timestamp.
-    Missing anchor/coverage raises instead of accepting a potentially gapped file.
+    tail is authoritative, including timestamps removed or restored by the provider.
+    Missing anchors or truncated range boundaries still raise.
     """
     for label, array in (("base", base), ("update", update)):
         if array.ndim != 2 or len(array) == 0:
@@ -199,7 +198,7 @@ def merge_bar_arrays(
         if update_start == len(update) or int(update[update_start, 0]) != anchor_seconds:
             raise ValueError("expected anchor is missing from update; overlap cannot be verified")
         tail = update[update_start:]
-        validate_retained_bar_timestamps(base[base_start:], tail)
+        validate_bar_replacement_range(base[base_start:], tail)
         if not np.array_equal(base[base_start], tail[0]):
             return None
         return np.vstack((base[:base_start], tail))

@@ -25,7 +25,7 @@ from ..market_data.bars import (
     encode_alpaca_bars,
     merge_bar_arrays as merge_shared_bar_arrays,
     normalize_symbol,
-    validate_retained_bar_timestamps,
+    validate_bar_replacement_range,
 )
 from ..market_data.schema import BAR_SCHEMA_VERSION, validate_bar_columns, validate_bar_manifest
 from ..market_data.download_output import (
@@ -393,7 +393,7 @@ def process_ticker(
             if full_array is None:
                 return finished(False)
             if timeframe == "1Min":
-                validate_retained_bar_timestamps(base, full_array)
+                validate_bar_replacement_range(base, full_array)
             if int(full_array[-1, 0]) < int(base[-1, 0]):
                 logger.error(
                     "Full refresh ends before existing data; preserving old file, ticker=%s",

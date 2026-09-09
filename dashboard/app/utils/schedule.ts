@@ -23,6 +23,13 @@ export interface SessionTimeline {
   exitDate: string
 }
 
+export interface ExecutionMilestone {
+  active: boolean
+  completed: boolean
+  warning: boolean
+  description?: string
+}
+
 interface ZonedParts {
   year: number
   month: number
@@ -110,6 +117,86 @@ function validSessions(sessions: MarketSession[]): MarketSession[] {
     }
   }
   return [...unique.values()].sort((left, right) => left.date.localeCompare(right.date))
+}
+
+function completionTime(value: string | null, scheduledAt: Date): Date | null {
+  if (!value) return null
+  const completedAt = new Date(value)
+  if (Number.isNaN(completedAt.getTime()) || completedAt < scheduledAt) return null
+  return completedAt
+}
+
+/** Queue submission completes the exit-orders stage; fills remain a separate step. */
+export function executionMilestone(
+  event: ScheduleEvent,
+  strategy: StrategyState,
+  now: Date,
+  timeZone: string
+): ExecutionMilestone | null {
+  if (event.key === 'entry') {
+    const completedAt = completionTime(strategy.entry_completed_at, event.at)
+    const total = strategy.symbols.length
+    const filled = strategy.filled_symbols.length
+    if (completedAt) {
+      const warning = total > 0 && filled < total
+      return {
+        active: false,
+        completed: true,
+        warning,
+        description: warning
+          ? `${filled}/${total} filled · ${formatScheduleTime(completedAt, now, timeZone)}`
+          : `Filled · ${formatScheduleTime(completedAt, now, timeZone)}`
+      }
+    }
+    if (event.at <= now) {
+      return {
+        active: true,
+        completed: false,
+        warning: false,
+        description: total > 0 ? `Filling · ${filled}/${total}` : 'Filling'
+      }
+    }
+  }
+
+  if (event.key === 'exit') {
+    const completedAt = completionTime(strategy.exit_completed_at, event.at)
+    const remaining = strategy.remaining_symbols.length
+    if (completedAt) {
+      return {
+        active: false,
+        completed: true,
+        warning: remaining > 0,
+        description: remaining > 0
+          ? `${remaining} remaining · ${formatScheduleTime(completedAt, now, timeZone)}`
+          : `Exited · ${formatScheduleTime(completedAt, now, timeZone)}`
+      }
+    }
+    if (strategy.status === 'exit_queued') {
+      return { active: false, completed: true, warning: false, description: 'Queued successfully' }
+    }
+    if (event.at <= now) {
+      const label = strategy.status === 'exit_incomplete'
+        ? 'Exit incomplete'
+        : strategy.status === 'exiting' ? 'Exiting' : 'Awaiting exit orders'
+      return {
+        active: true,
+        completed: false,
+        warning: strategy.status === 'exit_incomplete',
+        description: remaining > 0 ? `${label} · ${remaining} remaining` : label
+      }
+    }
+  }
+
+  if (event.key === 'next_open' && event.at <= now && strategy.status === 'exit_queued' && !strategy.exit_completed_at) {
+    const remaining = strategy.remaining_symbols.length
+    return {
+      active: true,
+      completed: false,
+      warning: false,
+      description: remaining > 0 ? `Awaiting fills · ${remaining} remaining` : 'Awaiting fill confirmation'
+    }
+  }
+  return null
 }
 
 function sessionCanEnter(session: MarketSession, config: ScheduleConfig): boolean {

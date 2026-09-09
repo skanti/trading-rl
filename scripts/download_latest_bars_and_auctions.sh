@@ -14,6 +14,9 @@ MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_$BAR_SINCE}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
 NBBO_PATH="${NBBO_PATH:-$UPDATES_DIR/alpaca_nbbo_1545_2022-01-01.npz}"
 NBBO_TARGETS_PATH="${NBBO_TARGETS_PATH:-}"
+NBBO_RANK_SINCE="${NBBO_RANK_SINCE:-2023-01-01}"
+NBBO_RANK_TOP="${NBBO_RANK_TOP:-12}"
+NBBO_SYMBOLS_PATH="${NBBO_SYMBOLS_PATH:-$UPDATES_DIR/strategy_symbols_$NBBO_RANK_SINCE.txt}"
 MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
 # Keep the mutable download universe beside the market-data stores, not in the
 # tracked repository. MOST_LIQUID_PATH remains a compatibility override.
@@ -38,10 +41,12 @@ LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 usage() {
   cat <<'EOF'
 Refresh the current eligible company-stock universe, update its split-adjusted
-daily bars, rebuild the dollar-volume shortlist, update auctions, and then update
-minute bars and scheduled 15:45 NBBO for the shortlist plus SPY. No simulator
-run is required. NBBO_TARGETS_PATH optionally limits quotes to a trade CSV.
-The shortlist includes every daily top-20 symbol since 2022-01-01 by default.
+daily bars, rebuild the dollar-volume shortlist, update minute bars for that
+shortlist plus SPY, and replay the strategy ranker. Then update auctions and
+scheduled 15:45 NBBO for the ranker's symbol union plus SPY. No simulator run is
+required. NBBO_TARGETS_PATH optionally supplies a trade CSV instead of ranking.
+The auction/minute shortlist includes every daily top-20 symbol since 2022-01-01.
+The NBBO shortlist replays strategy top-12 selections since 2023-01-01 by default.
 Historical bar files are retained; new auction symbols are backfilled to the
 existing dataset's start date.
 
@@ -65,6 +70,9 @@ Common environment overrides:
   NBBO_OVERLAP_DAYS=7
   NBBO_TARGET_TIME=15:45
   NBBO_TARGETS_PATH=/tmp/overnight_trades.csv
+  NBBO_RANK_SINCE=2023-01-01
+  NBBO_RANK_TOP=12
+  NBBO_SYMBOLS_PATH=/data/ppv1/updates/strategy_symbols_2023-01-01.txt
   SHORTLIST_SINCE=2022-01-01
   SHORTLIST_DAILY_TOP=20
   SHORTLIST_LOOKBACK_SESSIONS=0  # all sessions since SHORTLIST_SINCE
@@ -156,31 +164,6 @@ fi
   --metric dollar-volume \
   --output "$LIQUIDITY_CANDIDATES_PATH"
 
-# Daily bars intentionally exclude the unfinished session, but today's opening
-# auction becomes usable after the SIP delay. Do not derive this bound from the
-# daily cache or same-day reconciliation will remain one session behind.
-auction_end="$(
-  "$PYTHON_BIN" - <<'PY'
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-print(datetime.now(ZoneInfo("America/New_York")).date().isoformat())
-PY
-)"
-if [[ ! "$auction_end" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  echo "Could not determine the current New York date: $auction_end" >&2
-  exit 1
-fi
-
-log "Updating auctions through the current New York date $auction_end"
-"$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
-  --start "$AUCTION_START" \
-  --refresh-requested-only \
-  --end "$auction_end" \
-  --overlap-days "$AUCTION_OVERLAP_DAYS" \
-  --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
-  --output "$AUCTIONS_PATH"
-
 # The minute universe is fully derived from the liquidity-prioritized shortlist,
 # so it lives in a scratch file the exit trap removes. The durable record of what
 # the store holds is _symbols.txt inside the store itself, written once the
@@ -217,8 +200,42 @@ if [[ -n "$NBBO_TARGETS_PATH" ]]; then
   fi
   nbbo_target_args=(--targets-from-trades "$NBBO_TARGETS_PATH")
 else
-  nbbo_target_args=(--symbols-file "$minute_symbols_tmp")
+  log "Replaying strategy top-$NBBO_RANK_TOP selections since $NBBO_RANK_SINCE for the NBBO shortlist"
+  "$PYTHON_BIN" -m trading_rl.cli.rank \
+    --since "$NBBO_RANK_SINCE" \
+    --top "$NBBO_RANK_TOP" \
+    --daily-bars-dir "$DAILY_BARS_DIR" \
+    --minute-bars-dir "$MINUTE_BARS_DIR" \
+    --auctions-path "$AUCTIONS_PATH" \
+    --output "$NBBO_SYMBOLS_PATH"
+  nbbo_target_args=(--symbols-file "$NBBO_SYMBOLS_PATH")
 fi
+
+# Daily bars intentionally exclude the unfinished session, but today's opening
+# auction becomes usable after the SIP delay. Do not derive this bound from the
+# daily cache or same-day reconciliation will remain one session behind.
+auction_end="$(
+  "$PYTHON_BIN" - <<'PY'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+print(datetime.now(ZoneInfo("America/New_York")).date().isoformat())
+PY
+)"
+if [[ ! "$auction_end" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  echo "Could not determine the current New York date: $auction_end" >&2
+  exit 1
+fi
+
+log "Updating auctions through the current New York date $auction_end"
+"$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
+  --start "$AUCTION_START" \
+  --refresh-requested-only \
+  --end "$auction_end" \
+  --overlap-days "$AUCTION_OVERLAP_DAYS" \
+  --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
+  --output "$AUCTIONS_PATH"
+
 log "Updating scheduled $NBBO_TARGET_TIME ET SIP NBBO through $auction_end"
 "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
   --start "$NBBO_START" \

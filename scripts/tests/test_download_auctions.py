@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,33 @@ def auction_row(symbol: str, date: str, price: object) -> dict[str, object]:
 
 
 class AuctionUpdateTests(unittest.TestCase):
+    def test_raw_loader_decompresses_each_column_once_and_preserves_raw_prints(self):
+        rows = [auction_row("AAPL", "2026-08-25", 100.125), auction_row("AAPL", "2026-08-27", 50.25)]
+        rows[0]["timestamp"] = "2026-08-25T13:30:00.123456789Z"
+        rows[1].update(session="close", condition="6", timestamp="2026-08-27T20:00:00Z")
+        splits = [{
+            "symbol": "AAPL", "ex_date": "2026-08-26", "old_rate": 1., "new_rate": 2.,
+            "type": "forward_split", "id": "test-split",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auctions.npz"
+            download_auctions._write_dataset(path, rows, splits, ["AAPL"], "2026-08-25", "2026-08-27")
+            with download_auctions.np.load(path, allow_pickle=False) as archive:
+                archive_type = type(archive)
+                self.assertNotEqual(float(archive["price"][0]), rows[0]["price"])
+            reads = Counter()
+            original_read = archive_type.__getitem__
+
+            def counted_read(archive, field):
+                reads[field] += 1
+                return original_read(archive, field)
+
+            with mock.patch.object(archive_type, "__getitem__", counted_read):
+                loaded = download_auctions._load_raw_auction_rows(path)
+        self.assertEqual(loaded, rows)
+        self.assertTrue(reads)
+        self.assertEqual(max(reads.values()), 1)
+
     def test_default_end_uses_the_new_york_calendar_date(self):
         self.assertEqual(
             download_auctions.default_end(

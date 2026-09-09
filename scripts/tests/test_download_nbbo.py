@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 import tempfile
@@ -27,6 +28,33 @@ def quote_row(symbol: str, day: str, ask: float) -> dict[str, object]:
 
 
 class DownloadNbboTest(unittest.TestCase):
+    def test_raw_loader_decompresses_each_column_once_and_preserves_raw_quotes(self):
+        rows = [quote_row("AAPL", "2026-09-01", 100.125), quote_row("AAPL", "2026-09-02", 50.25)]
+        rows[0]["timestamp"] = "2026-09-01T19:44:59.123456789Z"
+        splits = [{
+            "symbol": "AAPL", "ex_date": "2026-09-02", "old_rate": 1., "new_rate": 2.,
+            "type": "forward_split", "id": "test-split",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nbbo.npz"
+            arrays = download_nbbo._dataset_arrays(rows, splits)
+            self.assertNotEqual(arrays["ask_price"][0], rows[0]["ask_price"])
+            np.savez_compressed(path, **arrays)
+            with np.load(path, allow_pickle=False) as archive:
+                archive_type = type(archive)
+            reads = Counter()
+            original_read = archive_type.__getitem__
+
+            def counted_read(archive, field):
+                reads[field] += 1
+                return original_read(archive, field)
+
+            with mock.patch.object(archive_type, "__getitem__", counted_read):
+                loaded = download_nbbo._load_raw_rows(path)
+        self.assertEqual(loaded, rows)
+        self.assertTrue(reads)
+        self.assertEqual(max(reads.values()), 1)
+
     def test_trade_csv_preserves_rotating_daily_membership(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trades.csv"

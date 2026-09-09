@@ -22,7 +22,7 @@ const presentation = computed(() => {
     case 'exiting':
       return { color: 'info' as const, dot: 'bg-sky-400', text: 'text-sky-300', label: 'Closing position' }
     case 'exit_queued':
-      return { color: 'warning' as const, dot: 'bg-amber-400', text: 'text-amber-300', label: 'Exit queued' }
+      return { color: 'info' as const, dot: 'bg-sky-400', text: 'text-sky-300', label: 'Exit orders queued' }
     case 'closed':
       return { color: 'neutral' as const, dot: 'bg-slate-500', text: 'text-slate-400', label: 'Flat' }
     case 'exit_incomplete':

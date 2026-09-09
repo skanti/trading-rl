@@ -489,14 +489,24 @@ def _atomic_write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
 
 
 def _load_raw_rows(path: Path) -> list[dict[str, object]]:
-    with np.load(path, allow_pickle=False) as data:
-        found_version = int(np.asarray(data["format_version"]).item())
+    with np.load(path, allow_pickle=False) as archive:
+        found_version = int(np.asarray(archive["format_version"]).item())
         if found_version != FORMAT_VERSION:
             raise ValueError(
                 f"NBBO dataset format {found_version} cannot be updated as strict "
                 f"symbol-date format {FORMAT_VERSION}; rebuild it with "
                 "--targets-from-trades"
             )
+        # NpzFile does not cache array reads: indexing archive[column][row]
+        # would decompress the entire column again for every individual quote.
+        data = {
+            field: archive[field]
+            for field in (
+                "symbol", "date", "target_timestamp", "timestamp",
+                "raw_bid_price", "raw_ask_price", "raw_bid_size", "raw_ask_size",
+                "bid_exchange", "ask_exchange",
+            )
+        }
         count = len(data["symbol"])
         return [
             {
@@ -679,7 +689,9 @@ def update_nbbo(
         pd.Timestamp(start).date(),
         pd.Timestamp(previous_end).date() - timedelta(days=overlap_days - 1),
     ).isoformat()
+    info(f"Loading existing NBBO quotes from {output}")
     existing_rows = _load_raw_rows(output)
+    info(f"Loaded {len(existing_rows):,} existing quotes; planning the update")
     existing_symbols = {str(row["symbol"]) for row in existing_rows} | set(manifest["symbols"])
     scheduled_symbols = {symbol for values in targets.values() for symbol in values}
     all_symbols = sorted(existing_symbols | scheduled_symbols)
@@ -698,6 +710,14 @@ def update_nbbo(
         if start <= day.isoformat() <= end
     }
     pending = {day: symbols for day, symbols in pending.items() if symbols}
+    backfill_targets = sum(len(symbols) for day, symbols in pending.items() if day.isoformat() < refresh_start)
+    recent_targets = sum(map(len, pending.values())) - backfill_targets
+    info(
+        f"NBBO update plan: {len(scheduled_symbols):,} requested symbols "
+        f"({len(scheduled_symbols - existing_symbols):,} new); "
+        f"{recent_targets:,} targets from {refresh_start} onward, "
+        f"{backfill_targets:,} historical backfill targets"
+    )
     report = current_report()
     if report:
         report.set("Targets requested", sum(map(len, pending.values())), "symbol/date pairs")

@@ -400,7 +400,6 @@ def _load_raw_auction_rows(path: Path) -> list[dict[str, object]]:
         version = int(np.asarray(data["format_version"]).item())
         if version != FORMAT_VERSION:
             raise ValueError(f"unsupported auction NPZ format version: {version}")
-        count = len(data["symbol"])
         columns = {
             "symbol": data["symbol"].astype(str),
             "date": np.datetime_as_string(data["date"], unit="D"),
@@ -411,6 +410,7 @@ def _load_raw_auction_rows(path: Path) -> list[dict[str, object]]:
             "timestamp": data["timestamp"].astype(str),
             "exchange": data["exchange"].astype(str),
         }
+        count = len(columns["symbol"])
         if any(len(values) != count for values in columns.values()):
             raise ValueError(f"auction NPZ columns have inconsistent lengths: {path}")
         return [

@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   buildNaiveSchedule,
   buildSessionTimeline,
+  executionMilestone,
   formatCountdown,
   lastCompletedTimelineIndex,
   zonedDateTime,
   type ScheduleConfig
 } from '~/utils/schedule'
+import type { StrategyState } from '~/types/dashboard'
 
 const config: ScheduleConfig = {
   timeZone: 'America/New_York',
@@ -146,5 +148,59 @@ describe('lastCompletedTimelineIndex', () => {
 
   it('has no active milestone before the schedule begins', () => {
     expect(lastCompletedTimelineIndex(events, new Date('2026-08-27T12:00:00Z'))).toBeUndefined()
+  })
+})
+
+describe('executionMilestone', () => {
+  const symbols = ['AAPL', 'MSFT']
+  const strategy: StrategyState = {
+    status: 'exit_queued',
+    entry_date: '2026-09-08',
+    exit_date: '2026-09-09',
+    symbols,
+    filled_symbols: symbols,
+    remaining_symbols: symbols,
+    budget: 10000,
+    per_symbol_notional: 5000,
+    entry_completed_at: '2026-09-08T19:45:01Z',
+    exit_completed_at: null,
+    ranking_trade_date: '2026-09-08',
+    ranking_completed_at: '2026-09-08T18:01:00Z',
+    updated_at: '2026-09-09T10:00:01Z'
+  }
+  const now = new Date('2026-09-09T12:00:00Z')
+  const timeline = buildSessionTimeline(now, strategy, { ...config, exitTime: '06:00' }, {
+    sessions: [
+      { date: '2026-09-08', open: '09:30', close: '16:00' },
+      { date: '2026-09-09', open: '09:30', close: '16:00' }
+    ]
+  })!
+  const exit = timeline.events.find(event => event.key === 'exit')!
+  const opening = timeline.events.find(event => event.key === 'next_open')!
+
+  it('marks queued orders complete and leaves the next opening available for its countdown', () => {
+    expect(executionMilestone(exit, strategy, now, config.timeZone)).toEqual({
+      active: false, completed: true, warning: false, description: 'Queued successfully'
+    })
+    expect(timeline.events.some(event => executionMilestone(event, strategy, now, config.timeZone)?.active)).toBe(false)
+    expect(timeline.nextEvent?.key).toBe('next_open')
+    expect(formatCountdown(timeline.nextEvent!.at, now)).toBe('in 1h 30m')
+  })
+
+  it('waits for fill confirmation after the open instead of showing a completed exit', () => {
+    expect(executionMilestone(opening, strategy, new Date('2026-09-09T13:30:01Z'), config.timeZone)).toEqual({
+      active: true, completed: false, warning: false, description: 'Awaiting fills · 2 remaining'
+    })
+    const closed = { ...strategy, status: 'closed', remaining_symbols: [], exit_completed_at: '2026-09-09T13:30:02Z' }
+    expect(executionMilestone(exit, closed, new Date('2026-09-09T13:31:00Z'), config.timeZone)?.description).toBe('Exited · 9:30 AM')
+    expect(executionMilestone(opening, closed, new Date('2026-09-09T13:31:00Z'), config.timeZone)).toBeNull()
+  })
+
+  it('never labels unsent or failed exits as successfully queued', () => {
+    expect(executionMilestone(exit, { ...strategy, status: 'open' }, now, config.timeZone)?.description).toBe('Awaiting exit orders · 2 remaining')
+    expect(executionMilestone(exit, { ...strategy, status: 'exiting' }, now, config.timeZone)?.description).toBe('Exiting · 2 remaining')
+    expect(executionMilestone(exit, { ...strategy, status: 'exit_incomplete' }, now, config.timeZone)).toEqual({
+      active: true, completed: false, warning: true, description: 'Exit incomplete · 2 remaining'
+    })
   })
 })

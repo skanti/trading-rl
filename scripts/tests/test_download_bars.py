@@ -153,13 +153,12 @@ class BarUpdateTests(unittest.TestCase):
                     download_bars.merge_bar_arrays(base, update, anchor_seconds=2)
                 )
 
-    def test_expected_anchor_and_complete_stored_overlap_are_required(self):
+    def test_expected_anchor_and_stored_endpoint_are_required(self):
         base = bars((1, 100, 10, 1), (2, 101, 11, 2), (3, 102, 12, 3), (4, 103, 13, 4))
         for update, message in (
             (base[2:], "expected anchor"),
             (bars((5, 104, 14, 5)), "expected anchor"),
             (base[1:3], "stored endpoint"),
-            (base[[1, 3]], "missing previously stored"),
         ):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 download_bars.merge_bar_arrays(base, update, anchor_seconds=2)
@@ -199,10 +198,9 @@ class BarUpdateTests(unittest.TestCase):
         changed[:, 1] += 10
         responses = {
             "missing anchor": [base[2:]],
-            "missing interior timestamp": [base[[1, 3]]],
             "truncated tail": [base[1:3]],
             "full refresh drops prefix": [changed, changed],
-            "full refresh drops interior": [changed, base[[0, 1, 3]]],
+            "full refresh truncates tail": [changed, base[:3]],
         }
         for case, arrays in responses.items():
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
@@ -223,6 +221,55 @@ class BarUpdateTests(unittest.TestCase):
                 self.assertEqual(downloader.call_count, len(arrays))
                 self.assertEqual(stored.read_bytes(), original)
                 self.assertEqual((output / "_failed_tickers.txt").read_text(), "AAPL\n")
+
+    def test_minute_update_removes_missing_bars_and_restores_them_on_a_later_pull(self):
+        day = 86_400
+        base = bars((0, 100, 10, 1), (20 * day, 101, 11, 2), (30 * day, 102, 12, 3), (40 * day, 103, 13, 4))
+        for extend in (False, True):
+            with self.subTest(extend=extend), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "AAPL.npy"
+                np.save(path, base)
+                corrected = base[[1, 3]].copy()
+                restored = base[1:].copy()
+                restored[1] = bars((30 * day, 150, 25, 5))[0]
+                if extend:
+                    new_bar = bars((41 * day, 160, 26, 6))
+                    corrected = np.vstack((corrected, new_bar))
+                    restored = np.vstack((restored, new_bar))
+                with mock.patch.object(
+                    download_bars, "download_ticker",
+                    side_effect=[minute_frame(corrected), minute_frame(restored)],
+                ) as downloader:
+                    for update in (corrected, restored):
+                        report = download_bars.DownloadReport("Minute bars")
+                        self.assertTrue(download_bars.process_ticker(
+                            "AAPL", "alpaca", directory, download_bars.ANNO,
+                            update_existing=True, report=report,
+                        ))
+                        np.testing.assert_array_equal(np.load(path), np.vstack((base[:1], update)))
+                        self.assertEqual(report.outcomes, {"AAPL": "Updated"})
+                self.assertEqual(downloader.call_count, 2)
+
+    def test_full_minute_refresh_accepts_removed_interior_bars(self):
+        day = 86_400
+        base = bars((0, 100, 10, 1), (20 * day, 101, 11, 2), (30 * day, 102, 12, 3), (40 * day, 103, 13, 4))
+        refreshed = base[[0, 1, 3]].copy()
+        refreshed[:, 1:5] += 10
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "AAPL.npy"
+            np.save(path, base)
+            report = download_bars.DownloadReport("Minute bars")
+            with mock.patch.object(
+                download_bars, "download_ticker",
+                side_effect=[minute_frame(refreshed[1:]), minute_frame(refreshed)],
+            ) as downloader:
+                self.assertTrue(download_bars.process_ticker(
+                    "AAPL", "alpaca", directory, download_bars.ANNO,
+                    update_existing=True, report=report,
+                ))
+            self.assertEqual(downloader.call_count, 2)
+            np.testing.assert_array_equal(np.load(path), refreshed)
+            self.assertEqual(report.outcomes, {"AAPL": "Full redownloads"})
 
     def test_ticker_update_escalates_to_full_download_on_difference(self):
         day = 24 * 60 * 60

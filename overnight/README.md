@@ -178,8 +178,8 @@ validation, and atomic array replacement. Their orchestration remains separate s
 the live path can require a specific completed session and fail closed without
 partially updating its cache.
 
-To refresh the broad daily store, rebuild the dollar-volume shortlist, extend
-auction data, and update shortlist minute bars and scheduled NBBO in one pass, run:
+To refresh the broad daily store, rebuild the dollar-volume shortlist, update
+shortlist minute bars, and then update auctions and scheduled NBBO in one pass, run:
 
 ```bash
 ../scripts/download_latest_bars_and_auctions.sh
@@ -193,11 +193,20 @@ environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
 overlap/shortlist settings shown by `--help`. Downloads default to 8 workers,
 1 symbol per minute-bar batch, and a shared bar-download limit of 180 requests
 per minute. Single-symbol minute batches save each completed symbol independently
-and reduce memory use during full-history downloads. Auction updates use the current New
-York date. NBBO runs last using the same historical shortlist plus SPY, for each
-eligible trading session since `NBBO_START` (default `2022-01-01`) at
-`NBBO_TARGET_TIME` (default `15:45` ET). No simulation run is needed.
-`NBBO_TARGETS_PATH` optionally restricts NBBO downloads to a trade CSV instead.
+and reduce memory use during full-history downloads. After minute bars, the wrapper
+runs `trading-rank` against the refreshed bar stores and the existing auction
+history, then updates auctions and NBBO. Auction updates use the current New York
+date. Ranking requires the existing auction history to cover its replay interval.
+It replays strategy top-12 selections since
+`NBBO_RANK_SINCE` (default `2023-01-01`), using `NBBO_RANK_TOP` to set the basket size.
+The unique symbol union is saved to `NBBO_SYMBOLS_PATH` (default
+`$UPDATES_DIR/strategy_symbols_2023-01-01.txt`), together with its daily-selection
+CSV. The count follows the ranking results; it is not capped at 41.
+NBBO then requests that strategy union plus SPY for each eligible trading session
+since `NBBO_START` (default `2022-01-01`) at `NBBO_TARGET_TIME` (default `15:45` ET).
+No simulation run is needed. `NBBO_TARGETS_PATH` optionally supplies a trade CSV
+instead of running the ranker. A failed ranking stops the pipeline before auctions
+and NBBO.
 Targets still inside Alpaca's delayed-SIP window are deferred until a later run.
 Symbol-file NBBO uses Alpaca's trading calendar, authenticated with the trading
 credentials in `overnight/.env`; quote requests use the data credentials.
@@ -211,8 +220,10 @@ by default (`AUCTION_OVERLAP_DAYS` and `NBBO_OVERLAP_DAYS` in the wrapper).
 NBBO updates backfill previously unattempted symbol/date targets even outside the
 overlap and preserve unrequested pairs. Recorded missing quotes are retried within
 the overlap; use a wider overlap or `--rebuild` to retry older missing observations.
-The first NBBO run with the shortlist can be substantially larger than a trade-CSV
-download, including when it expands an existing CSV-based dataset.
+The first NBBO run with the strategy union can be larger than a trade-CSV download,
+including when it expands an existing CSV-based dataset. Before fetching quotes,
+the downloader reports loaded quotes, requested and new symbols, recent targets,
+and historical backfill targets so an expanded universe is visible immediately.
 
 All three downloaders use a shared Rich console and progress display. The final
 table labels each count's unit: bars report updated, unchanged, newly downloaded,
@@ -245,13 +256,18 @@ A matching anchor allows the entire tail to be replaced, accepting corrections t
 later bars even when no new timestamps are added. A changed anchor triggers a full
 retained-history refresh for that symbol.
 
-The expected anchor must be present, and the replacement must retain every stored
-timestamp in the replaced range and reach at least the stored endpoint. A full
-refresh must likewise retain every previously stored timestamp. Missing overlap,
-dropped rows, or a truncated replacement fail the symbol without overwriting its
-file; the command records `_failed_tickers.txt` and exits unsuccessfully if any
-symbol fails. These checks preserve known coverage, but do not assume a bar exists
-for every minute or prove that older, unqueried history is unchanged.
+The latest response is authoritative inside the refreshed range: an interior bar
+omitted by the provider is removed, and a bar returned by a later pull is restored
+while its timestamp remains inside that pull's range. This favors newer provider
+data and treats omitted bars as corrections; it cannot distinguish corrections
+from temporary provider omissions.
+
+The expected anchor must still be present, and the replacement must reach at least
+the stored endpoint. A full refresh must also reach back to the stored start.
+Missing anchors or truncated range boundaries fail the symbol without overwriting
+its file; the command records `_failed_tickers.txt` and exits unsuccessfully if any
+symbol fails. These checks do not assume a bar exists for every minute or prove
+that older, unqueried history is unchanged.
 
 Each symbol has its own anchor even in multi-symbol batches. `--since` supplies
 the start for new files; an existing file supplies its own retained start. Use
@@ -438,7 +454,8 @@ default remains `minute-open`. The NBBO source requires
 `--entry-time 15:45`. A buy is benchmarked at the ask, while the existing
 transaction-cost assumption remains separately visible. Set `NBBO_TARGETS_PATH` to
 the same trade CSV to restrict the all-in-one wrapper to that basket; otherwise it
-downloads the historical shortlist for every eligible session.
+replays `trading-rank` and downloads its historical symbol union for every eligible
+session.
 
 For exit-price research, select each held basket's **exit date** explicitly:
 
