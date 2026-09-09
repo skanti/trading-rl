@@ -44,15 +44,18 @@ from trading_rl.market_data.bars import (
 )
 from trading_rl.market_data.calendar import calendar_session_supports_entry
 
-from .backtest import (
+from .history import (
     DEFAULT_SECURITY_MASTER_CACHE,
-    basket_quantities,
-    issuer_key,
     _security_symbol,
-    causal_ema_log_liquidity,
-    causal_turnover_stability,
     is_company_security,
     load_nasdaq_security_master,
+)
+from .backtest import (
+    basket_quantities,
+)
+from .ranking import (
+    causal_completed_trading_days, issuer_key, liquidity_scores,
+    ranked_indices, select_ranked_indices,
 )
 from .live_config import (
     DEFAULT_LIVE_CONFIG_PATH,
@@ -1083,9 +1086,7 @@ def completed_liquidity_ranking(
     volume only when VWAP is unavailable. Missing sessions decay an existing
     EMA exactly like the backtest and do not count toward minimum history.
 
-    ``scheme`` selects the ranking statistic, and both options call straight into
-    the simulator's implementation so a live basket and a simulated one cannot
-    drift apart.
+    Scoring, history eligibility, and ordering come from the shared ranking module.
     """
     if scheme not in ("dollar_ema", "turnover_stability"):
         raise ValueError(f"unsupported live liquidity scheme: {scheme}")
@@ -1095,8 +1096,8 @@ def completed_liquidity_ranking(
     symbols = sorted(bars_by_symbol)
     date_index = {day: index for index, day in enumerate(completed)}
     values = np.full((len(completed) + 1, len(symbols)), np.nan, dtype=np.float64)
-    observations = np.zeros(len(symbols), dtype=np.int32)
     for column, symbol in enumerate(symbols):
+        seen_sessions: set[date] = set()
         for bar in bars_by_symbol[symbol]:
             timestamp = bar.get("t")
             if not timestamp:
@@ -1105,6 +1106,9 @@ def completed_liquidity_ranking(
             row = date_index.get(bar_date)
             if row is None:
                 continue
+            if bar_date in seen_sessions:
+                raise ValueError(f"duplicate completed session for {symbol}: {bar_date}")
+            seen_sessions.add(bar_date)
             volume = _float(bar.get("v"), "bar.v")
             price_value = bar.get("vw")
             price = _float(price_value, "bar.vw") if price_value is not None else 0.0
@@ -1112,33 +1116,24 @@ def completed_liquidity_ranking(
                 price = _float(bar.get("c"), "bar.c")
             if volume > 0.0 and price > 0.0:
                 values[row, column] = price * volume
-                observations[column] += 1
-    score_matrix = (
-        causal_turnover_stability(
-            values,
-            ema_span,
-            min_history_days,
-            dispersion_span=dispersion_span,
-        )
-        if scheme == "turnover_stability"
-        else causal_ema_log_liquidity(values, ema_span, min_history_days)
+    score_matrix = liquidity_scores(
+        values, scheme, ema_span, min_history_days, dispersion_span=dispersion_span,
     )
     latest_scores = score_matrix[-1]
+    observations = causal_completed_trading_days(values)[-1]
     required_sessions = (
         int(min_history_days)
         if minimum_trading_days is None
         else int(minimum_trading_days)
     )
-    if required_sessions < 1:
-        raise ValueError("minimum_trading_days must be positive")
-    ranked = [
-        (symbol, float(latest_scores[index]), int(observations[index]))
-        for index, symbol in enumerate(symbols)
-        if np.isfinite(latest_scores[index])
-        and observations[index] >= required_sessions
+    ordered = ranked_indices(
+        latest_scores, np.asarray(symbols), completed_days=observations,
+        minimum_trading_days=required_sessions,
+    )
+    return [
+        (symbols[index], float(latest_scores[index]), int(observations[index]))
+        for index in ordered
     ]
-    ranked.sort(key=lambda item: (-item[1], item[0]))
-    return ranked
 
 
 def _download_bars(
@@ -1740,33 +1735,28 @@ def _select_unconflicted_candidates(
     A ranking written before issuers were recorded has no ``issuer`` field; such a
     candidate falls back to its own symbol, which disables deduping rather than failing.
     """
-    selected: list[str] = []
-    seen_issuers: set[str] = set()
-    skipped_duplicates: list[str] = []
-    for candidate in ranking["candidates"]:
-        symbol = str(candidate["symbol"])
-        if symbol in held_symbols or symbol in open_order_symbols:
-            continue
-        if dedupe_share_classes:
-            issuer = str(candidate.get("issuer") or symbol)
-            if issuer in seen_issuers:
-                skipped_duplicates.append(symbol)
-                continue
-            seen_issuers.add(issuer)
-        selected.append(symbol)
-        if len(selected) == top:
-            break
-    if len(selected) != top:
+    # Broker conflicts are live-specific eligibility constraints. Preserve the
+    # archived ranking order and delegate issuer deduplication/top-N to the core.
+    candidates = [
+        candidate for candidate in ranking["candidates"]
+        if str(candidate["symbol"]) not in held_symbols | open_order_symbols
+    ]
+    symbols = np.asarray([str(candidate["symbol"]) for candidate in candidates])
+    issuers = {
+        str(candidate["symbol"]): str(candidate.get("issuer") or candidate["symbol"])
+        for candidate in candidates
+    }
+    try:
+        selected = select_ranked_indices(
+            np.arange(len(symbols)), symbols, top,
+            issuers=issuers if dedupe_share_classes else None,
+        )
+    except ValueError as error:
         raise RuntimeError(
-            f"only {len(selected)} ranked candidates remain after excluding existing positions/orders"
-        )
-    if skipped_duplicates:
-        LOGGER.info(
-            "skipped %d duplicate share class(es) so the basket holds distinct issuers: %s",
-            len(skipped_duplicates),
-            ", ".join(skipped_duplicates),
-        )
-    return selected
+            "not enough ranked candidates remain after excluding existing positions/orders: "
+            + str(error)
+        ) from error
+    return symbols[selected].tolist()
 
 
 def enter_for_day(

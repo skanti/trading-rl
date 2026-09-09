@@ -856,7 +856,7 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
     def test_live_ranking_matches_the_simulator_scheme_for_scheme(self):
         """The live scorer must agree with the simulator on identical input, or a
         live basket and a backtested one silently diverge."""
-        from trading_rl.overnight.backtest import (
+        from trading_rl.overnight.ranking import (
             causal_ema_log_liquidity,
             causal_turnover_stability,
         )

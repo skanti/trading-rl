@@ -39,8 +39,8 @@ usage() {
   cat <<'EOF'
 Refresh the current eligible company-stock universe, update its split-adjusted
 daily bars, rebuild the dollar-volume shortlist, update auctions, and then update
-minute bars for the shortlist plus SPY. When NBBO_TARGETS_PATH is set, the final
-step updates strict scheduled 15:45 NBBO targets from that simulator trade CSV.
+minute bars and scheduled 15:45 NBBO for the shortlist plus SPY. No simulator
+run is required. NBBO_TARGETS_PATH optionally limits quotes to a trade CSV.
 The shortlist includes every daily top-20 symbol since 2022-01-01 by default.
 Historical bar files are retained; new auction symbols are backfilled to the
 existing dataset's start date.
@@ -173,21 +173,13 @@ if [[ ! "$auction_end" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
 fi
 
 log "Updating auctions through the current New York date $auction_end"
-if [[ -f "$AUCTIONS_PATH" && -f "${AUCTIONS_PATH%.npz}.json" ]]; then
-  "$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
-    --update \
-    --refresh-requested-only \
-    --end "$auction_end" \
-    --overlap-days "$AUCTION_OVERLAP_DAYS" \
-    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
-    --output "$AUCTIONS_PATH"
-else
-  "$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
-    --start "$AUCTION_START" \
-    --end "$auction_end" \
-    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
-    --output "$AUCTIONS_PATH"
-fi
+"$PYTHON_BIN" "$SCRIPT_DIR/download_auctions.py" \
+  --start "$AUCTION_START" \
+  --refresh-requested-only \
+  --end "$auction_end" \
+  --overlap-days "$AUCTION_OVERLAP_DAYS" \
+  --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
+  --output "$AUCTIONS_PATH"
 
 # The minute universe is fully derived from the liquidity-prioritized shortlist,
 # so it lives in a scratch file the exit trap removes. The durable record of what
@@ -223,29 +215,19 @@ if [[ -n "$NBBO_TARGETS_PATH" ]]; then
     echo "NBBO target trade CSV does not exist: $NBBO_TARGETS_PATH" >&2
     exit 1
   fi
-  log "Updating scheduled $NBBO_TARGET_TIME ET SIP NBBO targets through $auction_end"
-  if [[ -f "$NBBO_PATH" && -f "${NBBO_PATH%.npz}.json" ]]; then
-    "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
-      --update \
-      --end "$auction_end" \
-      --target-time "$NBBO_TARGET_TIME" \
-      --overlap-days "$NBBO_OVERLAP_DAYS" \
-      --targets-from-trades "$NBBO_TARGETS_PATH" \
-      --auctions-path "$AUCTIONS_PATH" \
-      --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
-      --output "$NBBO_PATH"
-  else
-    "$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
-      --start "$NBBO_START" \
-      --end "$auction_end" \
-      --target-time "$NBBO_TARGET_TIME" \
-      --targets-from-trades "$NBBO_TARGETS_PATH" \
-      --auctions-path "$AUCTIONS_PATH" \
-      --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
-      --output "$NBBO_PATH"
-  fi
+  nbbo_target_args=(--targets-from-trades "$NBBO_TARGETS_PATH")
 else
-  log "Skipping optional NBBO update; set NBBO_TARGETS_PATH to a simulator trade CSV"
+  nbbo_target_args=(--symbols-file "$minute_symbols_tmp")
 fi
+log "Updating scheduled $NBBO_TARGET_TIME ET SIP NBBO through $auction_end"
+"$PYTHON_BIN" "$SCRIPT_DIR/download_nbbo.py" \
+  --start "$NBBO_START" \
+  --end "$auction_end" \
+  --target-time "$NBBO_TARGET_TIME" \
+  --overlap-days "$NBBO_OVERLAP_DAYS" \
+  "${nbbo_target_args[@]}" \
+  --auctions-path "$AUCTIONS_PATH" \
+  --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE" \
+  --output "$NBBO_PATH"
 
 log "Market-data update complete through $auction_end"

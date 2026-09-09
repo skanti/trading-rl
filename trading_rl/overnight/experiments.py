@@ -68,29 +68,30 @@ from rich.console import Console
 from rich.table import Table
 
 from ..market_data.calendar import auction_close_minutes
-from .backtest import (
+from .history import (
     DEFAULT_AUCTIONS_PATH,
     DEFAULT_DAILY_DATA_DIR,
     DEFAULT_DATA_DIR,
     DEFAULT_SECURITY_MASTER_CACHE,
-    DEFAULT_TRANSACTION_COST_BPS,
     EXTENDED_OPEN_MINUTE,
     REFERENCE_SYMBOL,
-    _cache_metadata,
     _security_symbol,
-    build_issuer_map,
-    causal_completed_trading_days,
-    causal_ema_log_liquidity,
     company_universe_mask,
     exchange_universe_mask,
     load_nasdaq_security_master,
+    reference_session_calendar,
+)
+from .backtest import (
+    DEFAULT_TRANSACTION_COST_BPS,
+    _cache_metadata,
     load_opening_auction_prices,
     load_or_build_cache,
-    reference_session_calendar,
     strategy_metrics,
-    top_liquid_indices,
 )
 from .price_utils import forward_fill_positions
+from .ranking import (
+    build_issuer_map, causal_completed_trading_days, causal_ema_log_liquidity, top_ranked_indices,
+)
 
 AUCTION_MINUTE = -1  # sentinel: exit in the opening cross rather than at a clock time
 
@@ -278,14 +279,12 @@ def rank_baskets(panel: Panel, selection: Selection, entry_minute: int) -> list[
             baskets.append(np.empty(0, dtype=np.int64))
             continue
         executable = np.where(entry_stale[index, stock] <= 10, entry_prices[index, stock], np.nan)
-        eligible = np.where(
-            panel.completed_days[index, stock] >= selection.minimum_trading_days,
-            scores[index, stock],
-            np.nan,
-        )
         try:
-            local = top_liquid_indices(
-                eligible, executable, selection.top, stock_symbols,
+            local = top_ranked_indices(
+                scores[index, stock], stock_symbols, selection.top,
+                completed_days=panel.completed_days[index, stock],
+                minimum_trading_days=selection.minimum_trading_days,
+                eligible_mask=np.isfinite(executable) & (executable > 0.0),
                 issuers=panel.issuers if selection.dedupe else None,
             )
         except ValueError:

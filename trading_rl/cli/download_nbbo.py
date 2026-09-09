@@ -16,14 +16,16 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
-from tqdm import tqdm
 
 from ..market_data.calendar import auction_close_minutes, short_entry_dates
+from ..market_data.download_mode import use_incremental_download
+from ..market_data.download_output import current_report, download_output, info, track_download
 from .download_auctions import (
     _download_splits,
     _ordered_splits,
     _request_headers,
     _security_symbol,
+    symbols_from_file,
 )
 
 
@@ -177,6 +179,33 @@ def merge_target_schedules(
     return merged
 
 
+def targets_from_symbols(
+    symbols: set[str], start: str, end: str, target: clock_time
+) -> dict[date, set[str]]:
+    """Schedule a reusable symbol universe using the official trading calendar."""
+    from ..overnight.live import AlpacaClient, load_credentials
+    from ..market_data.calendar import calendar_session_supports_entry
+
+    start_day, end_day = pd.Timestamp(start).date(), pd.Timestamp(end).date()
+    if end_day < start_day:
+        raise ValueError(f"end {end} precedes start {start}")
+    key, secret = load_credentials()
+    client = AlpacaClient(
+        key, secret,
+        trading_url=os.environ.get("ALPACA_URL", "https://paper-api.alpaca.markets/v2"),
+    )
+    sessions = client.calendar(start_day, end_day)
+    universe = {_security_symbol(symbol) for symbol in symbols} | {REFERENCE_SYMBOL}
+    targets = {
+        date.fromisoformat(str(session["date"])): set(universe)
+        for session in sessions
+        if calendar_session_supports_entry(session, target)
+    }
+    if not targets:
+        raise ValueError(f"no eligible trading sessions from {start} through {end}")
+    return targets
+
+
 def _bounded_targets(
     targets: dict[date, set[str]], start: str, end: str
 ) -> dict[date, set[str]]:
@@ -319,7 +348,7 @@ def _download_quote_rows(
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     sessions = sorted(targets)
-    for day in tqdm(sessions, desc="Downloading scheduled NBBO", unit="session"):
+    for day in track_download(sessions, total=len(sessions), description="Fetching NBBO", unit="sessions"):
         target_at = target_timestamp(day, target)
         for batch in _batches(sorted(targets[day]), batch_size):
             # A tight batch query is efficient for liquid names. Any absent name gets
@@ -376,12 +405,13 @@ def _ordered_unique_rows(
 def merge_quote_rows(
     existing_rows: Iterable[dict[str, object]],
     refreshed_rows: Iterable[dict[str, object]],
-    refreshed_dates: set[str],
+    refreshed_targets: set[tuple[str, str]],
 ) -> list[dict[str, object]]:
+    """Replace only attempted symbol/date pairs, including explicitly missing quotes."""
     kept = [
         row
         for row in existing_rows
-        if str(row["date"]) not in refreshed_dates
+        if (str(row["symbol"]), str(row["date"])) not in refreshed_targets
     ]
     return _ordered_unique_rows([*kept, *refreshed_rows])
 
@@ -555,6 +585,10 @@ def _fetch(
     eligible_targets = {day: requested[day] for day in eligible}
     if not eligible_targets:
         return [], deferred, [], set()
+    info(
+        f"requesting {sum(map(len, eligible_targets.values())):,} scheduled NBBO quotes "
+        f"across {len(eligible_targets):,} sessions"
+    )
     missing_quotes: list[dict[str, object]] = []
     with requests.Session() as session:
         rows = _download_quote_rows(
@@ -584,6 +618,9 @@ def download_nbbo(
     requests_per_minute: int = 180,
 ) -> tuple[int, int, int]:
     targets = _bounded_targets(targets, start, end)
+    report = current_report()
+    if report:
+        report.set("Targets requested", sum(map(len, targets.values())), "symbol/date pairs")
     rows, deferred, missing_quotes, _ = _fetch(
         targets, start, end, target, batch_size, lookback_seconds, requests_per_minute
     )
@@ -605,6 +642,10 @@ def download_nbbo(
         len(targets),
         missing_quotes=missing_quotes,
     )
+    if report:
+        report.set("Full redownloads" if report.mode == "Rebuild" else "New quotes", len(rows), "quotes")
+        report.set("Missing this run", len(missing_quotes), "symbol/date pairs")
+        report.set("Targets deferred", sum(map(len, targets.values())) - len(rows) - len(missing_quotes), "symbol/date pairs")
     return len(symbols), len(_ordered_unique_rows(rows)), deferred
 
 
@@ -622,7 +663,7 @@ def update_nbbo(
     if not output.exists() or not manifest_path.exists():
         raise ValueError("--update requires the existing NBBO NPZ and JSON manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    start = str(manifest["start"])
+    start = min(str(manifest["start"])[:10], min(targets).isoformat())
     previous_end = str(manifest["end"])
     target = parse_target_time(str(manifest["target_time"]))
     if target_override is not None and target_override != target:
@@ -639,30 +680,52 @@ def update_nbbo(
         pd.Timestamp(previous_end).date() - timedelta(days=overlap_days - 1),
     ).isoformat()
     existing_rows = _load_raw_rows(output)
-    existing_symbols = {str(row["symbol"]) for row in existing_rows}
+    existing_symbols = {str(row["symbol"]) for row in existing_rows} | set(manifest["symbols"])
     scheduled_symbols = {symbol for values in targets.values() for symbol in values}
     all_symbols = sorted(existing_symbols | scheduled_symbols)
-    refreshed, deferred, missing_quotes, refreshed_days = _fetch(
-        targets,
-        refresh_start,
-        end,
-        target,
-        batch_size,
-        lookback_seconds,
-        requests_per_minute,
-    )
+    # Previously missing quotes count as attempted. Retry those in the overlap,
+    # while backfilling every never-attempted pair regardless of its age.
+    known = {
+        (str(row["symbol"]), str(row["date"]))
+        for row in [*existing_rows, *manifest.get("missing_quotes", [])]
+    }
+    pending = {
+        day: {
+            symbol for symbol in symbols
+            if day.isoformat() >= refresh_start or (symbol, day.isoformat()) not in known
+        }
+        for day, symbols in targets.items()
+        if start <= day.isoformat() <= end
+    }
+    pending = {day: symbols for day, symbols in pending.items() if symbols}
+    report = current_report()
+    if report:
+        report.set("Targets requested", sum(map(len, pending.values())), "symbol/date pairs")
+    if pending:
+        refreshed, deferred, missing_quotes, refreshed_days = _fetch(
+            pending, min(pending).isoformat(), end, target, batch_size,
+            lookback_seconds, requests_per_minute,
+        )
+    else:
+        refreshed, deferred, missing_quotes, refreshed_days = [], 0, [], set()
+    refreshed_targets = {
+        (symbol, day.isoformat())
+        for day, symbols in pending.items() if day.isoformat() in refreshed_days
+        for symbol in symbols
+    }
+    missing_this_run = len(missing_quotes)
     # Refresh the complete split ledger once for the final universe.
     headers = _request_headers()
     split_end = max(pd.Timestamp(end).date(), datetime.now(timezone.utc).date()).isoformat()
     with requests.Session() as session:
         splits = _download_splits(session, headers, all_symbols, start, split_end)
-    # Even a session with every quote missing was attempted and must replace its
-    # old rows. Deferred sessions were not attempted and keep their old data.
+    # Missing attempted pairs replace old quotes, but unrequested symbols and
+    # deferred sessions retain their existing records.
     missing_quotes = [
         row for row in manifest.get("missing_quotes", [])
-        if str(row["date"]) not in refreshed_days
+        if (str(row["symbol"]), str(row["date"])) not in refreshed_targets
     ] + missing_quotes
-    merged = merge_quote_rows(existing_rows, refreshed, refreshed_days)
+    merged = merge_quote_rows(existing_rows, refreshed, refreshed_targets)
     _write_dataset(
         output,
         merged,
@@ -680,12 +743,27 @@ def update_nbbo(
             "overlap_days": overlap_days,
             "scheduled_symbols": sorted(scheduled_symbols),
             "scheduled_target_count": sum(len(values) for values in targets.values()),
+            "attempted_target_count": len(refreshed_targets),
         },
         missing_quotes=missing_quotes,
     )
+    if report:
+        old_keys = {(str(row["symbol"]), str(row["date"])) for row in existing_rows}
+        updated = sum((str(row["symbol"]), str(row["date"])) in old_keys for row in refreshed)
+        backfilled = sum(
+            (str(row["symbol"]), str(row["date"])) not in old_keys and str(row["date"]) < refresh_start
+            for row in refreshed
+        )
+        report.set("Updated quotes", updated, "quotes")
+        report.set("New quotes", len(refreshed) - updated - backfilled, "quotes")
+        report.set("Historical backfills", backfilled, "quotes")
+        report.set("Missing this run", missing_this_run, "symbol/date pairs")
+        report.set("Targets deferred", sum(map(len, pending.values())) - len(refreshed_targets), "symbol/date pairs")
+        report.set("Existing quotes retained", len(old_keys - refreshed_targets), "quotes")
     return len(all_symbols), len(merged), deferred
 
 
+@download_output("NBBO", LOGGER, exit_on_error=True)
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", default=None)
@@ -697,7 +775,12 @@ def main() -> None:
         help="auction NPZ used for official session-close times",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument("--update", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--update", action="store_true",
+                      help="require an existing dataset (default: create or update automatically)")
+    mode.add_argument("--rebuild", action="store_true", help="redownload the full target schedule")
+    parser.add_argument("--symbols-file", action="append", default=[],
+                        help="one symbol per line; query each trading session without a trade CSV")
     parser.add_argument("--overlap-days", type=int, default=7)
     parser.add_argument("--lookback-seconds", type=int, default=60)
     parser.add_argument(
@@ -721,36 +804,55 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--requests-per-minute", type=int, default=180)
     args = parser.parse_args()
+    report = current_report()
+    report.output = args.output
     if min(args.overlap_days, args.lookback_seconds, args.batch_size, args.requests_per_minute) < 1:
         parser.error("overlap, lookback, batch size, and request rate must be positive")
-    if not args.targets_from_trades:
-        parser.error("at least one --targets-from-trades CSV is required")
+    if bool(args.targets_from_trades) == bool(args.symbols_file):
+        parser.error("provide either --symbols-file or --targets-from-trades")
     output = Path(args.output)
-    if output.suffix.lower() != ".npz":
-        parser.error("--output must end in .npz")
+    try:
+        incremental = use_incremental_download(output, update=args.update, rebuild=args.rebuild)
+    except ValueError as error:
+        parser.error(str(error))
+    report.mode = "Rebuild" if args.rebuild else "Update" if incremental else "Initial download"
+    for label in ("Updated quotes", "New quotes", "Historical backfills", "Full redownloads"):
+        report.set(label, 0, "quotes")
     target = args.target_time
     manifest_path = output.with_suffix(".json")
-    if target is None and args.update and manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    if target is None and manifest:
         target = parse_target_time(str(manifest["target_time"]))
     target = target or parse_target_time("15:45")
-    targets = merge_target_schedules(
-        targets_from_trade_csv(Path(value), args.target_date_column)
-        for value in args.targets_from_trades
-    )
+    shortened = set()
+    if args.symbols_file:
+        start = args.start or manifest.get("start")
+        if not start:
+            parser.error("--start is required for an initial symbol-file download")
+        if incremental:
+            start = min(start, str(manifest["start"]))
+        symbols = set().union(*(symbols_from_file(Path(path)) for path in args.symbols_file))
+        if not symbols:
+            parser.error("symbol files contain no symbols")
+        end = args.end or default_end()
+        targets = targets_from_symbols(symbols, start, end, target)
+    else:
+        targets = merge_target_schedules(
+            targets_from_trade_csv(Path(value), args.target_date_column)
+            for value in args.targets_from_trades
+        )
+        close_minutes = auction_close_minutes(Path(args.auctions_path), targets)
+        shortened = short_entry_dates(close_minutes, target.hour * 60 + target.minute)
+        targets = {day: symbols for day, symbols in targets.items() if day not in shortened}
+        if not targets:
+            parser.error("all scheduled NBBO targets fall on shortened sessions")
+        start = args.start or min(targets).isoformat()
+        end = args.end or max(targets).isoformat()
     # The simulator prices SPY at the same entry source for its benchmark.  Keep
     # that reference observation alongside each day's rotating strategy basket.
     for day_symbols in targets.values():
         day_symbols.add(REFERENCE_SYMBOL)
-    close_minutes = auction_close_minutes(Path(args.auctions_path), targets)
-    shortened = short_entry_dates(
-        close_minutes, target.hour * 60 + target.minute
-    )
-    targets = {day: symbols for day, symbols in targets.items() if day not in shortened}
-    if not targets:
-        parser.error("all scheduled NBBO targets fall on shortened sessions")
-    end = args.end or max(targets).isoformat()
-    if args.update:
+    if incremental:
         count, quotes, deferred = update_nbbo(
             output,
             end,
@@ -762,7 +864,6 @@ def main() -> None:
             target,
         )
     else:
-        start = args.start or min(targets).isoformat()
         count, quotes, deferred = download_nbbo(
             targets,
             start,
@@ -773,17 +874,14 @@ def main() -> None:
             args.lookback_seconds,
             args.requests_per_minute,
         )
-    parts = []
+    report.set("Quotes in dataset", quotes, "quotes")
+    report.set("Symbols in dataset", count, "symbols")
+    report.set("Short sessions skipped", len(shortened), "sessions")
+    report.set("Sessions deferred", deferred, "sessions")
     written_manifest = json.loads(output.with_suffix(".json").read_text())
     if written_manifest["missing_quote_count"]:
-        parts.append(f"{written_manifest['missing_quote_count']:,} missing symbol/date quotes "
-                     "recorded in the JSON manifest")
-    if shortened:
-        parts.append(f"skipped {len(shortened)} shortened session(s)")
-    if deferred:
-        parts.append(f"deferred {deferred} session(s) inside the SIP delay")
-    suffix = "; " + "; ".join(parts) if parts else ""
-    print(f"wrote {quotes:,} scheduled NBBO quotes for {count} symbols to {output}{suffix}")
+        report.details.append(f"Missing quote details: {output.with_suffix('.json')} (missing_quotes)")
+
 
 
 if __name__ == "__main__":

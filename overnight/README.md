@@ -179,7 +179,7 @@ the live path can require a specific completed session and fail closed without
 partially updating its cache.
 
 To refresh the broad daily store, rebuild the dollar-volume shortlist, extend
-auction data, and update shortlist minute bars in one pass, run:
+auction data, and update shortlist minute bars and scheduled NBBO in one pass, run:
 
 ```bash
 ../scripts/download_latest_bars_and_auctions.sh
@@ -194,9 +194,36 @@ overlap/shortlist settings shown by `--help`. Downloads default to 8 workers,
 1 symbol per minute-bar batch, and a shared bar-download limit of 180 requests
 per minute. Single-symbol minute batches save each completed symbol independently
 and reduce memory use during full-history downloads. Auction updates use the current New
-York date. An optional NBBO update runs last when `NBBO_TARGETS_PATH` names a
-simulator trade CSV; targets still inside Alpaca's delayed-SIP window are deferred
-and filled by the next overlap refresh.
+York date. NBBO runs last using the same historical shortlist plus SPY, for each
+eligible trading session since `NBBO_START` (default `2022-01-01`) at
+`NBBO_TARGET_TIME` (default `15:45` ET). No simulation run is needed.
+`NBBO_TARGETS_PATH` optionally restricts NBBO downloads to a trade CSV instead.
+Targets still inside Alpaca's delayed-SIP window are deferred until a later run.
+Symbol-file NBBO uses Alpaca's trading calendar, authenticated with the trading
+credentials in `overnight/.env`; quote requests use the data credentials.
+Early-close sessions are excluded when the target time is at or after the close.
+
+Both `download-auctions` and `download-nbbo` create an absent dataset and update an
+existing dataset automatically. `--update` explicitly requires an existing dataset;
+`--rebuild` explicitly redownloads the full requested history. An incomplete NPZ/JSON
+pair fails instead of being overwritten. Their overlaps remain seven calendar days
+by default (`AUCTION_OVERLAP_DAYS` and `NBBO_OVERLAP_DAYS` in the wrapper).
+NBBO updates backfill previously unattempted symbol/date targets even outside the
+overlap and preserve unrequested pairs. Recorded missing quotes are retried within
+the overlap; use a wider overlap or `--rebuild` to retry older missing observations.
+The first NBBO run with the shortlist can be substantially larger than a trade-CSV
+download, including when it expands an existing CSV-based dataset.
+
+All three downloaders use a shared Rich console and progress display. The final
+table labels each count's unit: bars report updated, unchanged, newly downloaded,
+fully redownloaded, skipped, and failed symbols; auctions report refreshed/new
+symbols, symbols without prints, and stored prints; NBBO reports refreshed quotes,
+new quotes, historical backfills, missing targets, and deferred targets. Successful
+download counts are recorded after saving. Progress counts processed work and can
+include failed or missing targets. Warning/error event totals are separate from
+failed-symbol counts; repeated diagnostics appear below the table with examples.
+NBBO missing-pair details remain in its JSON manifest, and failed bar symbols remain
+in `_failed_tickers.txt`. Fatal CLI errors print a failed summary and exit nonzero.
 The shortlist is ordered by consistent daily top-N appearances, then trailing
 average liquidity, so its most persistently liquid symbols enter the concurrent
 minute-download queue first.
@@ -305,8 +332,84 @@ python backtest.py \
   --transaction-cost-bps 1
 ```
 
-For a causal spread-aware entry, generate a normal minute-bar backtest CSV and use its
-exact `(entry_date, sample_id)` basket as the NBBO download schedule:
+For a reusable NBBO dataset without first running a backtest:
+
+```bash
+download-nbbo \
+  --symbols-file /data/ppv1/updates/liquidity_candidates.txt \
+  --start 2022-01-01 \
+  --target-time 15:45 \
+  --output /data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz
+```
+
+SPY is included automatically. Repeating the command updates existing coverage and
+backfills newly requested historical pairs. Change both `--target-time` and
+`--output` to collect a separate snapshot time, such as 09:35.
+
+To collect only the symbols selected by the strategy, replay its ranking without
+simulating returns or downloading NBBO:
+
+```bash
+trading-rank \
+  --since 2023-01-01 \
+  --top 12 \
+  --output /tmp/strategy_symbols_2023.txt \
+  --output-csv /tmp/strategy_targets_2023.csv
+```
+
+`trading-rank` shares the backtest's universe filters, causal liquidity scores,
+minimum-history rules, company deduplication, and session window, including warm-up
+before `--since`. `--end-date` is the final **exit** date, so the last exported entry
+is the preceding eligible session. With no date options, it exports the trailing
+12 months. `--entry-time` defaults to 15:45 Eastern and excludes shortened sessions
+that have already closed at that time.
+
+The command reads daily bars for liquidity, the minute-file inventory for the same
+candidate universe as the backtester, SPY minute bars for complete sessions, and
+auction metadata for calendar/exchange checks. It does not read stock minute
+prices or NBBO, build an execution-price cache, size trades, or calculate returns.
+It exports intended membership independent of quote availability, matching the
+NBBO backtest's selection stage. A minute-price backtest can choose different
+members because it additionally filters missing or stale entry prices.
+
+Execution-price and transaction-cost arguments do not apply to `trading-rank`.
+The backtester's former `--export-symbols` option has been removed; use
+`trading-rank --output` for symbol exports.
+
+The default minimum is 100 completed observed sessions per symbol. If your stores
+start in January 2022, the first possible entry is May 26, 2022; use
+`--since 2022-05-26`. Selecting from January requires earlier warm-up history.
+Insufficient history or a missing official session close fails with a dated error
+before replacing exports; the ranker does not silently shorten the requested range.
+
+`trading_rl/overnight/ranking.py` owns the causal scoring, completed-session counts,
+minimum-history eligibility, deterministic score/symbol ordering, issuer identity,
+and top-N deduplication used by live execution, backtests, and exports. Callers
+supply their data windows and eligibility constraints; broker conflicts, price
+availability, sizing, and order submission remain outside the shared ranker.
+Matching inputs and settings produce matching rankings. Live input rejects
+duplicate completed-session bars so duplicates cannot inflate history counts.
+`trading_rl/overnight/history.py` shares the historical calendar, warm-up window,
+universe filters, and daily dollar-volume loading with the backtester.
+
+The text file contains sorted unique stock symbols. The CSV contains `entry_date`,
+`exit_date`, `rank`, `sample_id`, and `liquidity_score`; it represents intended
+selections before missing execution prices or whole-share sizing can remove
+trades. SPY is excluded from the strategy union and added by the NBBO downloader.
+If `--output-csv` is omitted, the CSV uses the symbol-list path with a `.csv` suffix.
+
+Use the daily schedule for the smallest NBBO download, or the text file with
+`--symbols-file` for every eligible date across the exported union:
+
+```bash
+download-nbbo \
+  --targets-from-trades /tmp/strategy_targets_2023.csv \
+  --target-time 15:45 \
+  --output /data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz
+```
+
+For 09:35 exit quotes, pass `--target-date-column exit_date`, `--target-time 09:35`,
+and a separate output file. A completed simulation's trade CSV also remains usable:
 
 ```bash
 trading-backtest \
@@ -320,21 +423,22 @@ download-nbbo \
 ```
 
 The downloader stores the latest valid SIP bid/ask at or before 15:45 ET, never a
-later quote, with raw and split-adjusted fields. It requests only each session's
+later quote, with raw and split-adjusted fields. In trade-CSV mode it requests only each session's
 selected basket rather than crossing every symbol that appeared during the entire
 window with every date. Basket rotation is therefore preserved: a multi-month run may
 contain many unique symbols, but normally only that day's 12 targets plus the SPY
 benchmark are queried in a single batch. Any target without a valid quote inside
 `--lookback-seconds` (60 seconds by default) is skipped with a warning. Valid quotes
 are saved, and the JSON manifest records `missing_quote_count` and the exact
-`missing_quotes` symbol/date pairs. Version-1 broad-union NBBO files must be rebuilt once with the target CSV.
+`missing_quotes` symbol/date pairs. A missing quote replaces any older quote for
+that same attempted symbol/date; deferred and unrequested pairs are retained.
 
 Use the resulting dataset in a backtest with `--entry-price-source nbbo-ask`; the
 default remains `minute-open`. The NBBO source requires
 `--entry-time 15:45`. A buy is benchmarked at the ask, while the existing
 transaction-cost assumption remains separately visible. Set `NBBO_TARGETS_PATH` to
-the same trade CSV when running the all-in-one downloader wrapper; without it the
-wrapper explicitly skips the optional NBBO update.
+the same trade CSV to restrict the all-in-one wrapper to that basket; otherwise it
+downloads the historical shortlist for every eligible session.
 
 For exit-price research, select each held basket's **exit date** explicitly:
 
@@ -346,7 +450,7 @@ download-nbbo \
   --output /data/ppv1/updates/alpaca_nbbo_0935_2022-01-01.npz
 ```
 
-The default `--target-date-column entry_date` is for entry quotes. Changing only
+In trade-CSV mode, the default `--target-date-column entry_date` is for entry quotes. Changing only
 the clock to 09:35 would request the afternoon basket on the wrong morning.
 Run the simulator against the exit bids with:
 

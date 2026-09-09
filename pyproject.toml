@@ -37,6 +37,7 @@ dev = [
 trading-dashboard = "trading_rl.dashboard.daemon:main"
 trading-dashboard-auth = "trading_rl.dashboard.auth:main"
 trading-backtest = "trading_rl.overnight.backtest:main"
+trading-rank = "trading_rl.cli.rank:main"
 trading-experiments = "trading_rl.overnight.experiments:main"
 trading-live = "trading_rl.overnight.live:main"
 trading-reconcile = "trading_rl.overnight.reconcile_live_sessions:main"

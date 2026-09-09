@@ -10,7 +10,10 @@ import numpy as np
 from scripts.tests.bar_fixtures import ohlcv_fixture
 from rich.console import Console
 
-from trading_rl.overnight.backtest import BAR_ORIGIN, EASTERN
+from trading_rl.overnight.history import (
+    BAR_ORIGIN,
+    EASTERN,
+)
 from trading_rl.overnight.broker_fees import summarize_broker_fees
 from trading_rl.overnight.reconciliation_prices import MissingBenchmarkData
 from trading_rl.overnight.reconcile_live_sessions import (

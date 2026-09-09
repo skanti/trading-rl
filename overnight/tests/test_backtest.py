@@ -11,28 +11,29 @@ import pandas as pd
 from rich.console import Console
 
 from trading_rl.market_data.calendar import auction_close_minutes, short_entry_dates
+from trading_rl.overnight.ranking import (
+    causal_ema_log_liquidity, causal_turnover_stability, causal_completed_trading_days,
+    liquidity_scores, top_ranked_indices,
+)
+from trading_rl.overnight.history import (
+    company_universe_mask,
+    exchange_universe_mask,
+    is_company_security,
+    load_primary_auction_exchange_mask,
+    reference_session_calendar,
+)
 from trading_rl.overnight.backtest import (
     DEFAULT_TRANSACTION_COST_BPS,
     _symbol_daily_arrays,
     MINUTE_PRICE_COLUMNS,
     basket_quantities,
     build_parser,
-    causal_ema_log_liquidity,
-    causal_turnover_stability,
-    causal_completed_trading_days,
-    company_universe_mask,
-    exchange_universe_mask,
-    is_company_security,
-    liquidity_scores,
     load_opening_auction_prices,
-    load_primary_auction_exchange_mask,
     load_scheduled_nbbo_asks,
     print_symbol_trade_counts,
     print_summary_table,
-    reference_session_calendar,
     run_backtest,
     strategy_metrics,
-    top_liquid_indices,
 )
 
 
@@ -606,9 +607,9 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
         self.assertLess(unsmoothed[3, 0], unsmoothed[3, 1])
 
     def test_top_selection_excludes_symbols_without_a_current_entry_price(self):
-        selected = top_liquid_indices(
+        selected = top_ranked_indices(
             scores=np.array([5.0, 4.0, 3.0]),
-            entry_prices=np.array([np.nan, 100.0, 100.0]),
+            eligible_mask=np.array([False, True, True]),
             top=2,
             symbols=np.array(["A", "B", "C"]),
         )

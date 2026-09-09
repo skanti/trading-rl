@@ -179,7 +179,7 @@ class DownloadNbboTest(unittest.TestCase):
         self.assertEqual(float(arrays["ask_size"][0]), 2_000.0)
         self.assertEqual(float(arrays["raw_ask_price"][0]), 1_200.0)
 
-    def test_overlap_replaces_the_complete_refreshed_date_membership(self):
+    def test_overlap_preserves_unrequested_symbols_on_refreshed_dates(self):
         existing = [
             quote_row("AAPL", "2026-08-24", 100.0),
             quote_row("AAPL", "2026-08-25", 101.0),
@@ -187,13 +187,14 @@ class DownloadNbboTest(unittest.TestCase):
         ]
         refreshed = [quote_row("AAPL", "2026-08-25", 101.5)]
 
-        merged = download_nbbo.merge_quote_rows(existing, refreshed, {"2026-08-25"})
+        merged = download_nbbo.merge_quote_rows(existing, refreshed, {("AAPL", "2026-08-25")})
 
         self.assertEqual(
             [(row["symbol"], row["date"], row["ask_price"]) for row in merged],
             [
                 ("AAPL", "2026-08-24", 100.0),
                 ("AAPL", "2026-08-25", 101.5),
+                ("MSFT", "2026-08-25", 500.0),
             ],
         )
 
@@ -296,6 +297,113 @@ class DownloadNbboTest(unittest.TestCase):
         self.assertEqual(deferred, 0)
         self.assertEqual(missing[0]["symbol"], "AAPL")
         self.assertEqual(attempted, {"2026-09-02"})
+
+    def test_symbol_file_schedule_uses_calendar_skips_early_closes_and_handles_dst(self):
+        sessions = [
+            {"date": "2026-03-06", "close": "16:00"},
+            {"date": "2026-03-09", "close": "16:00"},
+            {"date": "2026-11-27", "close": "13:00"},
+        ]
+        with mock.patch("trading_rl.overnight.live.load_credentials", return_value=("test", "test")), mock.patch(
+            "trading_rl.overnight.live.AlpacaClient"
+        ) as client:
+            client.return_value.calendar.return_value = sessions
+            targets = download_nbbo.targets_from_symbols({"AAPL"}, "2026-01-01", "2026-12-31", time(15, 45))
+            morning = download_nbbo.targets_from_symbols({"AAPL"}, "2026-01-01", "2026-12-31", time(9, 35))
+        self.assertEqual(set(targets), {date(2026, 3, 6), date(2026, 3, 9)})
+        self.assertEqual(targets[date(2026, 3, 6)], {"AAPL", "SPY"})
+        self.assertIn(date(2026, 11, 27), morning)
+        self.assertEqual(download_nbbo.target_timestamp(date(2026, 3, 6), time(15, 45)).hour, 20)
+        self.assertEqual(download_nbbo.target_timestamp(date(2026, 3, 9), time(15, 45)).hour, 19)
+
+    def test_update_backfills_new_pairs_outside_overlap_and_preserves_other_quotes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nbbo.npz"
+            old_missing = [{"date": "2026-01-02", "symbol": "MISSING", "reason": "missing"}]
+            download_nbbo._write_dataset(
+                output, [quote_row("AAPL", "2026-01-02", 100.), quote_row("MSFT", "2026-09-02", 200.)],
+                [], ["AAPL", "MSFT", "MISSING"], "2026-01-02", "2026-09-02", time(15, 45), 60, 3, 2,
+                missing_quotes=old_missing,
+            )
+            targets = {date(2026, 1, 2): {"AAPL", "MSFT", "MISSING"}, date(2026, 9, 2): {"AAPL"}}
+            refreshed = [quote_row("MSFT", "2026-01-02", 150.), quote_row("AAPL", "2026-09-02", 110.)]
+            with mock.patch.object(download_nbbo, "_fetch", return_value=(
+                refreshed, 0, [], {"2026-01-02", "2026-09-02"}
+            )) as fetch, mock.patch.object(download_nbbo, "_request_headers", return_value={}), mock.patch.object(
+                download_nbbo, "_download_splits", return_value=[]
+            ):
+                download_nbbo.update_nbbo(output, "2026-09-02", targets, 7, 100, 60, 180)
+                self.assertEqual(fetch.call_args.args[0], {
+                    date(2026, 1, 2): {"MSFT"}, date(2026, 9, 2): {"AAPL"}
+                })
+            rows = download_nbbo._load_raw_rows(output)
+            self.assertEqual(len(rows), 4)
+            self.assertIn(("MSFT", "2026-09-02", 200.), [(r["symbol"], r["date"], r["ask_price"]) for r in rows])
+            manifest = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual(manifest["missing_quotes"], old_missing)
+
+    def test_missing_refresh_preserves_other_symbols_and_their_missing_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nbbo.npz"
+            download_nbbo._write_dataset(
+                output, [quote_row("AAPL", "2026-09-02", 100.), quote_row("MSFT", "2026-09-02", 200.)],
+                [], ["AAPL", "MSFT", "OTHER"], "2026-09-02", "2026-09-02", time(15, 45), 60, 3, 1,
+                missing_quotes=[{"symbol": "OTHER", "date": "2026-09-02"}],
+            )
+            with mock.patch.object(download_nbbo, "_fetch", return_value=(
+                [], 0, [{"symbol": "AAPL", "date": "2026-09-02"}], {"2026-09-02"}
+            )), mock.patch.object(download_nbbo, "_request_headers", return_value={}), mock.patch.object(
+                download_nbbo, "_download_splits", return_value=[]
+            ):
+                download_nbbo.update_nbbo(output, "2026-09-02", {date(2026, 9, 2): {"AAPL"}}, 7, 100, 60, 180)
+            self.assertEqual([r["symbol"] for r in download_nbbo._load_raw_rows(output)], ["MSFT"])
+            manifest = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual({r["symbol"] for r in manifest["missing_quotes"]}, {"AAPL", "OTHER"})
+
+    def test_update_with_no_pending_targets_does_not_fail_or_fetch_quotes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nbbo.npz"
+            download_nbbo._write_dataset(
+                output, [quote_row("AAPL", "2026-01-02", 100.)], [], ["AAPL"],
+                "2026-01-02", "2026-09-02", time(15, 45), 60, 1, 1,
+            )
+            with mock.patch.object(download_nbbo, "_fetch") as fetch, mock.patch.object(
+                download_nbbo, "_request_headers", return_value={}
+            ), mock.patch.object(download_nbbo, "_download_splits", return_value=[]):
+                download_nbbo.update_nbbo(output, "2026-09-02", {date(2026, 1, 2): {"AAPL"}}, 7, 100, 60, 180)
+            fetch.assert_not_called()
+            self.assertEqual(len(download_nbbo._load_raw_rows(output)), 1)
+
+    def test_update_api_failure_preserves_both_existing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nbbo.npz"
+            manifest = output.with_suffix(".json")
+            download_nbbo._write_dataset(
+                output, [quote_row("AAPL", "2026-09-02", 100.)], [], ["AAPL"],
+                "2026-09-02", "2026-09-02", time(15, 45), 60, 1, 1,
+            )
+            before = (output.read_bytes(), manifest.read_bytes())
+            with mock.patch.object(download_nbbo, "_fetch", side_effect=RuntimeError("API unavailable")):
+                with self.assertRaisesRegex(RuntimeError, "API unavailable"):
+                    download_nbbo.update_nbbo(output, "2026-09-02", {date(2026, 9, 2): {"AAPL"}}, 7, 100, 60, 180)
+            self.assertEqual((output.read_bytes(), manifest.read_bytes()), before)
+
+    def test_update_extends_start_for_older_new_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nbbo.npz"
+            download_nbbo._write_dataset(
+                output, [quote_row("AAPL", "2026-09-02", 100.)], [], ["AAPL"],
+                "2026-09-02", "2026-09-02", time(15, 45), 60, 1, 1,
+            )
+            with mock.patch.object(download_nbbo, "_fetch", return_value=(
+                [quote_row("AAPL", "2022-01-03", 90.)], 0, [], {"2022-01-03"}
+            )) as fetch, mock.patch.object(download_nbbo, "_request_headers", return_value={}), mock.patch.object(
+                download_nbbo, "_download_splits", return_value=[]
+            ):
+                download_nbbo.update_nbbo(output, "2026-09-02", {date(2022, 1, 3): {"AAPL"}}, 7, 100, 60, 180)
+            self.assertEqual(fetch.call_args.args[1], "2022-01-03")
+            self.assertEqual(json.loads(output.with_suffix(".json").read_text())["start"], "2022-01-03")
+            self.assertEqual(len(download_nbbo._load_raw_rows(output)), 2)
 
 
 if __name__ == "__main__":

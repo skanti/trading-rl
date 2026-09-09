@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -15,7 +16,11 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
-from tqdm import tqdm
+
+from ..market_data.download_mode import use_incremental_download
+from ..market_data.download_output import current_report, download_output, download_progress, info
+
+LOGGER = logging.getLogger(__name__)
 
 
 AUCTIONS_URL = "https://data.alpaca.markets/v2/stocks/auctions"
@@ -191,7 +196,7 @@ def _download_auction_rows(
     batch_size: int,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    with tqdm(total=len(symbols), desc="Downloading auctions", unit="symbol") as progress:
+    with download_progress(total=len(symbols), description="Fetching auctions") as progress:
         for batch in _batches(symbols, batch_size):
             page_token: str | None = None
             while True:
@@ -481,6 +486,9 @@ def download_auctions(
     output_path: Path,
     batch_size: int = 50,
 ) -> tuple[int, int]:
+    report = current_report()
+    if report:
+        report.set("Requested", len(symbols), "symbols")
     headers = _request_headers()
     start_bound = pd.Timestamp(start).date().isoformat()
     end_bound = pd.Timestamp(end).date().isoformat()
@@ -505,6 +513,13 @@ def download_auctions(
         end,
         split_adjusted_as_of=split_end,
     )
+    if report:
+        returned = {str(row["symbol"]) for row in rows}
+        report.set("Full redownloads" if report.mode == "Rebuild" else "New downloads", len(returned), "symbols")
+        report.set("Without auction prints", len(set(symbols) - returned), "symbols")
+        report.set("Prints in dataset", len(_ordered_unique_auction_rows(rows)), "prints")
+        if missing := sorted(set(symbols) - returned):
+            LOGGER.warning("No auction prints returned for %d symbols (examples: %s)", len(missing), ", ".join(missing[:5]))
     return len(symbols), len(_ordered_unique_auction_rows(rows))
 
 
@@ -541,6 +556,10 @@ def update_auctions(
     all_symbols = sorted(existing_symbols | new_symbols)
     refresh_symbols = requested_symbols if refresh_requested_only else set(all_symbols)
     refresh_existing = existing_symbols & refresh_symbols
+    report = current_report()
+    if report:
+        report.set("Requested", len(refresh_symbols), "symbols")
+        report.set("Not refreshed", len(existing_symbols - refresh_symbols), "symbols")
     # A retained symbol may have missed several updates outside the shortlist.
     # Resume from its own coverage date, not the dataset's newest end date.
     saved_end_dates = manifest.get("symbol_end_dates", {})
@@ -554,7 +573,7 @@ def update_auctions(
     refresh_start = max(
         dataset_start_date, oldest_end - timedelta(days=int(overlap_days) - 1)
     ).isoformat()
-    print(
+    info(
         f"refreshing auctions for {len(refresh_symbols):,} symbols "
         f"({len(refresh_existing):,} existing, {len(new_symbols):,} new); "
         f"retaining {len(all_symbols):,} symbols in the dataset"
@@ -583,7 +602,7 @@ def update_auctions(
             if refresh_start <= str(row["date"]) <= requested_end_bound
         ]
         if new_symbols:
-            print(
+            info(
                 f"new symbols: downloading full retained history for "
                 f"{', '.join(sorted(new_symbols))}"
             )
@@ -631,9 +650,18 @@ def update_auctions(
         split_adjusted_as_of=split_end,
         symbol_end_dates=symbol_end_dates,
     )
+    if report:
+        returned = {str(row["symbol"]) for row in refreshed_rows}
+        report.set("Updated", len(refresh_existing & returned), "symbols")
+        report.set("New downloads", len(new_symbols & returned), "symbols")
+        report.set("Without auction prints", len(refresh_symbols - returned), "symbols")
+        report.set("Prints in dataset", len(merged), "prints")
+        if missing := sorted(refresh_symbols - returned):
+            LOGGER.warning("No auction prints returned for %d symbols (examples: %s)", len(missing), ", ".join(missing[:5]))
     return len(all_symbols), len(merged)
 
 
+@download_output("Auctions", LOGGER, exit_on_error=True)
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -647,22 +675,24 @@ def main() -> None:
         help="inclusive RFC-3339 or YYYY-MM-DD (default: today in New York)",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--update",
         action="store_true",
-        help="refresh an overlapping tail of an existing dataset and retain its symbol set",
+        help="require an existing dataset (default: create if absent, update if present)",
     )
+    mode.add_argument("--rebuild", action="store_true", help="redownload the full dataset")
     parser.add_argument(
         "--overlap-days",
         type=int,
         default=7,
-        help="calendar days replaced during --update to capture late corrections (default: 7)",
+        help="calendar days replaced during updates to capture late corrections (default: 7)",
     )
     parser.add_argument(
         "--refresh-requested-only",
         action="store_true",
         help=(
-            "with --update, refresh only explicitly selected symbols plus SPY; "
+            "when updating, refresh only explicitly selected symbols plus SPY; "
             "retain other stored history"
         ),
     )
@@ -681,20 +711,32 @@ def main() -> None:
     parser.add_argument("--symbols", default="", help="additional comma-separated symbols")
     parser.add_argument("--batch-size", type=int, default=50)
     args = parser.parse_args()
+    report = current_report()
+    report.output = args.output
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if args.overlap_days < 1:
         parser.error("--overlap-days must be positive")
-    if not args.update and not args.start:
-        parser.error("--start is required unless --update is used")
-    if args.refresh_requested_only and not args.update:
-        parser.error("--refresh-requested-only requires --update")
+    output_path = Path(args.output)
+    try:
+        incremental = use_incremental_download(
+            output_path, update=args.update, rebuild=args.rebuild
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    report.mode = "Rebuild" if args.rebuild else "Update" if incremental else "Initial download"
+    for label in ("Requested", "Updated", "New downloads", "Full redownloads", "Without auction prints", "Not refreshed"):
+        report.set(label, 0, "symbols")
+    if args.start is None and output_path.exists():
+        args.start = json.loads(output_path.with_suffix(".json").read_text())["start"]
+    if not incremental and not args.start:
+        parser.error("--start is required for an initial download")
     try:
         query_end, current_day = auction_query_end(args.end)
     except ValueError as error:
         parser.error(str(error))
     if current_day:
-        print(
+        info(
             f"current-day SIP query is delayed through {query_end}; "
             "today's closing auctions may be incomplete and will be filled by "
             "the next overlap refresh"
@@ -704,12 +746,11 @@ def main() -> None:
         symbols.update(symbols_from_trade_csv(Path(path)))
     for path in args.symbols_file:
         symbols.update(symbols_from_file(Path(path)))
+    if args.rebuild and not symbols and output_path.exists():
+        symbols.update(json.loads(output_path.with_suffix(".json").read_text())["symbols"])
     if args.refresh_requested_only and not symbols:
         parser.error("--refresh-requested-only requires an explicit symbol selection")
-    output_path = Path(args.output)
-    if output_path.suffix.lower() != ".npz":
-        parser.error("--output must end in .npz")
-    if args.update:
+    if incremental:
         count, prints = update_auctions(
             output_path,
             args.end,
@@ -727,7 +768,7 @@ def main() -> None:
             output_path,
             args.batch_size,
         )
-    print(f"wrote {prints:,} auction prints for {count} stored symbols to {args.output}")
+
 
 
 if __name__ == "__main__":

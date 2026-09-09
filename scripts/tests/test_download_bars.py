@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 import tempfile
 import threading
@@ -34,56 +33,6 @@ def minute_frame(array: np.ndarray):
 
 
 class BarUpdateTests(unittest.TestCase):
-    def test_repetitive_logs_are_summarized_with_example_symbols(self):
-        summary = download_bars.DeferredDownloadSummary("DOWNLOAD_BARS")
-        records = [
-            logging.LogRecord(
-                "DOWNLOAD_BARS",
-                logging.WARNING,
-                __file__,
-                1,
-                "Historical overlap changed; downloading full retained history, ticker=%s",
-                (ticker,),
-                None,
-            )
-            for ticker in ("MSFT", "AAPL")
-        ]
-        routine_info = logging.LogRecord(
-            "DOWNLOAD_BARS",
-            logging.INFO,
-            __file__,
-            1,
-            "Incremental update complete, ticker=%s, old_rows=%d, new_rows=%d",
-            ("NVDA", 10, 11),
-            None,
-        )
-        startup_info = logging.LogRecord(
-            "DOWNLOAD_BARS",
-            logging.INFO,
-            __file__,
-            1,
-            "Tickers provided, tickers_num=%d",
-            (3,),
-            None,
-        )
-
-        self.assertTrue(all(not summary.filter(record) for record in records))
-        self.assertFalse(summary.filter(routine_info))
-        self.assertTrue(summary.filter(startup_info))
-
-        destination = mock.Mock()
-        summary.write(destination)
-        destination.info.assert_any_call(
-            "Download event summary: updates=%d, warnings=%d, errors=%d", 1, 2, 0
-        )
-        destination.info.assert_any_call(
-            "  %s %s: %d%s",
-            "WARNING",
-            "Historical overlap changed; downloading full retained history",
-            2,
-            " (e.g. AAPL, MSFT)",
-        )
-
     def test_extensionless_ticker_list_is_loaded_as_a_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "minute-symbols"
@@ -482,7 +431,7 @@ class BarUpdateTests(unittest.TestCase):
                 with (
                     mock.patch.object(download_bars, "process_ticker", side_effect=process),
                     mock.patch.object(download_bars, "process_alpaca_batch", side_effect=process_batch),
-                    mock.patch.object(download_bars, "tqdm") as progress,
+                    mock.patch.object(download_bars, "download_progress") as progress,
                     self.assertRaisesRegex(RuntimeError, "SLOW"),
                 ):
                     progress.return_value.__enter__.return_value.update.side_effect = advance

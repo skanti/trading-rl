@@ -5,7 +5,6 @@ import pathlib
 import random
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from itertools import islice
@@ -16,9 +15,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 import requests
-from rich.logging import RichHandler
 
 from ..market_data.bars import (
     BAR_COLUMNS,
@@ -31,8 +28,10 @@ from ..market_data.bars import (
     validate_retained_bar_timestamps,
 )
 from ..market_data.schema import BAR_SCHEMA_VERSION, validate_bar_columns, validate_bar_manifest
+from ..market_data.download_output import (
+    DownloadReport, current_report, download_output, download_progress, track_download,
+)
 
-logging.basicConfig(level=logging.INFO, handlers=[RichHandler()], force=True)
 logger = logging.getLogger("DOWNLOAD_BARS")
 
 ANNO = BAR_EPOCH
@@ -42,103 +41,6 @@ ALPACA_REQUESTS_PER_MINUTE = 180
 ALPACA_BATCH_SIZE = 100
 ALPACA_SIP_DELAY = timedelta(minutes=20)
 DATASET_MANIFEST = "_download_manifest.json"
-
-
-class DeferredDownloadSummary(logging.Filter):
-    """Collapse repetitive per-ticker logs into a compact end-of-run summary."""
-
-    DEFERRED_INFO_PREFIXES = (
-        "Ticker exists already - skip",
-        "Incremental update complete",
-        "Full refresh complete",
-    )
-
-    def __init__(self, logger_name: str, example_limit: int = 5):
-        super().__init__()
-        self.logger_name = logger_name
-        self.example_limit = example_limit
-        self.counts: Counter[tuple[int, str]] = Counter()
-        self.examples: dict[tuple[int, str], set[str]] = {}
-        self.lock = threading.Lock()
-
-    @staticmethod
-    def _category(message: str) -> str:
-        if message.startswith("Alpaca batch failed; retrying"):
-            return "Alpaca batch failed; split and retried"
-        return message.split(",", 1)[0]
-
-    @staticmethod
-    def _example(message: str) -> str | None:
-        for marker in ("ticker=", "name="):
-            if marker in message:
-                return message.split(marker, 1)[1].split(", ", 1)[0]
-        return None
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != self.logger_name:
-            return True
-        message = record.getMessage()
-        should_defer = record.levelno >= logging.WARNING or (
-            record.levelno == logging.INFO
-            and message.startswith(self.DEFERRED_INFO_PREFIXES)
-        )
-        if not should_defer:
-            return True
-
-        key = (record.levelno, self._category(message))
-        example = self._example(message)
-        with self.lock:
-            self.counts[key] += 1
-            if example:
-                values = self.examples.setdefault(key, set())
-                if len(values) < self.example_limit:
-                    values.add(example)
-        return False
-
-    def write(self, destination: logging.Logger) -> None:
-        with self.lock:
-            counts = dict(self.counts)
-            examples = {key: sorted(values) for key, values in self.examples.items()}
-
-        if not counts:
-            destination.info(
-                "Download event summary: no warnings or per-ticker updates"
-            )
-            return
-
-        info_count = sum(
-            count
-            for (level, _category), count in counts.items()
-            if level < logging.WARNING
-        )
-        warning_count = sum(
-            count
-            for (level, _category), count in counts.items()
-            if level == logging.WARNING
-        )
-        error_count = sum(
-            count
-            for (level, _category), count in counts.items()
-            if level > logging.WARNING
-        )
-        destination.info(
-            "Download event summary: updates=%d, warnings=%d, errors=%d",
-            info_count,
-            warning_count,
-            error_count,
-        )
-        for (level, category), count in sorted(
-            counts.items(), key=lambda item: (-item[0][0], item[0][1])
-        ):
-            sample = examples.get((level, category), [])
-            example_text = f" (e.g. {', '.join(sample)})" if sample else ""
-            destination.info(
-                "  %s %s: %d%s",
-                logging.getLevelName(level),
-                category,
-                count,
-                example_text,
-            )
 
 
 class RateLimiter:
@@ -437,12 +339,19 @@ def process_ticker(
     overlap_days: int = 30,
     timeframe: str = "1Min",
     initial_df: pd.DataFrame | None = None,
+    report: DownloadReport | None = None,
 ) -> bool:
     ticker = storage_ticker(ticker)
     out_path = f"{out_dir}/{ticker}.npy"
+    existed = os.path.exists(out_path)
+
+    def finished(success: bool, outcome: str = "Failed") -> bool:
+        if report is not None:
+            report.record(ticker, outcome if success else "Failed")
+        return success
+
     if skip_existing and os.path.exists(out_path):
-        logger.info(f"Ticker exists already - skip, ticker={ticker}")
-        return True
+        return finished(True, "Skipped")
     try:
         if update_existing and os.path.exists(out_path):
             base = np.load(out_path)
@@ -463,37 +372,26 @@ def process_ticker(
             )
             if update_df.empty:
                 logger.warning("No update bars found, ticker=%s", ticker)
-                return False
+                return finished(False)
             update_array = dataframe_to_array(
                 update_df, os.path.basename(out_path), timeframe
             )
             if update_array is None:
-                return False
+                return finished(False)
             merged = merge_bar_arrays(base, update_array, anchor_seconds=anchor_seconds)
             if merged is not None:
                 save_array(merged, out_path)
-                logger.info(
-                    "Incremental update complete, ticker=%s, old_rows=%d, new_rows=%d",
-                    ticker,
-                    len(base),
-                    len(merged),
-                )
-                return True
+                return finished(True, "Unchanged" if np.array_equal(base, merged) else "Updated")
 
-            logger.warning(
-                "Historical overlap changed%s; downloading full retained history, ticker=%s",
-                " at the anchor" if anchor_seconds is not None else "",
-                ticker,
-            )
             full_df = download_ticker(ticker, source, base_start, timeframe)
             if full_df.empty:
                 logger.warning("No full-refresh bars found, ticker=%s", ticker)
-                return False
+                return finished(False)
             full_array = dataframe_to_array(
                 full_df, os.path.basename(out_path), timeframe
             )
             if full_array is None:
-                return False
+                return finished(False)
             if timeframe == "1Min":
                 validate_retained_bar_timestamps(base, full_array)
             if int(full_array[-1, 0]) < int(base[-1, 0]):
@@ -501,15 +399,9 @@ def process_ticker(
                     "Full refresh ends before existing data; preserving old file, ticker=%s",
                     ticker,
                 )
-                return False
+                return finished(False)
             save_array(full_array, out_path)
-            logger.info(
-                "Full refresh complete, ticker=%s, old_rows=%d, new_rows=%d",
-                ticker,
-                len(base),
-                len(full_array),
-            )
-            return True
+            return finished(True, "Full redownloads")
 
         df = (
             initial_df
@@ -518,11 +410,14 @@ def process_ticker(
         )
         if len(df) == 0:
             logger.warning(f"No bars found, ticker={ticker}")
-            return False
-        return save_as_npy(data=df, out_path=out_path, timeframe=timeframe)
+            return finished(False)
+        return finished(
+            save_as_npy(data=df, out_path=out_path, timeframe=timeframe),
+            "Full redownloads" if existed else "New downloads",
+        )
     except Exception:
         logger.exception("Ticker failed, ticker=%s", ticker)
-        return False
+        return finished(False)
 
 
 def initial_request_since(
@@ -558,6 +453,7 @@ def process_alpaca_batch(
     update_existing: bool,
     overlap_days: int,
     timeframe: str,
+    report: DownloadReport | None = None,
 ) -> list[tuple[int, bool]]:
     """Download a symbol batch once, then apply normal per-symbol persistence.
 
@@ -574,7 +470,7 @@ def process_alpaca_batch(
     except Exception:
         if len(tasks) == 1:
             index, ticker, _ = tasks[0]
-            logger.exception("Alpaca batch failed, ticker=%s", ticker)
+            logger.warning("Alpaca batch failed; retrying ticker=%s", ticker, exc_info=True)
             succeeded = process_ticker(
                 ticker,
                 source="alpaca",
@@ -584,6 +480,7 @@ def process_alpaca_batch(
                 update_existing=update_existing,
                 overlap_days=overlap_days,
                 timeframe=timeframe,
+                report=report,
             )
             return [(index, succeeded)]
         midpoint = len(tasks) // 2
@@ -600,6 +497,7 @@ def process_alpaca_batch(
             update_existing,
             overlap_days,
             timeframe,
+            report,
         ) + process_alpaca_batch(
             tasks[midpoint:],
             out_dir,
@@ -608,6 +506,7 @@ def process_alpaca_batch(
             update_existing,
             overlap_days,
             timeframe,
+            report,
         )
 
     outcomes = []
@@ -623,6 +522,7 @@ def process_alpaca_batch(
             overlap_days=overlap_days,
             timeframe=timeframe,
             initial_df=frame,
+            report=report,
         )
         outcomes.append((index, succeeded))
     return outcomes
@@ -668,6 +568,7 @@ def load_tickers(tickers_path: str) -> list[str]:
     return tickers
 
 
+@download_output("Bars", logger)
 def main(
     source: str,
     tickers_path: str,
@@ -684,6 +585,12 @@ def main(
     requests_per_minute: int = ALPACA_REQUESTS_PER_MINUTE,
 ) -> None:
     global ALPACA_RATE_LIMITER
+    report = current_report()
+    report.title = f"{'Minute' if timeframe == '1Min' else 'Daily'} bars"
+    report.output = out_dir
+    report.mode = "Update" if update_existing else "Skip existing" if skip_existing else "Full download"
+    for label in ("Requested", "Updated", "Unchanged", "New downloads", "Full redownloads", "Skipped", "Failed"):
+        report.set(label, 0, "symbols")
     if batch_size < 1:
         raise ValueError("batch size must be positive")
     if requests_per_minute < 1:
@@ -711,27 +618,24 @@ def main(
                 f"requested {timeframe}"
             )
 
-    t0 = time.perf_counter()
 
     tickers = load_tickers(tickers_path)
 
     if rot:
         tickers = [rot13(ticker) for ticker in tickers]
     tickers_num = len(tickers)
+    report.set("Requested", tickers_num, "symbols")
     assert tickers_num > 0, "No tickers found"
-    logger.info(f"Tickers provided, tickers_num={tickers_num}")
+    logger.info("Processing %s symbols", f"{tickers_num:,}")
     if source == "alpaca":
         logger.info(
-            "Alpaca download settings, timeframe=%s, batch_size=%d, workers=%d, "
-            "requests_per_minute=%d",
+            "Alpaca %s · batch size %d · workers %d · limit %d requests/min",
             timeframe,
             batch_size,
             workers_num,
             requests_per_minute,
         )
 
-    deferred_summary = DeferredDownloadSummary(logger.name)
-    logger.addFilter(deferred_summary)
     if source == "alpaca" and batch_size > 1 and not skip_existing:
         tasks = [
             (
@@ -755,18 +659,19 @@ def main(
             update_existing=update_existing,
             overlap_days=overlap_days,
             timeframe=timeframe,
+            report=report,
         )
         outcomes: list[tuple[int, bool]] = []
         if workers_num == 0:
             iterator = map(batch_fn, task_batches)
-            with tqdm(total=tickers_num, desc="Processing tickers") as progress:
+            with download_progress(total=tickers_num, description="Processing bars") as progress:
                 for batch_outcomes in iterator:
                     outcomes.extend(batch_outcomes)
                     progress.update(len(batch_outcomes))
         else:
             with (
                 ThreadPoolExecutor(max_workers=workers_num) as pool,
-                tqdm(total=tickers_num, desc="Processing tickers") as progress,
+                download_progress(total=tickers_num, description="Processing bars") as progress,
             ):
                 futures = [pool.submit(batch_fn, tasks) for tasks in task_batches]
                 for future in as_completed(futures):
@@ -786,16 +691,17 @@ def main(
             update_existing=update_existing,
             overlap_days=overlap_days,
             timeframe=timeframe,
+            report=report,
         )
         if workers_num == 0:
             res = list(
-                tqdm(map(fn, tickers), total=tickers_num, desc="Processing tickers")
+                track_download(map(fn, tickers), total=tickers_num, description="Processing bars")
             )
         else:
             res = [False] * tickers_num
             with (
                 ThreadPoolExecutor(max_workers=workers_num) as pool,
-                tqdm(total=tickers_num, desc="Processing tickers") as progress,
+                download_progress(total=tickers_num, description="Processing bars") as progress,
             ):
                 futures = {
                     pool.submit(fn, ticker): index
@@ -804,8 +710,6 @@ def main(
                 for future in as_completed(futures):
                     res[futures[future]] = future.result()
                     progress.update(1)
-    t1 = time.perf_counter()
-    logger.removeFilter(deferred_summary)
 
     success_num = sum(res)
     failed_tickers = [
@@ -813,9 +717,7 @@ def main(
     ]
     failed_path = pathlib.Path(out_dir) / "_failed_tickers.txt"
     failed_path.write_text("".join(f"{ticker}\n" for ticker in failed_tickers))
-    logger.info(
-        f"Downloading done, success_num={success_num}, tickers_num={tickers_num}"
-    )
+    report.set("Failed", len(failed_tickers), "symbols")
     if failed_tickers:
         logger.warning(
             "Tickers failed, failed_num=%d, manifest=%s",
@@ -845,15 +747,12 @@ def main(
     manifest_part.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     os.replace(manifest_part, manifest_path)
 
-    duration = t1 - t0
-    deferred_summary.write(logger)
     if failed_tickers:
         raise RuntimeError(
             f"Bar download failed for {', '.join(failed_tickers)}; see {failed_path}"
         )
     if archive:
         pack_to_archive(out_dir)
-    logger.info(f"Done, duration={duration:0.2f}s")
 
 
 parser = argparse.ArgumentParser()
@@ -943,21 +842,24 @@ def cli() -> None:
     else:
         raise ValueError("Either --days or --since must be provided")
 
-    main(
-        source=args.source,
-        tickers_path=args.tickers_path,
-        out_dir=args.out_dir,
-        since=dt_since,
-        workers_num=args.workers_num,
-        archive=args.archive,
-        skip_existing=args.skip_existing,
-        update_existing=args.update_existing,
-        overlap_days=args.overlap_days,
-        timeframe=args.timeframe,
-        rot=args.rot,
-        batch_size=args.batch_size,
-        requests_per_minute=args.requests_per_minute,
-    )
+    try:
+        main(
+            source=args.source,
+            tickers_path=args.tickers_path,
+            out_dir=args.out_dir,
+            since=dt_since,
+            workers_num=args.workers_num,
+            archive=args.archive,
+            skip_existing=args.skip_existing,
+            update_existing=args.update_existing,
+            overlap_days=args.overlap_days,
+            timeframe=args.timeframe,
+            rot=args.rot,
+            batch_size=args.batch_size,
+            requests_per_minute=args.requests_per_minute,
+        )
+    except Exception:
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

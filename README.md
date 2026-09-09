@@ -18,5 +18,5 @@ does not use a `src/` directory. See [overnight/README.md](overnight/README.md)
 for strategy behavior, data formats, and command examples.
 
 Installed commands include `trading-dashboard`, `trading-dashboard-auth`,
-`trading-live`, `trading-backtest`, `trading-reconcile`, `download-bars`,
+`trading-live`, `trading-backtest`, `trading-rank`, `trading-reconcile`, `download-bars`,
 `download-auctions`, and `download-nbbo`.

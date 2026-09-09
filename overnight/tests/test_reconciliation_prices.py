@@ -174,6 +174,24 @@ class ReconciliationPricesTest(unittest.TestCase):
         ):
             self.run_reconcile()
 
+    def test_historical_nbbo_with_mixed_timestamp_precision_reconciles(self):
+        with np.load(self.entry_nbbo, allow_pickle=False) as stored:
+            arrays = {
+                key: stored[key] if stored[key].ndim == 0 else np.repeat(stored[key], 2)
+                for key in stored.files
+            }
+        arrays.update(
+            date=np.asarray(["2022-01-03", "2026-08-28"], dtype="datetime64[D]"),
+            target_timestamp=["2022-01-03T20:45:00.000Z", "2026-08-28T19:59:00Z"],
+            timestamp=["2022-01-03T20:44:59.886123456Z", "2026-08-28T19:58:59Z"],
+        )
+        np.savez(self.entry_nbbo, **arrays)
+        result = self.run_reconcile()
+        row = result["rows"][0]
+        self.assertEqual(row["simulator_entry_price"], 10.)
+        self.assertEqual(row["simulator_entry_price_comparable"], 20.)
+        self.assertEqual(row["entry_staleness_minutes"], 1 / 60)
+
     def test_explicit_transaction_cost_overrides_source_defaults(self):
         for entry, exit in [("nbbo-ask", "opening-auction"), ("minute-vwap", "minute-vwap")]:
             for cost in [0.0, 1.0, 2.5]:

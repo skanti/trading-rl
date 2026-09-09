@@ -10,7 +10,10 @@ import pandas as pd
 from trading_rl.cli import download_bars
 from trading_rl.market_data.bars import encode_alpaca_bars
 from trading_rl.market_data.schema import BAR_COLUMNS, BAR_SCHEMA_VERSION
-from trading_rl.overnight.backtest import _dataset_manifest, _manifest_fingerprint
+from trading_rl.overnight.history import (
+    _dataset_manifest,
+    _manifest_fingerprint,
+)
 
 
 def sample_bar():

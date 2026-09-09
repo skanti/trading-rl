@@ -166,3 +166,64 @@ class MissingNbboTest(unittest.TestCase):
         )
         self.assertEqual(args.exit_price_source, "nbbo-bid")
         self.assertEqual(args.exit_nbbo_path, "/tmp/bids.npz")
+
+
+class ScheduledNbboTimestampTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "nbbo.npz"
+        self.symbols = np.array(["A", "B", "C", "D"])
+        self.dates = pd.DatetimeIndex(["2022-01-03", "2022-01-04", "2026-09-01", "2026-09-03"])
+        self.arrays = dict(
+            split_adjusted=np.asarray(True),
+            symbol=self.symbols,
+            date=self.dates.to_numpy(dtype="datetime64[D]"),
+            target_timestamp=[
+                "2022-01-03T20:45:00Z", "2022-01-04T20:45:00.000Z",
+                "2026-09-01T19:45:00.000000+00:00", "2026-09-03T15:45:00.000000000-04:00",
+            ],
+            timestamp=[
+                "2022-01-03T20:44:59.886Z", "2022-01-04T20:45:00Z",
+                "2026-09-01T19:44:59.999999Z", "2026-09-03T15:44:59.999999999-04:00",
+            ],
+            ask_price=[10., 20., 30., 40.], raw_ask_price=[20., 40., 60., 80.],
+            bid_price=[9., 19., 29., 39.], raw_bid_price=[18., 38., 58., 78.],
+            ask_exchange=["Q"] * 4, bid_exchange=["Q"] * 4,
+        )
+
+    def load(self, side="ask"):
+        np.savez_compressed(self.path, **self.arrays)
+        return load_scheduled_nbbo_prices(self.path, self.dates, self.symbols, side, 945)
+
+    def test_mixed_iso_precision_and_offsets_preserve_prices_and_nanosecond_age(self):
+        for side in ("bid", "ask"):
+            with self.subTest(side=side):
+                prices, staleness, rows = self.load(side)
+                np.testing.assert_array_equal(prices.diagonal(), self.arrays[f"{side}_price"])
+                np.testing.assert_allclose(
+                    staleness.diagonal(), np.asarray([0.114, 0., 0.000001, 0.000000001]) / 60.,
+                    rtol=0., atol=1e-16,
+                )
+                np.testing.assert_array_equal(rows.raw_price, self.arrays[f"raw_{side}_price"])
+                self.assertEqual(rows.iloc[-1].timestamp.value, pd.Timestamp("2026-09-03T19:44:59.999999999Z").value)
+
+    def test_post_target_quote_is_rejected_even_one_nanosecond_late(self):
+        self.arrays["timestamp"][-1] = "2026-09-03T19:45:00.000000001Z"
+        with self.assertRaisesRegex(ValueError, "post-target NBBO quote"):
+            self.load()
+
+    def test_target_must_still_match_the_scheduled_minute_exactly(self):
+        self.arrays["target_timestamp"][-1] = "2026-09-03T19:45:00.000000001Z"
+        with self.assertRaisesRegex(ValueError, "target timestamps"):
+            self.load()
+
+    def test_missing_and_malformed_timestamps_fail_instead_of_producing_nan_age(self):
+        for column in ("target_timestamp", "timestamp"):
+            for value in ("", "NaT", "not-a-timestamp"):
+                with self.subTest(column=column, value=value):
+                    original = self.arrays[column][0]
+                    self.arrays[column][0] = value
+                    with self.assertRaises(ValueError):
+                        self.load()
+                    self.arrays[column][0] = original
