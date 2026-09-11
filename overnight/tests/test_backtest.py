@@ -32,6 +32,7 @@ from trading_rl.overnight.backtest import (
     load_scheduled_nbbo_asks,
     print_symbol_trade_counts,
     print_summary_table,
+    resolve_transaction_cost_bps,
     run_backtest,
     strategy_metrics,
 )
@@ -85,12 +86,30 @@ class BacktestCliTest(unittest.TestCase):
                     parser.parse_args([option, value])
                 self.assertEqual(error.exception.code, 2)
 
-    def test_defaults_preserve_execution_sources_and_history_filters(self):
+    def test_defaults_match_reconciliation_sources_and_preserve_history_filters(self):
+        from trading_rl.overnight.reconcile_live_sessions import build_parser as reconciliation_parser
+
         args = build_parser().parse_args([])
-        self.assertEqual(args.entry_price_source, "minute-open")
+        reconciliation = reconciliation_parser().parse_args([])
+        self.assertEqual(args.entry_price_source, "nbbo-ask")
         self.assertEqual(args.exit_price_source, "opening-auction")
+        self.assertEqual(args.entry_time, 15 * 60 + 45)
+        self.assertEqual(args.exit_time, 9 * 60 + 30)
+        self.assertEqual(args.transaction_cost_bps, 0.0)
+        self.assertEqual(args.entry_price_source, reconciliation.entry_price_source)
+        self.assertEqual(args.exit_price_source, reconciliation.exit_price_source)
+        self.assertEqual(
+            resolve_transaction_cost_bps(args.transaction_cost_bps, args.entry_price_source, args.exit_price_source),
+            0.0,
+        )
         self.assertEqual(args.min_history_days, 20)
         self.assertEqual(args.min_trading_days, 100)
+        alternate_exit = build_parser().parse_args([
+            "--exit-price-source", "nbbo-bid", "--exit-time", "09:35",
+        ])
+        self.assertEqual(alternate_exit.transaction_cost_bps, 0.0)
+        explicit_cost = build_parser().parse_args(["--transaction-cost-bps", "1"])
+        self.assertEqual(explicit_cost.transaction_cost_bps, 1.0)
 
     def test_sources_remain_specific_to_entry_and_exit(self):
         parser = build_parser()
@@ -112,8 +131,10 @@ class BacktestCliTest(unittest.TestCase):
 
 
 class OvernightLiquidityBaselineTest(unittest.TestCase):
-    def test_default_transaction_cost_is_one_basis_point_per_side(self):
+    def test_source_dependent_cost_fallback_retains_one_basis_point_per_side(self):
         self.assertEqual(DEFAULT_TRANSACTION_COST_BPS, 1.0)
+        self.assertEqual(resolve_transaction_cost_bps(None, "minute-open", "opening-auction"), 1.0)
+        self.assertEqual(resolve_transaction_cost_bps(1.0, "nbbo-ask", "opening-auction"), 1.0)
 
     def test_scheduled_nbbo_loader_returns_adjusted_asks_and_quote_age(self):
         with tempfile.TemporaryDirectory() as directory:

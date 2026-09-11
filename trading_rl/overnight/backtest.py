@@ -608,6 +608,19 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
     comparison.add_column(f"Top {summary['top']}", justify="right")
     comparison.add_column("SPY overnight", justify="right")
     comparison.add_column("SPY buy & hold", justify="right")
+    starting_capital = float(summary["budget"]) if summary.get("budget") is not None else 1.0
+    comparison.add_row("Start capital", *(f"${starting_capital:,.2f}" for _ in range(3)))
+    ending_capitals = (
+        float(summary.get(
+            "ending_equity", starting_capital * (1.0 + float(strategy["total_return"])),
+        )),
+        starting_capital * (1.0 + float(spy_overnight["total_return"])),
+        starting_capital * (1.0 + float(spy_buy_hold["total_return"])),
+    )
+    comparison.add_row(
+        "End capital",
+        *(f"${value:,.2f}" if np.isfinite(value) else "n/a" for value in ending_capitals),
+    )
     strategy_trades = int(summary["trades"])
     spy_overnight_trades = int(spy_overnight["periods"])
     trade_counts = (strategy_trades, spy_overnight_trades, int(spy_buy_hold["periods"] > 0))
@@ -712,11 +725,12 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         details.add_row("WARNING: benchmark gaps",
                         f"{summary['missing_benchmark_sessions']} sessions unavailable; "
                         "benchmark aggregate metrics are not reported")
+    if summary.get("budget") is None:
+        details.add_row("Capital basis", "$1.00 normalized start; set --budget for dollar sizing")
     if summary.get("budget") is not None:
         details.add_row(
             "Position sizing",
-            f"{summary['share_mode']} shares from ${float(summary['budget']):,.0f} initial equity; "
-            f"ending ${float(summary['ending_equity']):,.2f}; "
+            f"{summary['share_mode']} shares; "
             f"mean deployed ${float(summary['average_capital_deployed']):,.2f} "
             f"({float(summary['average_capital_utilization']):.2%}), "
             f"mean basket {float(summary['average_executed_basket_size']):.2f}/"
@@ -1103,6 +1117,8 @@ def run_backtest(
     spy_buy_hold_returns[-1] -= side_cost
     spy_buy_hold_daily = pd.Series(spy_buy_hold_returns, index=daily.index, dtype=np.float64)
     difference_buy_hold = daily - spy_buy_hold_daily
+    sessions["strategy_return"] = daily
+    sessions["spy_buy_and_hold_return"] = spy_buy_hold_daily
     by_date = {day: set(group.sample_id) for day, group in trades.groupby("entry_date", sort=True)}
     memberships = [by_date.get(day, set()) for day in sessions.index]
     replacements = [
@@ -1280,10 +1296,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--entry-price-source",
         choices=ENTRY_PRICE_SOURCES,
-        default="minute-open",
+        default="nbbo-ask",
         help="minute-* selects a field of the bar starting at --entry-time; non-open "
         "fields model hypothetical fills over that minute, known only at its end. "
-        "nbbo-ask uses the latest causal SIP ask at 15:45 (default: minute-open)",
+        "nbbo-ask uses the latest causal SIP ask at 15:45 (default: nbbo-ask)",
     )
     parser.add_argument("--exit-time", type=_parse_clock, default=_parse_clock("09:30"))
     parser.add_argument(
@@ -1313,8 +1329,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transaction-cost-bps",
         type=float,
-        default=None,
-        help="additional cost in bps per side (default: 0.0 for nbbo-ask → opening-auction; 1.0 otherwise)",
+        default=0.0,
+        help="additional cost in bps per side (default: 0.0)",
     )
     parser.add_argument(
         "--share-mode",
@@ -1689,6 +1705,14 @@ def main() -> None:
     print_summary_table(summary)
     if args.show_symbol_trade_frequency:
         print_symbol_trade_counts(trades)
+
+    try:
+        from .backtest_plot import write_equity_plot
+
+        summary["plot_path"] = str(write_equity_plot(summary))
+        print(f"wrote equity plot to {summary['plot_path']}")
+    except Exception as error:  # noqa: BLE001 - plot failure must not discard numerical results
+        LOGGER.warning("could not write equity plot: %s", error)
 
     if args.output_csv:
         output_csv = Path(args.output_csv)

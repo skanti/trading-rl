@@ -21,8 +21,12 @@ forms remain as compatibility launchers.
    dispersion over the same span so steady turnover outranks episodic turnover.
 3. Before each 15:45 entry, rank using the EMA state through the previous
    session only. The current session never contributes to its own rank.
-4. Equal-weight the selected stocks, then close them in the next session's
-   opening auction.
+4. Equal-weight the selected stocks at the 15:45 SIP NBBO ask, then close them
+   in the next session's opening auction.
+
+Entries default to `--entry-price-source nbbo-ask` at `--entry-time 15:45`,
+matching reconciliation. Use `--entry-price-source minute-open` explicitly to
+run the former default benchmark.
 
 Exits default to `--exit-price-source opening-auction` at `--exit-time 09:30`,
 because that is the price a live order actually receives: Nasdaq routes any
@@ -37,13 +41,26 @@ Run the tests from this directory:
 python -m unittest discover -s tests
 ```
 
-Additional transaction costs default to **0.0 bps per side** for
-`nbbo-ask` → `opening-auction`, and **1.0 bp per side** for other source pairs,
-in both the backtester and reconciler. An explicit `--transaction-cost-bps`
-always overrides this default. Zero assumes no additional fees or slippage beyond
-the selected prices; reconciliation still reports actual broker fees separately.
+The backtester defaults to **0.0 bps per side** of additional transaction costs,
+including when overriding the price sources. Set `--transaction-cost-bps 1`
+explicitly for a 1 bp-per-side cost assumption. The reconciler retains its
+source-dependent default: **0.0 bps** for `nbbo-ask` → `opening-auction` and
+**1.0 bp** for other source pairs, with explicit overrides supported.
+Zero assumes no additional fees or slippage beyond the selected prices;
+reconciliation still reports actual broker fees separately.
 The potentially long per-symbol trade-frequency table is hidden by default;
 include `--show-symbol-trade-frequency` when that breakdown is needed.
+
+The comparison table shows starting and ending capital for the strategy and both
+SPY benchmarks, using the same starting amount from `--budget`. Without a budget,
+capital is normalized to a $1.00 start. Unavailable benchmark results show `n/a`.
+
+Every CLI backtest also writes a WebP equity plot for the strategy and SPY buy &
+hold under `/tmp/trading-backtests` (or the configured system temporary directory).
+The printed path and optional JSON `plot_path` identify the unique file for that
+run. Plotting uses the already computed returns, including leverage, borrowing
+costs, and cash intervals; it requires no extra market-data pass. The benchmark
+curve stops if missing observations make its compounded return unavailable.
 
 Every simulated stock must have at least 100 completed observed trading
 sessions before it can be selected. The current session is not counted. Change
@@ -54,17 +71,17 @@ The log transform and default 10-session EMA keep earnings, index-rebalance,
 and news-related volume spikes from dominating the ranking. Turnover stability
 uses that same span for its dispersion window, keeping the two horizons aligned.
 
-The first run combines split-adjusted daily bars from
-`/data/ppv1/updates/bars_1day_2022-01-01` with execution prices from
-`/data/ppv1/updates/bars_1min_2022-01-01`, then writes a date-by-symbol cache
-under `/tmp/trading/baseline_cache`. The daily bars drive the causal liquidity
-ranking; minute bars are used only for entry/exit prices. Override the two stores
-with `--daily-bars-dir` and `--minute-bars-dir`, respectively. Subsequent runs with the
-same inputs and date range reuse the cache.
+The first run loads split-adjusted daily bars from
+`/data/ppv1/updates/bars_1day_2022-01-01` and uses the minute-store inventory and
+SPY bars in `/data/ppv1/updates/bars_1min_2022-01-01` for candidates and sessions.
+It writes a date-by-symbol cache under `/tmp/trading/baseline_cache`, reused when
+inputs and dates match. Override the bar stores with `--daily-bars-dir` and
+`--minute-bars-dir`. Default execution prices come from `--nbbo-path` and
+`--auctions-path`; explicit minute price sources read the minute-bar store.
 
 Both `--entry-price-source` and `--exit-price-source` accept `minute-open`,
 `minute-high`, `minute-low`, `minute-close`, and `minute-vwap`. Entry defaults to
-`minute-open` and also supports `nbbo-ask`; exit defaults to `opening-auction`
+`nbbo-ask`; exit defaults to `opening-auction`
 and also supports `nbbo-bid`.
 For example:
 
@@ -482,8 +499,8 @@ are saved, and the JSON manifest records `missing_quote_count` and the exact
 `missing_quotes` symbol/date pairs. A missing quote replaces any older quote for
 that same attempted symbol/date; deferred and unrequested pairs are retained.
 
-Use the resulting dataset in a backtest with `--entry-price-source nbbo-ask`; the
-default remains `minute-open`. The NBBO source requires
+Backtests use the resulting dataset by default with `--entry-price-source nbbo-ask`.
+The NBBO source requires
 `--entry-time 15:45`. A buy is benchmarked at the ask, while the existing
 transaction-cost assumption remains separately visible. Set `NBBO_TARGETS_PATH` to
 the same trade CSV and `NBBO_TRADE_DATE=entry` to restrict the all-in-one wrapper to
