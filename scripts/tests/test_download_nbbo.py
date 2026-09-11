@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, time, timezone
+import io
 from pathlib import Path
 import tempfile
 import json
@@ -66,7 +68,7 @@ class DownloadNbboTest(unittest.TestCase):
                 "2026-09-02,NVDA\n"
             )
 
-            targets = download_nbbo.targets_from_trade_csv(path)
+            targets = download_nbbo.targets_from_trade_csv(path, "entry_date")
 
         self.assertEqual(targets[date(2026, 9, 1)], {"AAPL", "MSFT"})
         self.assertEqual(targets[date(2026, 9, 2)], {"MSFT", "NVDA"})
@@ -126,6 +128,66 @@ class DownloadNbboTest(unittest.TestCase):
             path.write_text("entry_date,sample_id\n2026-09-03,AAPL\n")
             with self.assertRaisesRegex(ValueError, "exit_date"):
                 download_nbbo.targets_from_trade_csv(path, "exit_date")
+
+    def test_cli_requires_an_explicit_trade_date_only_for_trade_csvs(self):
+        cases = [
+            (["--targets-from-trades", "trades.csv"], "--trade-date entry|exit is required"),
+            (["--targets-from-trades", "trades.csv", "--trade-date", "entry_date"], "invalid choice"),
+            (["--targets-from-trades", "trades.csv", "--trade-date"], "expected one argument"),
+            (["--targets-from-trades", "trades.csv", "--target-date-column", "exit_date"], "unrecognized arguments"),
+            (["--symbols-file", "symbols.txt", "--trade-date", "exit"], "only applies to --targets-from-trades"),
+        ]
+        for args, message in cases:
+            with self.subTest(args=args), redirect_stderr(io.StringIO()) as stderr, redirect_stdout(io.StringIO()), mock.patch(
+                "sys.argv", ["download-nbbo", "--output", "unused.npz", *args]
+            ), mock.patch.object(download_nbbo, "use_incremental_download") as mode:
+                with self.assertRaises(SystemExit) as error:
+                    download_nbbo.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn(message, stderr.getvalue())
+                mode.assert_not_called()
+
+    def test_cli_trade_date_selects_the_correct_basket_dates_on_create_and_update(self):
+        for trade_date in ("entry", "exit"):
+            for existing in (False, True):
+                with self.subTest(trade_date=trade_date, existing=existing), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    trades = root / "trades.csv"
+                    trades.write_text(
+                        "entry_date,exit_date,sample_id\n"
+                        "2026-09-03,2026-09-04,AAPL\n"
+                        "2026-09-04,2026-09-08,MSFT\n"
+                    )
+                    output = root / "nbbo.npz"
+                    manifest = {"start": "2026-09-03", "end": "2026-09-08", "target_time": "09:35", "missing_quote_count": 0}
+                    if existing:
+                        output.touch()
+                        output.with_suffix(".json").write_text(json.dumps(manifest))
+
+                    def save(*args, **kwargs):
+                        output.with_suffix(".json").write_text(json.dumps(manifest))
+                        return (3, 4, 0)
+
+                    argv = [
+                        "download-nbbo", "--output", str(output), "--targets-from-trades", str(trades),
+                        "--trade-date", trade_date, "--target-time", "09:35",
+                    ]
+                    with mock.patch("sys.argv", argv), redirect_stdout(io.StringIO()), mock.patch.object(
+                        download_nbbo, "auction_close_minutes",
+                        return_value={date(2026, 9, day): 16 * 60 for day in (3, 4, 8)},
+                    ), mock.patch.object(download_nbbo, "download_nbbo", side_effect=save) as initial, mock.patch.object(
+                        download_nbbo, "update_nbbo", side_effect=save
+                    ) as update:
+                        download_nbbo.main()
+                    expected = {
+                        date(2026, 9, 3 if trade_date == "entry" else 4): {"AAPL", "SPY"},
+                        date(2026, 9, 4 if trade_date == "entry" else 8): {"MSFT", "SPY"},
+                    }
+                    self.assertEqual(update.call_count, int(existing))
+                    self.assertEqual(initial.call_count, int(not existing))
+                    call = update.call_args if existing else initial.call_args
+                    self.assertEqual(call.args[2 if existing else 0], expected)
+                    self.assertEqual(call.args[-1] if existing else call.args[4], time(9, 35))
 
     def test_invalid_latest_quotes_search_earlier_pages_within_same_window(self):
         invalid = {"quotes": {"AAPL": [

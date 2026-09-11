@@ -71,9 +71,10 @@ const timelineItems = computed<TimelineItem[]>(() => {
     const completed = executionState?.completed ?? event.at <= now.value
     const warning = executionState?.warning ?? false
     const next = index === nextIndex
+    const showCountdown = next || (event.key === 'next_open' && event.at > now.value)
     const description = executionState?.description
-      ?? (next ? formatCountdown(event.at, now.value) : undefined)
-    const tone = warning ? 'warning' : completed ? 'success' : next ? 'info' : 'neutral'
+      ?? (showCountdown ? formatCountdown(event.at, now.value) : undefined)
+    const tone = warning ? 'warning' : completed ? 'success' : showCountdown ? 'info' : 'neutral'
     return {
       value: index + 1,
       title: event.label,

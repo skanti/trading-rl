@@ -791,6 +791,7 @@ def reconcile_execution(
         "timing": timing,
         "warnings": warnings,
         "totals": {
+            "entry_equity": entry_equity,
             "actual_entry_notional": actual_entry_notional,
             "actual_exit_notional": total("actual_exit_notional"),
             "actual_gross_pnl": actual_gross_pnl,
@@ -1095,6 +1096,11 @@ def format_bps(value: object) -> str:
     return f"{float(value):+.2f} bps"
 
 
+def simulator_price_difference_bps(actual: float, simulator: float) -> float:
+    """Use actual fills as the price reference; positive means simulator is higher."""
+    return (simulator / actual - 1) * 10_000
+
+
 def pnl_comparison_context(
     pnl: object, *, label: str, bps: object | None = None
 ) -> str:
@@ -1109,6 +1115,33 @@ def pnl_comparison_context(
     if bps is not None:
         explanation += f" ({abs(float(bps)):.2f} bps)"
     return explanation
+
+
+def _add_pnl_percentage_row(
+    table: Table, label: str, actual: float | None, simulator: float, starting_equity: float | None,
+) -> None:
+    equity_available = starting_equity is not None and starting_equity > 0
+    table.add_row(
+        label,
+        f"{actual / starting_equity:+.2%}" if equity_available and actual is not None else "Unavailable",
+        f"{simulator / starting_equity:+.2%}" if equity_available else "Unavailable",
+        f"Based on {format_usd(starting_equity)} starting equity" if equity_available else "Starting account equity unavailable",
+    )
+
+
+def _add_gross_pnl_rows(
+    table: Table, actual: float, simulator: float, starting_equity: float | None,
+) -> None:
+    difference = actual - simulator
+    equity_available = starting_equity is not None and starting_equity > 0
+    difference_bps = difference / starting_equity * 10_000 if equity_available else None
+    table.add_row(
+        "Gross P&L",
+        format_usd(actual, signed=True),
+        format_usd(simulator, signed=True),
+        pnl_comparison_context(difference, label="gross P&L", bps=difference_bps),
+    )
+    _add_pnl_percentage_row(table, "Gross P&L (%)", actual, simulator, starting_equity)
 
 
 def execution_context(bps: object, *, side: str) -> str:
@@ -1155,6 +1188,55 @@ def _reported_total(
     return _number(totals.get(field), field)
 
 
+def summarize_execution_prices(results: Sequence[Mapping[str, object]]) -> dict[str, float]:
+    """Compare raw prices with identical entry-share weights on both sides.
+
+    Pool notionals before calculating bps so the reported price averages reproduce
+    the difference. Entry quantities isolate price effects from quantity changes.
+    """
+    prices: dict[str, float] = {}
+    for side in ("entry", "exit"):
+        observations = []
+        for result in results:
+            prefix = (
+                "actual_time" if result.get("reporting_benchmark") == ACTUAL_TIME_REPORTING_BENCHMARK
+                else "simulator"
+            )
+            impact_field = f"{'actual_time_' if prefix == 'actual_time' else ''}{side}_execution_pnl_impact"
+            for row in result["rows"]:
+                quantity = _number(row["entry_quantity"], "entry quantity")
+                actual = _number(row[f"actual_{side}_price"], f"actual {side} price")
+                simulated = _number(row[f"{prefix}_{side}_price_comparable"], f"comparable {side} price")
+                if min(quantity, actual, simulated) <= 0:
+                    raise ValueError("execution quantities and prices must be positive")
+                impact = _number(row[impact_field], impact_field)
+                observations.append((quantity, quantity * actual, quantity * simulated, impact))
+        shares = math.fsum(value[0] for value in observations)
+        if not shares:
+            raise ValueError("execution price averages require filled trades")
+        actual_notional = math.fsum(value[1] for value in observations)
+        simulated_notional = math.fsum(value[2] for value in observations)
+        prices[f"actual_{side}_price_average"] = actual_notional / shares
+        prices[f"simulator_{side}_price_average"] = simulated_notional / shares
+        prices[f"{side}_execution_slippage_bps"] = (actual_notional / simulated_notional - 1) * 10_000
+        prices[f"{side}_execution_pnl_impact"] = math.fsum(value[3] for value in observations)
+    deployed = math.fsum(float(result["totals"]["actual_entry_notional"]) for result in results)
+    for side in ("entry", "exit"):
+        prices[f"{side}_execution_pnl_impact_bps"] = prices[f"{side}_execution_pnl_impact"] / deployed * 10_000
+    return prices
+
+
+def _add_execution_price_rows(table: Table, prices: Mapping[str, float]) -> None:
+    for side in ("entry", "exit"):
+        difference = simulator_price_difference_bps(
+            prices[f"actual_{side}_price_average"], prices[f"simulator_{side}_price_average"],
+        )
+        table.add_row(
+            f"{side.capitalize()} price", "0.00 bps", format_bps(difference),
+            "Simulator relative to actual",
+        )
+
+
 def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, object]:
     """Aggregate reconciliations without letting small sessions dominate bps."""
     if not results:
@@ -1173,32 +1255,6 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
         return sum(
             _reported_total(result, scheduled_field, actual_time_field)
             for result in results
-        )
-
-    def reported_total_for(
-        scheduled_field: str,
-        actual_time_field: str,
-        selected: Sequence[Mapping[str, object]],
-    ) -> float:
-        return sum(
-            _reported_total(result, scheduled_field, actual_time_field)
-            for result in selected
-        )
-
-    def reported_weighted_bps(scheduled_field: str, actual_time_field: str) -> float:
-        notional = total("actual_entry_notional")
-        if notional <= 0.0:
-            raise ValueError("aggregate entry notional must be positive")
-        return (
-            sum(
-                _reported_total(result, scheduled_field, actual_time_field)
-                * _number(
-                    totals(result).get("actual_entry_notional"),
-                    "actual entry notional",
-                )
-                for result in results
-            )
-            / notional
         )
 
     fee_confirmed = [
@@ -1234,11 +1290,14 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
         {str(result.get("entry_price_source") or "unspecified") for result in results}
     )
     entry_notional = total("actual_entry_notional")
+    if entry_notional <= 0.0:
+        raise ValueError("aggregate entry notional must be positive")
     actual_gross = total("actual_gross_pnl")
     simulator_gross = reported_total(
         "simulator_gross_pnl", "actual_time_simulator_gross_pnl"
     )
     gross_difference = actual_gross - simulator_gross
+    first_result = min(results, key=lambda result: str(result["entry_date"]))
     summary: dict[str, object] = {
         "sessions": count,
         "scheduled_entry_price_sources": scheduled_entry_sources,
@@ -1247,18 +1306,15 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
         "first_entry_date": min(str(result["entry_date"]) for result in results),
         "last_exit_date": max(str(result["exit_date"]) for result in results),
         "actual_entry_notional_total": entry_notional,
+        "starting_equity": totals(first_result).get("entry_equity"),
         "actual_gross_pnl_total": actual_gross,
         "simulator_gross_pnl_total": simulator_gross,
         "actual_minus_simulator_gross_pnl_total": gross_difference,
         "actual_minus_simulator_gross_bps": gross_difference
         / entry_notional
         * 10_000.0,
-        "entry_execution_slippage_bps": reported_weighted_bps(
-            "entry_execution_slippage_bps", "actual_time_entry_slippage_bps"
-        ),
-        "exit_execution_slippage_bps": reported_weighted_bps(
-            "exit_execution_slippage_bps", "actual_time_exit_slippage_bps"
-        ),
+        **summarize_execution_prices(results),
+        "quantity_pnl_impact": total("quantity_pnl_impact"),
         "actual_time_benchmark_sessions": actual_time_benchmark_sessions,
         "fee_confirmed_sessions": len(fee_confirmed),
         "account_observed_sessions": len(account_observed),
@@ -1273,40 +1329,29 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
             }
         ),
     }
+    # Gross, modeled costs, and net must cover the same sessions. Dropping
+    # pending-fee sessions from net alone can hide losses and inflate returns.
+    summary["simulator_transaction_cost_total"] = reported_total(
+        "simulator_transaction_cost",
+        "actual_time_simulator_transaction_cost",
+    )
+    simulator_net = reported_total("simulator_net_pnl", "actual_time_simulator_net_pnl")
+    summary["simulator_net_pnl_total"] = simulator_net
     if fee_confirmed:
-        actual_net = total("actual_net_pnl_after_broker_fees", fee_confirmed)
-        simulator_net = reported_total_for(
-            "simulator_net_pnl",
-            "actual_time_simulator_net_pnl",
-            fee_confirmed,
+        summary["actual_broker_fee_cost_total"] = total(
+            "actual_broker_fee_cost", fee_confirmed
         )
+    if len(fee_confirmed) == count:
+        actual_net = total("actual_net_pnl_after_broker_fees")
         net_difference = actual_net - simulator_net
-        confirmed_notional = total("actual_entry_notional", fee_confirmed)
         summary.update(
             {
-                "actual_broker_fee_cost_total": total(
-                    "actual_broker_fee_cost", fee_confirmed
-                ),
-                "simulator_transaction_cost_total": reported_total_for(
-                    "simulator_transaction_cost",
-                    "actual_time_simulator_transaction_cost",
-                    fee_confirmed,
-                ),
                 "actual_net_pnl_total": actual_net,
-                "simulator_net_pnl_total": simulator_net,
                 "actual_minus_simulator_net_pnl_total": net_difference,
                 "actual_minus_simulator_net_bps": net_difference
-                / confirmed_notional
+                / entry_notional
                 * 10_000.0,
             }
-        )
-    else:
-        summary["simulator_transaction_cost_total"] = reported_total(
-            "simulator_transaction_cost",
-            "actual_time_simulator_transaction_cost",
-        )
-        summary["simulator_net_pnl_total"] = reported_total(
-            "simulator_net_pnl", "actual_time_simulator_net_pnl"
         )
     if account_observed:
         summary["broker_equity_pnl_total"] = total(
@@ -1349,22 +1394,18 @@ def print_overview(
         caption=f"{summary['first_entry_date']} → {summary['last_exit_date']}",
         caption_justify="left",
     )
-    comparison.add_column("Total")
+    comparison.add_column("Metric")
     comparison.add_column("Actual", justify="right")
     comparison.add_column("Simulator", justify="right")
     comparison.add_column("Difference / context", justify="right")
-    comparison.add_row(
-        "Gross P&L",
-        format_usd(summary["actual_gross_pnl_total"], signed=True),
-        format_usd(summary["simulator_gross_pnl_total"], signed=True),
-        pnl_comparison_context(
-            summary["actual_minus_simulator_gross_pnl_total"],
-            label="gross P&L",
-            bps=summary["actual_minus_simulator_gross_bps"],
-        ),
+    _add_gross_pnl_rows(
+        comparison,
+        summary["actual_gross_pnl_total"],
+        summary["simulator_gross_pnl_total"],
+        summary["starting_equity"],
     )
     comparison.add_row(
-        f"Costs ({fee_sessions}/{sessions} confirmed)",
+        f"Costs ({fee_sessions}/{sessions} actual confirmed)",
         (
             f"-{format_usd(summary['actual_broker_fee_cost_total'])}"
             if summary.get("actual_broker_fee_cost_total")
@@ -1384,7 +1425,7 @@ def print_overview(
         + " per side",
     )
     comparison.add_row(
-        f"Net P&L ({fee_sessions}/{sessions} confirmed)",
+        "Net P&L",
         format_usd(summary["actual_net_pnl_total"], signed=True)
         if summary.get("actual_net_pnl_total") is not None
         else "Unavailable",
@@ -1395,32 +1436,18 @@ def print_overview(
             bps=summary["actual_minus_simulator_net_bps"],
         )
         if summary.get("actual_minus_simulator_net_pnl_total") is not None
-        else "Actual fees unavailable",
+        else f"Actual fees confirmed for {fee_sessions}/{sessions} sessions",
     )
-    comparison.add_row(
-        "Entry price",
-        "Fills",
-        (
-            scheduled_entry_label
-            if not actual_time_sessions
-            else f"At fill minute: {scheduled_entry_label}"
-            if actual_time_sessions == sessions
-            else f"Per-session ({actual_time_sessions} actual-time)"
-        ),
-        execution_context(summary["entry_execution_slippage_bps"], side="entry"),
+    _add_pnl_percentage_row(
+        comparison, "Net P&L (%)",
+        summary.get("actual_net_pnl_total"), summary["simulator_net_pnl_total"], summary["starting_equity"],
     )
-    comparison.add_row(
-        "Exit price",
-        "Fills",
-        (
-            scheduled_exit_label
-            if not actual_time_sessions
-            else f"At fill minute: {scheduled_exit_label}"
-            if actual_time_sessions == sessions
-            else f"Per-session ({actual_time_sessions} actual-time)"
-        ),
-        execution_context(summary["exit_execution_slippage_bps"], side="exit"),
-    )
+    _add_execution_price_rows(comparison, summary)
+    if abs(float(summary["quantity_pnl_impact"])) >= 0.005:
+        comparison.add_row(
+            "Quantity P&L impact", "—", "—",
+            format_usd(summary["quantity_pnl_impact"], signed=True),
+        )
     account_sessions = int(summary["account_observed_sessions"])
     if account_sessions:
         comparison.add_row(
@@ -1436,14 +1463,6 @@ def print_overview(
             format_usd(summary["unexplained_residual_total"], signed=True),
             "—",
             "Account Δ − fee-adjusted fill P&L",
-        )
-    if summary.get("ranking_observed_sessions"):
-        ranking_sessions = int(summary["ranking_observed_sessions"])
-        comparison.add_row(
-            f"Ranking replay ({ranking_sessions}/{sessions})",
-            "Actual basket",
-            "Replayed basket",
-            f"{float(summary['ranking_overlap_fraction']):.1%} symbol overlap",
         )
     comparison.add_row(
         "Sessions",
@@ -1488,10 +1507,45 @@ def print_overview(
         str(summary["trades"]),
         "100% matched trades",
     )
+    comparison.add_section()
+    comparison.add_row(
+        "Entry price source",
+        "Fills",
+        (
+            scheduled_entry_label
+            if not actual_time_sessions
+            else f"At fill minute: {scheduled_entry_label}"
+            if actual_time_sessions == sessions
+            else f"Per-session ({actual_time_sessions} actual-time)"
+        ),
+        "",
+    )
+    comparison.add_row(
+        "Exit price source",
+        "Fills",
+        (
+            scheduled_exit_label
+            if not actual_time_sessions
+            else f"At fill minute: {scheduled_exit_label}"
+            if actual_time_sessions == sessions
+            else f"Per-session ({actual_time_sessions} actual-time)"
+        ),
+        "",
+    )
+    if summary.get("ranking_observed_sessions"):
+        ranking_sessions = int(summary["ranking_observed_sessions"])
+        comparison.add_row(
+            f"Ranking replay ({ranking_sessions}/{sessions})",
+            "Actual basket",
+            "Replayed basket",
+            f"{float(summary['ranking_overlap_fraction']):.1%} symbol overlap",
+        )
     CONSOLE.print(comparison)
     CONSOLE.print(
-        "[dim]Dollar values are cumulative totals over the displayed coverage. "
-        "Execution differences and P&L bps are weighted by deployed capital. "
+        "[dim]Dollar P&L values are cumulative totals. P&L (%) divides the corresponding dollar P&L "
+        "by account equity before the first included entry. Only matched sessions contribute P&L. "
+        "Price bps = (simulator / actual − 1) × 10,000, using raw prices and identical "
+        "entry-share weights for both sides. Positive means the simulator price is higher. "
         "Gross P&L and execution differences exclude transaction costs.[/dim]"
     )
     if any(source in MINUTE_PRICE_COLUMNS and source != "minute-open"
@@ -1503,11 +1557,11 @@ def print_overview(
             f"[dim]The simulator uses the selected minute fields at each actual fill minute "
             f"for {actual_time_sessions}/{sessions} sessions.[/dim]"
         )
-    if fee_sessions:
-        CONSOLE.print(
-            f"[dim]* Actual costs use Alpaca FEE activities for {fee_sessions}/{sessions} "
-            "fee-confirmed sessions. Net comparisons use only those same sessions.[/dim]"
-        )
+    CONSOLE.print(
+        f"[dim]* Actual costs use Alpaca FEE activities for {fee_sessions}/{sessions} "
+        "fee-confirmed sessions. Simulator costs and net P&L include all matched sessions. "
+        "Actual net P&L is unavailable until fees are confirmed for every matched session.[/dim]"
+    )
 
 
 def _actual_time_bar_label(result: Mapping[str, object], side: str) -> str:
@@ -1548,10 +1602,6 @@ def print_result(
         result, "simulator_gross_pnl", "actual_time_simulator_gross_pnl"
     )
     actual_gross_pnl = float(totals["actual_gross_pnl"])
-    gross_difference = actual_gross_pnl - simulator_gross_pnl
-    gross_difference_bps = (
-        gross_difference / float(totals["actual_entry_notional"]) * 10_000.0
-    )
     ranking = result.get("ranking_replay") or {}
     ranking_text = "Unavailable"
     if isinstance(ranking, Mapping) and ranking.get("status") == "complete":
@@ -1562,22 +1612,15 @@ def print_result(
 
     comparison = Table(
         title="Live reconciliation",
-        caption=f"{len(result['symbols'])} symbols · Ranking replay: {ranking_text}",
+        caption=f"{len(result['symbols'])} symbols",
         caption_justify="left",
     )
     comparison.add_column("Metric")
     comparison.add_column("Actual", justify="right")
     comparison.add_column("Simulator", justify="right")
     comparison.add_column("Explanation", justify="right")
-    comparison.add_row(
-        "Gross P&L",
-        format_usd(actual_gross_pnl, signed=True),
-        format_usd(simulator_gross_pnl, signed=True),
-        pnl_comparison_context(
-            gross_difference,
-            label="gross P&L",
-            bps=gross_difference_bps,
-        ),
+    _add_gross_pnl_rows(
+        comparison, actual_gross_pnl, simulator_gross_pnl, totals.get("entry_equity"),
     )
     modeled_cost = _reported_total(
         result,
@@ -1626,6 +1669,11 @@ def print_result(
         if fee_complete
         else "Actual fees unavailable",
     )
+    _add_pnl_percentage_row(
+        comparison, "Net P&L (%)",
+        totals["actual_net_pnl_after_broker_fees"] if fee_complete else None,
+        simulator_net_pnl, totals.get("entry_equity"),
+    )
     if actual_account_result is not None:
         residual_field = (
             "broker_minus_fee_adjusted_fill_pnl"
@@ -1639,41 +1687,8 @@ def print_result(
             "No simulator value · "
             f"{format_usd(totals[residual_field], signed=True)} unexplained residual**",
         )
-    comparison.add_row(
-        f"Entry · {result['entry_date']}",
-        "Fills",
-        (
-            _actual_time_bar_label(result, "entry")
-            if use_actual_time
-            else _scheduled_price_label(result, "entry")
-        ),
-        execution_context(
-            totals[
-                "actual_time_entry_slippage_bps"
-                if use_actual_time
-                else "entry_execution_slippage_bps"
-            ],
-            side="entry",
-        ),
-    )
     timing = result.get("timing") or {}
-    comparison.add_row(
-        f"Exit · {result['exit_date']}",
-        "Fills",
-        (
-            _actual_time_bar_label(result, "exit")
-            if use_actual_time
-            else _scheduled_price_label(result, "exit")
-        ),
-        execution_context(
-            totals[
-                "actual_time_exit_slippage_bps"
-                if use_actual_time
-                else "exit_execution_slippage_bps"
-            ],
-            side="exit",
-        ),
-    )
+    _add_execution_price_rows(comparison, summarize_execution_prices([result]))
     actual_time_exit_slippage = totals.get("actual_time_exit_slippage_bps")
     if (
         not use_actual_time
@@ -1694,19 +1709,34 @@ def print_result(
             "Entry quantities",
             f"{format_usd(totals['quantity_pnl_impact'], signed=True)} P&L",
         )
-    CONSOLE.print(comparison)
-    CONSOLE.print(
-        "[dim]Gross P&L and execution differences exclude transaction costs. "
-        "Entry price differences are actual fills versus "
-        + (_actual_time_bar_label(result, "entry") if use_actual_time else _scheduled_price_label(result, "entry"))
-        + "; positive "
-        "means paid more. Exit differences are fills versus "
-        + (
+    comparison.add_section()
+    comparison.add_row(
+        "Entry price source",
+        "Fills",
+        (
+            _actual_time_bar_label(result, "entry")
+            if use_actual_time
+            else _scheduled_price_label(result, "entry")
+        ),
+        str(result["entry_date"]),
+    )
+    comparison.add_row(
+        "Exit price source",
+        "Fills",
+        (
             _actual_time_bar_label(result, "exit")
             if use_actual_time
             else _scheduled_price_label(result, "exit")
-        )
-        + "; positive means received more.[/dim]"
+        ),
+        str(result["exit_date"]),
+    )
+    comparison.add_row("Ranking replay", "Actual basket", "Replayed basket", ranking_text)
+    CONSOLE.print(comparison)
+    CONSOLE.print(
+        "[dim]Gross P&L and execution differences exclude transaction costs. "
+        "P&L (%) divides the corresponding dollar P&L by account equity before entry. "
+        "Price bps = (simulator / actual − 1) × 10,000, using raw prices and identical "
+        "entry-share weights for both sides. Positive means the simulator price is higher.[/dim]"
     )
     if fee_complete:
         CONSOLE.print(
@@ -1723,22 +1753,17 @@ def print_result(
     if show_symbol_breakdown:
         detail = Table(title="Execution differences by symbol")
         detail.add_column("Symbol")
-        detail.add_column("Entry price Δ", justify="right")
-        detail.add_column("Entry impact", justify="right")
-        detail.add_column("Exit price Δ", justify="right")
-        detail.add_column("Exit impact", justify="right")
-        detail.add_column("Net model Δ", justify="right")
+        detail.add_column("Side")
+        detail.add_column("Actual price", justify="right")
+        detail.add_column("Simulator price", justify="right")
+        detail.add_column("Price Δ", justify="right")
+        detail.add_column("P&L impact", justify="right")
+        detail.add_column("Gross P&L Δ", justify="right")
         for row in result["rows"]:
-            entry_bps = row[
-                "actual_time_entry_slippage_bps"
-                if use_actual_time
-                else "entry_slippage_bps"
-            ]
-            exit_bps = row[
-                "actual_time_exit_slippage_bps"
-                if use_actual_time
-                else "exit_slippage_bps"
-            ]
+            simulator_entry = float(row["actual_time_entry_price_comparable" if use_actual_time else "simulator_entry_price_comparable"])
+            simulator_exit = float(row["actual_time_exit_price_comparable" if use_actual_time else "simulator_exit_price_comparable"])
+            entry_bps = simulator_price_difference_bps(float(row["actual_entry_price"]), simulator_entry)
+            exit_bps = simulator_price_difference_bps(float(row["actual_exit_price"]), simulator_exit)
             model_difference = row[
                 "actual_minus_actual_time_simulator_gross_pnl"
                 if use_actual_time
@@ -1756,17 +1781,27 @@ def print_result(
             ]
             detail.add_row(
                 str(row["symbol"]),
+                "Entry",
+                f"${float(row['actual_entry_price']):,.4f}",
+                f"${simulator_entry:,.4f}",
                 format_bps(entry_bps),
                 format_usd(entry_impact, signed=True),
+                "—",
+            )
+            detail.add_row(
+                "", "Exit",
+                f"${float(row['actual_exit_price']):,.4f}",
+                f"${simulator_exit:,.4f}",
                 format_bps(exit_bps),
                 format_usd(exit_impact, signed=True),
                 format_usd(model_difference, signed=True),
+                end_section=True,
             )
         CONSOLE.print(detail)
         CONSOLE.print(
-            "[dim]Entry price Δ: actual fill vs selected entry benchmark; positive means "
-            "paid more. Exit price Δ: actual fill vs selected exit benchmark; "
-            "positive means received more. P&L impacts sum to Actual − simulator.[/dim]"
+            "[dim]Price Δ uses actual fills as the reference; positive means the simulator price "
+            "is higher. Entry + exit + quantity P&L impacts sum to "
+            "Actual − simulator gross P&L.[/dim]"
         )
 
 
@@ -1890,7 +1925,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-session-details",
         action="store_true",
-        help="print the legacy reconciliation table for every individual session",
+        help="print the reconciliation table for every individual session",
     )
     return parser
 

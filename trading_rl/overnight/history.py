@@ -449,16 +449,8 @@ def _manifest_fingerprint(data_dir: Path, timeframe: str) -> dict[str, object]:
     }
 
 
-def load_daily_dollar_volume(
-    path: Path,
-    date_positions: Mapping[pd.Timestamp, int],
-    date_count: int,
-) -> np.ndarray:
-    """Align split-adjusted daily turnover to the shared New York session calendar."""
-    result = np.full(date_count, np.nan, dtype=np.float64)
-    if not path.exists():
-        return result
-    daily = np.load(path, mmap_mode="r")
+def _daily_bar_dates(daily: np.ndarray, path: Path) -> pd.DatetimeIndex:
+    """Validate daily timestamps and interpret their dates in New York."""
     validate_bar_columns(daily, "1Day", str(path))
     if len(daily) and not np.all(daily[:-1, 0] < daily[1:, 0]):
         raise ValueError(f"{path} timestamps must be strictly increasing")
@@ -476,6 +468,24 @@ def load_daily_dollar_volume(
     )
     if daily_dates.duplicated().any():
         raise ValueError(f"{path} contains duplicate New York session dates")
+    return daily_dates
+
+
+def daily_bar_dates(path: Path) -> pd.DatetimeIndex:
+    return _daily_bar_dates(np.load(path, mmap_mode="r"), path)
+
+
+def load_daily_dollar_volume(
+    path: Path,
+    date_positions: Mapping[pd.Timestamp, int],
+    date_count: int,
+) -> np.ndarray:
+    """Align split-adjusted daily turnover to the shared New York session calendar."""
+    result = np.full(date_count, np.nan, dtype=np.float64)
+    if not path.exists():
+        return result
+    daily = np.load(path, mmap_mode="r")
+    daily_dates = _daily_bar_dates(daily, path)
     positions = np.asarray(
         [date_positions.get(stamp, -1) for stamp in daily_dates], dtype=np.int64
     )
@@ -522,6 +532,41 @@ def historical_window(
     The end date is the final exit session. Warm-up never relaxes the minimum
     history requirements when the local dataset starts too late.
     """
+    requested_start, final_exit, bounds = historical_window_bounds(
+        all_dates, since=since, end_date=end_date, months=months,
+        ema_span=ema_span, min_history_days=min_history_days,
+        min_trading_days=min_trading_days,
+    )
+    dates = all_dates[bounds]
+    context_sod = all_context_sod[bounds]
+    requested_dates = [
+        stamp.date() for stamp in dates if requested_start <= stamp < final_exit
+    ]
+    requested_closes = auction_close_minutes(auction_path, requested_dates)
+    shortened = short_entry_dates(requested_closes, entry_time)
+    return HistoricalWindow(
+        requested_start,
+        final_exit,
+        dates,
+        context_sod,
+        np.asarray([stamp.date() not in shortened for stamp in dates], dtype=bool),
+        shortened,
+    )
+
+
+def historical_window_bounds(
+    all_dates: pd.DatetimeIndex,
+    *,
+    since: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+    months: int | None,
+    ema_span: int,
+    min_history_days: int,
+    min_trading_days: int,
+) -> tuple[pd.Timestamp, pd.Timestamp, slice]:
+    """Select replay dates and causal warm-up independently of the data source."""
+    if len(all_dates) < 2:
+        raise ValueError("the local dataset contains fewer than two complete sessions")
     requested_end = end_date if end_date is not None else pd.Timestamp(all_dates[-1])
     eligible_end = all_dates[all_dates <= requested_end]
     if eligible_end.empty:
@@ -543,18 +588,4 @@ def historical_window(
         )
     warmup = max(3 * ema_span, min_history_days + 1, min_trading_days + 1)
     start_index = max(0, first_entry_index - warmup)
-    dates = all_dates[start_index : end_index + 1]
-    context_sod = all_context_sod[start_index : end_index + 1]
-    requested_dates = [
-        stamp.date() for stamp in dates if requested_start <= stamp < final_exit
-    ]
-    requested_closes = auction_close_minutes(auction_path, requested_dates)
-    shortened = short_entry_dates(requested_closes, entry_time)
-    return HistoricalWindow(
-        requested_start,
-        final_exit,
-        dates,
-        context_sod,
-        np.asarray([stamp.date() not in shortened for stamp in dates], dtype=bool),
-        shortened,
-    )
+    return requested_start, final_exit, slice(start_index, end_index + 1)

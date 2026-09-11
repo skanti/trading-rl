@@ -193,10 +193,10 @@ environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
 overlap/shortlist settings shown by `--help`. Downloads default to 8 workers,
 1 symbol per minute-bar batch, and a shared bar-download limit of 180 requests
 per minute. Single-symbol minute batches save each completed symbol independently
-and reduce memory use during full-history downloads. After minute bars, the wrapper
-runs `trading-rank` against the refreshed bar stores and the existing auction
-history, then updates auctions and NBBO. Auction updates use the current New York
-date. Ranking requires the existing auction history to cover its replay interval.
+and reduce memory use during full-history downloads. After daily bars and shortlist
+construction, the wrapper runs `trading-rank` using that explicit shortlist and the
+official trading calendar. It then updates minute bars, auctions, and NBBO. Ranking
+requires no minute bars or auctions. Auction updates use the current New York date.
 It replays strategy top-12 selections since
 `NBBO_RANK_SINCE` (default `2023-01-01`), using `NBBO_RANK_TOP` to set the basket size.
 The unique symbol union is saved to `NBBO_SYMBOLS_PATH` (default
@@ -205,8 +205,9 @@ CSV. The count follows the ranking results; it is not capped at 41.
 NBBO then requests that strategy union plus SPY for each eligible trading session
 since `NBBO_START` (default `2022-01-01`) at `NBBO_TARGET_TIME` (default `15:45` ET).
 No simulation run is needed. `NBBO_TARGETS_PATH` optionally supplies a trade CSV
-instead of running the ranker. A failed ranking stops the pipeline before auctions
-and NBBO.
+instead of running the ranker and requires an explicit `NBBO_TRADE_DATE=entry` or
+`NBBO_TRADE_DATE=exit` (no default). A failed ranking stops the pipeline before
+minute bars, auctions, and NBBO; a failed auction refresh stops it before NBBO.
 Targets still inside Alpaca's delayed-SIP window are deferred until a later run.
 Symbol-file NBBO uses Alpaca's trading calendar, authenticated with the trading
 credentials in `overnight/.env`; quote requests use the data credentials.
@@ -373,20 +374,48 @@ trading-rank \
   --output-csv /tmp/strategy_targets_2023.csv
 ```
 
-`trading-rank` shares the backtest's universe filters, causal liquidity scores,
+`trading-rank` shares the backtest's security-master filters, causal liquidity scores,
 minimum-history rules, company deduplication, and session window, including warm-up
 before `--since`. `--end-date` is the final **exit** date, so the last exported entry
 is the preceding eligible session. With no date options, it exports the trailing
 12 months. `--entry-time` defaults to 15:45 Eastern and excludes shortened sessions
 that have already closed at that time.
 
-The command reads daily bars for liquidity, the minute-file inventory for the same
-candidate universe as the backtester, SPY minute bars for complete sessions, and
-auction metadata for calendar/exchange checks. It does not read stock minute
-prices or NBBO, build an execution-price cache, size trades, or calculate returns.
-It exports intended membership independent of quote availability, matching the
-NBBO backtest's selection stage. A minute-price backtest can choose different
-members because it additionally filters missing or stale entry prices.
+The command reads only split-adjusted daily bars for market data. Candidates default
+to every symbol in `--daily-bars-dir`; pass `--symbols-file` to restrict them to an
+explicit shortlist. Every shortlisted symbol must have a daily file. Neither SPY
+nor a minute-bar store is required. The latest observed date before today in New
+York bounds the replay; today's and future bars never enter its history.
+
+Session dates and early closes come from Alpaca's calendar API, using `ALPACA_KEY`
+and `ALPACA_SECRET` (or the `APCA_API_*` equivalents), with `ALPACA_URL` selecting the
+trading endpoint. Missing bar days remain on the official calendar; weekends and
+holidays do not become sessions. For an offline replay, `--calendar-path` accepts a
+JSON object with `start`, `end`, and `sessions`, for example:
+
+```json
+{
+  "start": "2026-11-27",
+  "end": "2026-11-30",
+  "sessions": [
+    {"date": "2026-11-27", "open": "09:30", "close": "13:00"},
+    {"date": "2026-11-30", "open": "09:30", "close": "16:00"}
+  ]
+}
+```
+
+The saved calendar's coverage must include the daily data used by the command,
+including history before `--since`. A cached security master is also required for
+offline company/exchange filtering. `--minute-bars-dir` and `--auctions-path` are
+no longer ranker options.
+
+Exchange filtering explicitly uses the **current security master**. Historical
+listing transfers are not applied, and the CLI reports this policy. Backtests keep
+their historical auction-exchange checks, so exported baskets may differ for
+transferred listings or different candidate inventories. A minute-price backtest
+can also choose different members because it filters missing or stale entry prices.
+Ranking never reads auctions or NBBO, builds an execution-price cache, sizes trades,
+or calculates returns.
 
 Execution-price and transaction-cost arguments do not apply to `trading-rank`.
 The backtester's former `--export-symbols` option has been removed; use
@@ -395,7 +424,7 @@ The backtester's former `--export-symbols` option has been removed; use
 The default minimum is 100 completed observed sessions per symbol. If your stores
 start in January 2022, the first possible entry is May 26, 2022; use
 `--since 2022-05-26`. Selecting from January requires earlier warm-up history.
-Insufficient history or a missing official session close fails with a dated error
+Insufficient history or a calendar missing an observed daily-bar session fails with a dated error
 before replacing exports; the ranker does not silently shorten the requested range.
 
 `trading_rl/overnight/ranking.py` owns the causal scoring, completed-session counts,
@@ -405,8 +434,10 @@ supply their data windows and eligibility constraints; broker conflicts, price
 availability, sizing, and order submission remain outside the shared ranker.
 Matching inputs and settings produce matching rankings. Live input rejects
 duplicate completed-session bars so duplicates cannot inflate history counts.
-`trading_rl/overnight/history.py` shares the historical calendar, warm-up window,
-universe filters, and daily dollar-volume loading with the backtester.
+`trading_rl/overnight/history.py` shares warm-up bounds, universe filters, and daily
+dollar-volume loading with the backtester. `trading_rl/overnight/ranking_inputs.py`
+supplies the standalone ranker's daily inventory and calendar independently of
+execution data.
 
 The text file contains sorted unique stock symbols. The CSV contains `entry_date`,
 `exit_date`, `rank`, `sample_id`, and `liquidity_score`; it represents intended
@@ -420,11 +451,12 @@ Use the daily schedule for the smallest NBBO download, or the text file with
 ```bash
 download-nbbo \
   --targets-from-trades /tmp/strategy_targets_2023.csv \
+  --trade-date entry \
   --target-time 15:45 \
   --output /data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz
 ```
 
-For 09:35 exit quotes, pass `--target-date-column exit_date`, `--target-time 09:35`,
+For 09:35 exit quotes, pass `--trade-date exit`, `--target-time 09:35`,
 and a separate output file. A completed simulation's trade CSV also remains usable:
 
 ```bash
@@ -435,6 +467,7 @@ trading-backtest \
 
 download-nbbo \
   --targets-from-trades /tmp/overnight_nbbo_targets.csv \
+  --trade-date entry \
   --output /data/ppv1/updates/alpaca_nbbo_1545_2024-01-01.npz
 ```
 
@@ -453,7 +486,8 @@ Use the resulting dataset in a backtest with `--entry-price-source nbbo-ask`; th
 default remains `minute-open`. The NBBO source requires
 `--entry-time 15:45`. A buy is benchmarked at the ask, while the existing
 transaction-cost assumption remains separately visible. Set `NBBO_TARGETS_PATH` to
-the same trade CSV to restrict the all-in-one wrapper to that basket; otherwise it
+the same trade CSV and `NBBO_TRADE_DATE=entry` to restrict the all-in-one wrapper to
+that basket's entry dates; otherwise it
 replays `trading-rank` and downloads its historical symbol union for every eligible
 session.
 
@@ -462,13 +496,15 @@ For exit-price research, select each held basket's **exit date** explicitly:
 ```bash
 download-nbbo \
   --targets-from-trades /tmp/nbbo_targets.csv \
-  --target-date-column exit_date \
+  --trade-date exit \
   --target-time 09:35 \
   --output /data/ppv1/updates/alpaca_nbbo_0935_2022-01-01.npz
 ```
 
-In trade-CSV mode, the default `--target-date-column entry_date` is for entry quotes. Changing only
-the clock to 09:35 would request the afternoon basket on the wrong morning.
+In trade-CSV mode, `--trade-date entry|exit` is required and has no default. It selects
+the CSV's `entry_date` or `exit_date` column independently of `--target-time`.
+Choosing `entry` with 09:35 would request the afternoon basket on its entry morning.
+Omit `--trade-date` when using `--symbols-file`, which queries every eligible session.
 Run the simulator against the exit bids with:
 
 ```bash
@@ -805,11 +841,26 @@ also saved as `status: skipped` JSON artifacts, replacing prior results and remo
 any prior CSV for that date. Coverage counts remain visible because skipping missing
 data can itself bias the evaluated sample.
 
-The report shows actual filled quantities and prices, the transaction-cost
-assumption, broker-equity residual, and a replay of the liquidity ranking from
-archived `ticks.jsonl`. Dollar values are cumulative totals; execution differences
-are weighted by deployed capital. Fee-based net comparisons use the same
-fee-confirmed sessions on both sides. Minute high/low/close/VWAP are hypothetical
+The overview and session tables show entry and exit prices relative to actual
+fills. Actual is the `0.00 bps` reference; the simulator shows
+`(simulator / actual - 1) * 10,000` bps. Positive means the simulated price is
+higher. Both sides use raw prices and identical entry-share weights, including
+exits, to isolate price differences from quantity changes. Per-symbol price
+differences use the same actual-price reference. Dollar P&L values are cumulative totals. The report also
+shows `Gross P&L (%)` and `Net P&L (%)` to two decimals for actual and simulated
+execution, using the same starting account equity on both sides. The overview
+divides each row's dollar P&L by account equity before the first included entry; individual sessions
+use their own entry account equity. The table shows that equity baseline. Missing
+or nonpositive starting equity makes the percentages unavailable. Skipped sessions
+do not contribute P&L, and gross percentages exclude fees and unrelated account
+activity. The report includes the transaction-cost
+assumption, broker-equity residual, and a replay of the
+liquidity ranking from archived `ticks.jsonl`. Overview gross P&L, simulator costs,
+and net P&L cover all matched sessions. Actual costs show the confirmed fee subtotal
+and its session coverage; actual net dollars and percentages are unavailable until
+fees are confirmed for every included session. Simulator net dollars and percentages
+remain visible for all matched sessions, including those with pending broker fees.
+Minute high/low/close/VWAP are hypothetical
 fills over the selected minute, known only at its end.
 
 Strict schedule filtering remains the default. Fills must match the scheduled entry
@@ -838,7 +889,8 @@ python reconcile_live_sessions.py --since 2026-08-01 --show-session-details
 
 Results are written to `WORK_DIR/reconciliations/YYYY-MM-DD.json` and `.csv`. Use
 `--show-session-details` for the former per-session tables and
-`--show-symbol-breakdown` for per-symbol execution attribution. Use
+`--show-symbol-breakdown` for each symbol's actual and simulated entry/exit prices,
+price differences, and P&L attribution. Use
 `--entry-time` or `--liquidity-scheme` only to reconstruct legacy summaries that lack
 those fields; normal sessions retain their original schedule and ranking snapshot so a
 later daemon restart or configuration change cannot rewrite the audit inputs.

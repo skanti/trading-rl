@@ -14,6 +14,7 @@ MINUTE_BARS_DIR="${MINUTE_BARS_DIR:-$UPDATES_DIR/bars_1min_$BAR_SINCE}"
 AUCTIONS_PATH="${AUCTIONS_PATH:-$UPDATES_DIR/alpaca_auctions_2022-01-01.npz}"
 NBBO_PATH="${NBBO_PATH:-$UPDATES_DIR/alpaca_nbbo_1545_2022-01-01.npz}"
 NBBO_TARGETS_PATH="${NBBO_TARGETS_PATH:-}"
+NBBO_TRADE_DATE="${NBBO_TRADE_DATE:-}"
 NBBO_RANK_SINCE="${NBBO_RANK_SINCE:-2023-01-01}"
 NBBO_RANK_TOP="${NBBO_RANK_TOP:-12}"
 NBBO_SYMBOLS_PATH="${NBBO_SYMBOLS_PATH:-$UPDATES_DIR/strategy_symbols_$NBBO_RANK_SINCE.txt}"
@@ -41,10 +42,10 @@ LOCK_DIR="${LOCK_DIR:-/tmp/trading-rl-market-data-update.lock}"
 usage() {
   cat <<'EOF'
 Refresh the current eligible company-stock universe, update its split-adjusted
-daily bars, rebuild the dollar-volume shortlist, update minute bars for that
-shortlist plus SPY, and replay the strategy ranker. Then update auctions and
-scheduled 15:45 NBBO for the ranker's symbol union plus SPY. No simulator run is
-required. NBBO_TARGETS_PATH optionally supplies a trade CSV instead of ranking.
+daily bars, rebuild the dollar-volume shortlist, and replay the strategy ranker.
+Then update minute bars and auctions for that shortlist plus SPY, followed by
+scheduled 15:45 NBBO for the ranker's symbol union plus SPY. No simulator run is required. NBBO_TARGETS_PATH optionally supplies a trade CSV instead of ranking.
+Trade CSVs require NBBO_TRADE_DATE=entry or exit; there is no default.
 The auction/minute shortlist includes every daily top-20 symbol since 2022-01-01.
 The NBBO shortlist replays strategy top-12 selections since 2023-01-01 by default.
 Historical bar files are retained; new auction symbols are backfilled to the
@@ -70,6 +71,7 @@ Common environment overrides:
   NBBO_OVERLAP_DAYS=7
   NBBO_TARGET_TIME=15:45
   NBBO_TARGETS_PATH=/tmp/overnight_trades.csv
+  NBBO_TRADE_DATE=entry  # required only with NBBO_TARGETS_PATH; entry or exit
   NBBO_RANK_SINCE=2023-01-01
   NBBO_RANK_TOP=12
   NBBO_SYMBOLS_PATH=/data/ppv1/updates/strategy_symbols_2023-01-01.txt
@@ -124,6 +126,19 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
   set +a
 fi
+if [[ -n "$NBBO_TARGETS_PATH" ]]; then
+  if [[ "$NBBO_TRADE_DATE" != "entry" && "$NBBO_TRADE_DATE" != "exit" ]]; then
+    echo "NBBO_TRADE_DATE must be explicitly set to entry or exit when using NBBO_TARGETS_PATH" >&2
+    exit 2
+  fi
+  if [[ ! -f "$NBBO_TARGETS_PATH" ]]; then
+    echo "NBBO target trade CSV does not exist: $NBBO_TARGETS_PATH" >&2
+    exit 1
+  fi
+elif [[ -n "$NBBO_TRADE_DATE" ]]; then
+  echo "NBBO_TRADE_DATE only applies when using NBBO_TARGETS_PATH" >&2
+  exit 2
+fi
 : "${ALPACA_DATA_KEY:?ALPACA_DATA_KEY must be set}"
 : "${ALPACA_DATA_SECRET:?ALPACA_DATA_SECRET must be set}"
 : "${ALPACA_KEY:?ALPACA_KEY must be set to refresh the asset master}"
@@ -164,6 +179,21 @@ fi
   --metric dollar-volume \
   --output "$LIQUIDITY_CANDIDATES_PATH"
 
+# Ranking uses only completed daily bars, the explicit shortlist, and the
+# official trading calendar. Run it before any execution-data downloads.
+if [[ -n "$NBBO_TARGETS_PATH" ]]; then
+  nbbo_target_args=(--targets-from-trades "$NBBO_TARGETS_PATH" --trade-date "$NBBO_TRADE_DATE")
+else
+  log "Replaying strategy top-$NBBO_RANK_TOP selections since $NBBO_RANK_SINCE for the NBBO shortlist"
+  "$PYTHON_BIN" -m trading_rl.cli.rank \
+    --since "$NBBO_RANK_SINCE" \
+    --top "$NBBO_RANK_TOP" \
+    --daily-bars-dir "$DAILY_BARS_DIR" \
+    --symbols-file "$LIQUIDITY_CANDIDATES_PATH" \
+    --output "$NBBO_SYMBOLS_PATH"
+  nbbo_target_args=(--symbols-file "$NBBO_SYMBOLS_PATH")
+fi
+
 # The minute universe is fully derived from the liquidity-prioritized shortlist,
 # so it lives in a scratch file the exit trap removes. The durable record of what
 # the store holds is _symbols.txt inside the store itself, written once the
@@ -192,24 +222,6 @@ check_failures "$MINUTE_BARS_DIR"
 
 cp -- "$minute_symbols_tmp" "$MINUTE_BARS_DIR/_symbols.txt.part"
 mv -- "$MINUTE_BARS_DIR/_symbols.txt.part" "$MINUTE_BARS_DIR/_symbols.txt"
-
-if [[ -n "$NBBO_TARGETS_PATH" ]]; then
-  if [[ ! -f "$NBBO_TARGETS_PATH" ]]; then
-    echo "NBBO target trade CSV does not exist: $NBBO_TARGETS_PATH" >&2
-    exit 1
-  fi
-  nbbo_target_args=(--targets-from-trades "$NBBO_TARGETS_PATH")
-else
-  log "Replaying strategy top-$NBBO_RANK_TOP selections since $NBBO_RANK_SINCE for the NBBO shortlist"
-  "$PYTHON_BIN" -m trading_rl.cli.rank \
-    --since "$NBBO_RANK_SINCE" \
-    --top "$NBBO_RANK_TOP" \
-    --daily-bars-dir "$DAILY_BARS_DIR" \
-    --minute-bars-dir "$MINUTE_BARS_DIR" \
-    --auctions-path "$AUCTIONS_PATH" \
-    --output "$NBBO_SYMBOLS_PATH"
-  nbbo_target_args=(--symbols-file "$NBBO_SYMBOLS_PATH")
-fi
 
 # Daily bars intentionally exclude the unfinished session, but today's opening
 # auction becomes usable after the SIP delay. Do not derive this bound from the

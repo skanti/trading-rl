@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import os
-from pathlib import Path
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -14,11 +14,9 @@ from rich.console import Console
 from rich.progress import track
 from rich.table import Table
 
-from ..market_data.calendar import auction_close_minutes
+from ..market_data.calendar import short_entry_dates
 from ..overnight.history import (
-    DEFAULT_AUCTIONS_PATH,
     DEFAULT_DAILY_DATA_DIR,
-    DEFAULT_DATA_DIR,
     DEFAULT_SECURITY_MASTER_CACHE,
     REFERENCE_SYMBOL,
     _dataset_manifest,
@@ -27,14 +25,12 @@ from ..overnight.history import (
     _security_symbol,
     company_universe_mask,
     exchange_universe_mask,
-    historical_window,
+    historical_window_bounds,
     load_daily_dollar_volume,
     load_nasdaq_security_master,
-    load_primary_auction_exchange_mask,
-    reference_session_calendar,
-    simulation_symbols,
 )
 from ..overnight.ranking import build_issuer_map, replay_strategy_selections
+from ..overnight.ranking_inputs import daily_ranking_calendar, daily_ranking_symbols
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--end-date",
         type=_parse_day,
-        help="final exit date; defaults to the latest complete reference session",
+        help="final exit date; defaults to the latest completed daily-bar session",
     )
     parser.add_argument(
         "--top", type=int, default=12, help="stocks per entry session (default: 12)"
@@ -87,7 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--asset-filter", choices=("companies", "all"), default="companies"
     )
     parser.add_argument(
-        "--exchange-filter", choices=("all", "nasdaq"), default="nasdaq"
+        "--exchange-filter",
+        choices=("all", "nasdaq"),
+        default="nasdaq",
+        help="filter using the current security master (historical listing transfers are not applied)",
     )
     parser.add_argument(
         "--unclassified-asset-policy", choices=("keep", "exclude"), default="keep"
@@ -99,16 +98,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="split-adjusted daily bars used to rank completed-session liquidity",
     )
     parser.add_argument(
-        "--minute-bars-dir",
+        "--symbols-file",
         type=Path,
-        default=Path(DEFAULT_DATA_DIR),
-        help="candidate file inventory and SPY session calendar; stock minute prices are not read",
+        help="optional candidate shortlist; defaults to every symbol in the daily-bar store",
     )
     parser.add_argument(
-        "--auctions-path",
+        "--calendar-path",
         type=Path,
-        default=Path(DEFAULT_AUCTIONS_PATH),
-        help="official session closes and historical listing exchanges",
+        help="saved calendar JSON with start, end, and sessions; defaults to Alpaca's calendar API",
     )
     parser.add_argument(
         "--security-master-cache",
@@ -161,26 +158,8 @@ def export_rankings(args: argparse.Namespace, console: Console) -> None:
     csv_path = args.output_csv or args.output.with_suffix(".csv")
     if args.output.resolve() == csv_path.resolve():
         raise ValueError("symbol-list and selection-CSV output paths must differ")
-    _dataset_manifest(args.minute_bars_dir, "1Min")
     _dataset_manifest(args.daily_bars_dir, "1Day")
-    known_closes = auction_close_minutes(args.auctions_path, None)
-    all_dates, context_sod = reference_session_calendar(
-        args.minute_bars_dir / f"{REFERENCE_SYMBOL}.npy",
-        known_closes,
-    )
-    window = historical_window(
-        all_dates,
-        context_sod,
-        args.auctions_path,
-        since=args.since,
-        end_date=args.end_date,
-        months=args.months,
-        ema_span=args.ema_span,
-        min_history_days=args.min_history_days,
-        min_trading_days=args.min_trading_days,
-        entry_time=args.entry_time,
-    )
-    symbols = simulation_symbols(args.minute_bars_dir, args.daily_bars_dir)
+    symbols = daily_ranking_symbols(args.daily_bars_dir, args.symbols_file)
     master = {}
     if args.asset_filter == "companies" or args.exchange_filter != "all":
         master = load_nasdaq_security_master(
@@ -197,13 +176,41 @@ def export_rankings(args: argparse.Namespace, console: Console) -> None:
         symbols = symbols[mask]
     if args.exchange_filter != "all":
         symbols = symbols[exchange_universe_mask(symbols, master, args.exchange_filter)]
-    positions = {stamp: index for index, stamp in enumerate(window.dates)}
+    if not np.any(symbols != REFERENCE_SYMBOL):
+        raise ValueError(
+            "no tradable daily-bar candidates remain after universe filters"
+        )
+    all_dates, closes = daily_ranking_calendar(
+        args.daily_bars_dir,
+        symbols,
+        end_date=args.end_date,
+        calendar_path=args.calendar_path,
+    )
+    requested_start, final_exit, bounds = historical_window_bounds(
+        all_dates,
+        since=args.since,
+        end_date=args.end_date,
+        months=args.months,
+        ema_span=args.ema_span,
+        min_history_days=args.min_history_days,
+        min_trading_days=args.min_trading_days,
+    )
+    dates = all_dates[bounds]
+    shortened = short_entry_dates(
+        {
+            stamp.date(): closes[stamp.date()]
+            for stamp in dates
+            if requested_start <= stamp < final_exit
+        },
+        args.entry_time,
+    )
+    positions = {stamp: index for index, stamp in enumerate(dates)}
 
     def load_symbol(symbol: str) -> np.ndarray:
         return load_daily_dollar_volume(
             args.daily_bars_dir / f"{_security_symbol(symbol)}.npy",
             positions,
-            len(window.dates),
+            len(dates),
         )
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -216,20 +223,12 @@ def export_rankings(args: argparse.Namespace, console: Console) -> None:
             )
         )
     dollar_volume = np.column_stack(columns)
-    exchange_mask = None
-    if args.exchange_filter != "all":
-        exchange_mask, _ = load_primary_auction_exchange_mask(
-            args.auctions_path,
-            window.dates,
-            symbols,
-            args.exchange_filter,
-        )
     selections = replay_strategy_selections(
-        window.dates,
+        dates,
         symbols,
         dollar_volume,
-        window.requested_start,
-        window.end_date,
+        requested_start,
+        final_exit,
         top=args.top,
         ema_span=args.ema_span,
         min_history_days=args.min_history_days,
@@ -237,8 +236,9 @@ def export_rankings(args: argparse.Namespace, console: Console) -> None:
         liquidity_scheme=args.liquidity_scheme,
         issuers=build_issuer_map(symbols, master),
         dedupe_share_classes=args.dedupe_share_classes,
-        execution_exchange_mask=exchange_mask,
-        entry_session_mask=window.entry_session_mask,
+        entry_session_mask=np.asarray(
+            [stamp.date() not in shortened for stamp in dates]
+        ),
     )
     unique = write_strategy_export(selections, args.output, csv_path)
     table = Table(title="Strategy ranking export")
@@ -251,7 +251,14 @@ def export_rankings(args: argparse.Namespace, console: Console) -> None:
         ("Entry sessions", f"{selections.entry_date.nunique():,}"),
         ("Daily selections", f"{len(selections):,}"),
         ("Unique symbols", f"{len(unique):,}"),
-        ("Shortened entries skipped", str(len(window.shortened_entries))),
+        ("Exchange filter", args.exchange_filter),
+        (
+            "Exchange metadata",
+            "Current security master"
+            if args.exchange_filter != "all"
+            else "Not filtered",
+        ),
+        ("Shortened entries skipped", str(len(shortened))),
         ("First entry", selections.entry_date.min()),
         ("Last entry", selections.entry_date.max()),
         ("Last exit", selections.exit_date.max()),
@@ -263,6 +270,10 @@ def export_rankings(args: argparse.Namespace, console: Console) -> None:
     console.print(
         "Exported intended selections before execution skips or position sizing. SPY is added by the NBBO downloader."
     )
+    if args.exchange_filter != "all":
+        console.print(
+            "Historical listing transfers are not applied; backtest auction eligibility may produce different baskets."
+        )
 
 
 def main() -> None:
@@ -284,7 +295,7 @@ def main() -> None:
         parser.error("--ema-span must be at least 2 for turnover stability")
     try:
         export_rankings(args, Console())
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))
 
 

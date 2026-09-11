@@ -11,7 +11,7 @@ from rich.console import Console
 
 from trading_rl.overnight import reconcile_live_sessions as reconcile
 from trading_rl.overnight.backtest import ENTRY_PRICE_SOURCES, EXIT_PRICE_SOURCES
-from trading_rl.overnight.reconciliation_prices import MissingBenchmarkData
+from trading_rl.overnight.reconciliation_prices import BenchmarkPrice, MissingBenchmarkData
 from overnight.tests.test_reconcile_live_sessions import order, seconds
 
 
@@ -104,6 +104,7 @@ class ReconciliationPricesTest(unittest.TestCase):
                 "entry_date": "2026-08-28",
                 "exit_date": "2026-08-31",
                 "symbols": ["AAPL"],
+                "entry_account_snapshot": {"equity": "1000"},
                 "entry_orders": {"AAPL": order(10, 20, "2026-08-28T19:59:00Z")},
                 "exit_orders": {
                     "AAPL": order(
@@ -173,6 +174,105 @@ class ReconciliationPricesTest(unittest.TestCase):
             MissingBenchmarkData, "nbbo-ask data does not exist"
         ):
             self.run_reconcile()
+
+    def test_price_averages_use_matched_share_weights_and_separate_quantity_impacts(self):
+        position = self.summary["position"]
+        position["symbols"].append("MSFT")
+        position["entry_orders"] = {
+            "AAPL": order(10.5, 20.2, "2026-08-28T19:59:00Z"),
+            "MSFT": order(2.5, 198, "2026-08-28T19:59:00Z"),
+        }
+        for exit_quantity in (10.5, 9.5):
+            with self.subTest(exit_quantity=exit_quantity):
+                position["exit_orders"] = {
+                    "AAPL": order(exit_quantity, 40.4, "2026-08-31T13:30:00Z", "2026-08-31T12:00:00Z"),
+                    "MSFT": order(2.5, 210, "2026-08-31T13:30:00Z", "2026-08-31T12:00:00Z"),
+                }
+                with patch.object(reconcile, "load_benchmark_prices", side_effect=[
+                    {"AAPL": BenchmarkPrice(10, 20), "MSFT": BenchmarkPrice(100, 200)},
+                    {"AAPL": BenchmarkPrice(20, 40), "MSFT": BenchmarkPrice(110, 220)},
+                ]):
+                    result = self.run_reconcile()
+                summary = reconcile.summarize_results([result])
+                self.assertAlmostEqual(summary["actual_entry_price_average"], 707.1 / 13)
+                self.assertAlmostEqual(summary["simulator_entry_price_average"], 710 / 13)
+                self.assertAlmostEqual(summary["actual_exit_price_average"], 949.2 / 13)
+                self.assertAlmostEqual(summary["simulator_exit_price_average"], 970 / 13)
+                self.assertAlmostEqual(summary["entry_execution_slippage_bps"], (707.1 / 710 - 1) * 10_000)
+                self.assertAlmostEqual(summary["exit_execution_slippage_bps"], (949.2 / 970 - 1) * 10_000)
+                self.assertAlmostEqual(summary["entry_execution_pnl_impact"], 1.3)
+                self.assertAlmostEqual(summary["exit_execution_pnl_impact"], -20.8)
+                self.assertAlmostEqual(summary["entry_execution_pnl_impact_bps"], 1.3 / 707.1 * 10_000)
+                self.assertAlmostEqual(summary["exit_execution_pnl_impact_bps"], -20.8 / 707.1 * 10_000)
+                self.assertAlmostEqual(summary["quantity_pnl_impact"], (exit_quantity - 10.5) * 40.4)
+                self.assertAlmostEqual(
+                    summary["entry_execution_pnl_impact"] + summary["exit_execution_pnl_impact"] + summary["quantity_pnl_impact"],
+                    summary["actual_minus_simulator_gross_pnl_total"],
+                )
+                stream = StringIO()
+                with patch.object(reconcile, "CONSOLE", Console(file=stream, width=180)):
+                    reconcile.print_overview([result])
+                    reconcile.print_result(result, show_symbol_breakdown=True)
+                text = stream.getvalue()
+                for side, expected in (("Entry", "+41.01 bps"), ("Exit", "+219.13 bps")):
+                    rows = [line for line in text.splitlines() if f"│ {side} price " in line and "source" not in line]
+                    self.assertEqual(len(rows), 2)
+                    for row in rows:
+                        cells = row.split("│")
+                        self.assertEqual(cells[2].strip(), "0.00 bps")
+                        self.assertEqual(cells[3].strip(), expected)
+                self.assertIn("-99.01 bps", text)
+                self.assertIn("+101.01 bps", text)
+                self.assertNotIn("Entry P&L impact", text)
+                self.assertNotIn("Exit P&L impact", text)
+
+    def test_tables_show_relative_prices_and_keep_symbol_prices(self):
+        result = self.run_reconcile()
+        for render in (
+            lambda: reconcile.print_overview([result]),
+            lambda: reconcile.print_result(result, show_symbol_breakdown=True),
+        ):
+            stream = StringIO()
+            with patch.object(reconcile, "CONSOLE", Console(file=stream, width=180)):
+                render()
+            text = stream.getvalue()
+            for label in ("Entry price source", "Exit price source",
+                          "nbbo-ask", "opening-auction"):
+                self.assertIn(label, text)
+            self.assertNotIn("Entry P&L impact", text)
+            self.assertNotIn("Exit P&L impact", text)
+            self.assertNotIn("Avg entry price", text)
+            self.assertNotIn("Avg exit price", text)
+            self.assertNotIn("$10.0000", text)
+            self.assertIn("0.00 bps", text)
+            for side in ("Entry", "Exit"):
+                row = next(line for line in text.splitlines() if f"│ {side} price " in line)
+                cells = row.split("│")
+                self.assertEqual(cells[2].strip(), "0.00 bps")
+                self.assertEqual(cells[3].strip(), "+0.00 bps")
+            gross_return_row = next(line for line in text.splitlines() if "│ Gross P&L (%)" in line)
+            self.assertEqual(gross_return_row.count("+20.00%"), 2)
+            self.assertIn("$1,000.00 starting equity", gross_return_row)
+            net_return_row = next(line for line in text.splitlines() if "│ Net P&L (%)" in line)
+            self.assertIn("Unavailable", net_return_row)
+            self.assertIn("+20.00%", net_return_row)
+        self.assertIn("Execution differences by symbol", text)
+        self.assertIn("$20.0000", text)
+        self.assertIn("$40.0000", text)
+        self.assertIn("Simulator price", text)
+        self.assertIn("Gross P&L Δ", text)
+        reconcile.attach_broker_fees(result, {
+            "status": "complete", "cost": 2, "count": 1, "activity_date": "2026-08-31",
+        })
+        stream = StringIO()
+        with patch.object(reconcile, "CONSOLE", Console(file=stream, width=180)):
+            reconcile.print_overview([result])
+            reconcile.print_result(result)
+        net_rows = [line for line in stream.getvalue().splitlines() if "│ Net P&L (%)" in line]
+        self.assertEqual(len(net_rows), 2)
+        for row in net_rows:
+            self.assertIn("+19.80%", row)
+            self.assertIn("+20.00%", row)
 
     def test_historical_nbbo_with_mixed_timestamp_precision_reconciles(self):
         with np.load(self.entry_nbbo, allow_pickle=False) as stored:
@@ -287,6 +387,9 @@ class ReconciliationPricesTest(unittest.TestCase):
         )
         self.assertEqual(result["rows"][0]["actual_time_entry_price"], 10.5)
         self.assertEqual(result["rows"][0]["actual_time_exit_price"], 21)
+        prices = reconcile.summarize_execution_prices([result])
+        self.assertEqual(prices["simulator_entry_price_average"], 21)
+        self.assertEqual(prices["simulator_exit_price_average"], 42)
         with self.assertRaisesRegex(ValueError, "requires explicit minute-"):
             self.run_reconcile(actual_time_benchmark=True)
 

@@ -1,21 +1,21 @@
-from contextlib import redirect_stderr
 import io
 import json
-from datetime import datetime, timezone
-from pathlib import Path
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import pandas as pd
 from rich.console import Console
 
-from trading_rl.cli.download_nbbo import targets_from_trade_csv
-from trading_rl.overnight import backtest, history, ranking
 from trading_rl.cli import rank
+from trading_rl.cli.download_nbbo import targets_from_trade_csv
 from trading_rl.market_data.schema import BAR_COLUMNS, BAR_SCHEMA_VERSION
-from overnight.tests.test_backtest import write_auction_npz
+from trading_rl.overnight import backtest, history, ranking
+from trading_rl.overnight import ranking_inputs as rank_inputs
 
 
 def ranking_inputs():
@@ -208,6 +208,8 @@ class StrategyExportTest(unittest.TestCase):
             ("--entry-price-source", "nbbo-ask"),
             ("--exit-price-source", "minute-open"),
             ("--nbbo-path", "missing.npz"),
+            ("--minute-bars-dir", "missing"),
+            ("--auctions-path", "missing.npz"),
             ("--budget", "10000"),
             ("--transaction-cost-bps", "0"),
         ):
@@ -228,66 +230,38 @@ class RankingCliTest(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.inputs = ranking_inputs()
         self.daily = self.root / "daily"
-        self.minute = self.root / "minute"
-        for path, timeframe in ((self.daily, "1Day"), (self.minute, "1Min")):
-            path.mkdir()
-            (path / "_download_manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": BAR_SCHEMA_VERSION,
-                        "timeframe": timeframe,
-                        "adjustment": "split",
-                        "columns": list(BAR_COLUMNS[timeframe]),
-                    }
-                )
+        self.daily.mkdir()
+        (self.daily / "_download_manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": BAR_SCHEMA_VERSION,
+                    "timeframe": "1Day",
+                    "adjustment": "split",
+                    "columns": list(BAR_COLUMNS["1Day"]),
+                }
             )
+        )
         dates = self.inputs["dates"]
         daily_seconds = dates.tz_localize("America/New_York").tz_convert("UTC").as_unit(
             "s"
         ).asi8 - int(pd.Timestamp("2010-01-01", tz="UTC").timestamp())
         master = {}
-        minute_rows = []
-        auction_rows = []
-        for i, stamp in enumerate(dates):
-            close = "13:00" if not self.inputs["entry_session_mask"][i] else "16:00"
-            stamps = pd.date_range(
-                f"{stamp.date()} 09:30",
-                f"{stamp.date()} {close}",
-                freq="min",
-                tz="America/New_York",
-            )
-            seconds = stamps.tz_convert("UTC").as_unit("s").asi8 - int(
-                pd.Timestamp("2010-01-01", tz="UTC").timestamp()
-            )
-            minute_rows.extend(
-                [[value, 1000, 1000, 1000, 1000, 100, 10, 1000] for value in seconds]
-            )
-            auction_rows.append(
-                dict(
-                    symbol="SPY",
-                    date=str(stamp.date()),
-                    session="close",
-                    condition="6",
-                    price=1.0,
-                    size=100,
-                    exchange="P",
-                    timestamp=stamps[-1].isoformat(),
-                )
-            )
-            for j, symbol in enumerate(self.inputs["symbols"]):
-                auction_rows.append(
-                    dict(
-                        symbol=symbol,
-                        date=str(stamp.date()),
-                        session="open",
-                        condition="O",
-                        price=1.0,
-                        size=100,
-                        exchange="Q"
-                        if self.inputs["execution_exchange_mask"][i, j]
-                        else "N",
-                    )
-                )
+        self.calendar_path = self.root / "calendar.json"
+        self.calendar = {
+            "start": str(dates[0].date()),
+            "end": str(dates[-1].date()),
+            "sessions": [
+                {
+                    "date": str(stamp.date()),
+                    "open": "09:30",
+                    "close": "16:00"
+                    if self.inputs["entry_session_mask"][i]
+                    else "13:00",
+                }
+                for i, stamp in enumerate(dates)
+            ],
+        }
+        self.calendar_path.write_text(json.dumps(self.calendar))
         for j, symbol in enumerate(self.inputs["symbols"]):
             rows = [
                 [
@@ -303,10 +277,6 @@ class RankingCliTest(unittest.TestCase):
                 for i, seconds in enumerate(daily_seconds)
             ]
             np.save(self.daily / f"{symbol}.npy", np.asarray(rows, dtype=np.int64))
-            if symbol != "SPY":
-                # The candidate inventory must be available before NBBO collection,
-                # but ranking must never open stock minute files or inspect prices.
-                (self.minute / f"{symbol}.npy").write_bytes(b"not execution data")
             master[symbol] = {
                 "name": symbol + " - Common Stock",
                 "exchange": "Q",
@@ -315,10 +285,6 @@ class RankingCliTest(unittest.TestCase):
             }
         master["GOOG"]["name"] = "Alphabet Inc. - Class C Capital Stock"
         master["GOOGL"]["name"] = "Alphabet Inc. - Class A Common Stock"
-        np.save(self.minute / "SPY.npy", np.asarray(minute_rows, dtype=np.int32))
-        self.auctions = self.root / "auctions.npz"
-        self.auction_rows = auction_rows
-        write_auction_npz(self.auctions, auction_rows)
         self.master_path = self.root / "master.json"
         self.master_path.write_text(
             json.dumps(
@@ -340,12 +306,10 @@ class RankingCliTest(unittest.TestCase):
             "3",
             "--min-trading-days",
             "5",
-            "--minute-bars-dir",
-            str(self.minute),
             "--daily-bars-dir",
             str(self.daily),
-            "--auctions-path",
-            str(self.auctions),
+            "--calendar-path",
+            str(self.calendar_path),
             "--security-master-cache",
             str(self.master_path),
             "--output",
@@ -385,9 +349,12 @@ class RankingCliTest(unittest.TestCase):
         ):
             rank.main()
 
-    def test_cli_exports_intended_baskets_without_stock_minute_prices_or_nbbo(self):
+    def test_cli_exports_with_only_daily_bars_calendar_and_security_metadata(self):
+        (self.daily / "SPY.npy").unlink()
         self.run_cli()
-        expected = ranking.replay_strategy_selections(**replay_inputs(self.inputs))
+        inputs = replay_inputs(self.inputs)
+        inputs.pop("execution_exchange_mask")
+        expected = ranking.replay_strategy_selections(**inputs)
         actual = pd.read_csv(self.root / "symbols.csv")
         pd.testing.assert_frame_equal(actual, expected)
         self.assertEqual(
@@ -395,6 +362,10 @@ class RankingCliTest(unittest.TestCase):
             sorted(set(expected.sample_id)),
         )
         self.assertIn("Shortened entries skipped", self.output.getvalue())
+        self.assertIn("Current security master", self.output.getvalue())
+        self.assertIn(
+            "Historical listing transfers are not applied", self.output.getvalue()
+        )
         self.assertNotIn(
             str(self.inputs["dates"][18].date()), actual.entry_date.tolist()
         )
@@ -416,21 +387,54 @@ class RankingCliTest(unittest.TestCase):
         self.assertEqual((self.root / "symbols.txt").read_text(), "existing symbols\n")
         self.assertEqual((self.root / "symbols.csv").read_text(), "existing schedule\n")
 
-    def test_missing_official_session_close_is_a_hard_error(self):
+    def test_missing_calendar_session_is_a_hard_error_and_preserves_exports(self):
         missing_date = str(self.inputs["dates"][12].date())
-        write_auction_npz(
-            self.auctions,
-            [
-                row
-                for row in self.auction_rows
-                if not (row["session"] == "close" and row["date"] == missing_date)
-            ],
-        )
+        self.calendar["sessions"] = [
+            session
+            for session in self.calendar["sessions"]
+            if session["date"] != missing_date
+        ]
+        self.calendar_path.write_text(json.dumps(self.calendar))
+        (self.root / "symbols.txt").write_text("existing symbols\n")
+        (self.root / "symbols.csv").write_text("existing schedule\n")
         error = io.StringIO()
         with redirect_stderr(error), self.assertRaises(SystemExit):
             self.run_cli()
-        self.assertIn("official session close is unavailable", error.getvalue())
+        self.assertIn("calendar is missing daily-bar session dates", error.getvalue())
         self.assertIn(missing_date, error.getvalue())
+        self.assertEqual((self.root / "symbols.txt").read_text(), "existing symbols\n")
+        self.assertEqual((self.root / "symbols.csv").read_text(), "existing schedule\n")
+
+    def test_cli_fetches_calendar_when_no_offline_file_is_selected(self):
+        argv = self.argv.copy()
+        index = argv.index("--calendar-path")
+        del argv[index : index + 2]
+        with mock.patch.object(
+            rank_inputs,
+            "fetch_ranking_calendar",
+            return_value=self.calendar["sessions"],
+        ) as fetch:
+            self.run_cli(argv)
+        fetch.assert_called_once_with(
+            self.inputs["dates"][0].date(), self.inputs["dates"][-1].date()
+        )
+        self.assertTrue((self.root / "symbols.csv").exists())
+
+    def test_explicit_daily_shortlist_controls_candidates_without_spy(self):
+        shortlist = self.root / "shortlist.txt"
+        shortlist.write_text("AAPL\nNVDA\n")
+        (self.daily / "SPY.npy").unlink()
+        self.run_cli([*self.argv, "--symbols-file", str(shortlist)])
+        actual = pd.read_csv(self.root / "symbols.csv")
+        self.assertEqual(set(actual.sample_id), {"AAPL", "NVDA"})
+
+    def test_stale_calendar_coverage_is_rejected(self):
+        self.calendar["end"] = str(self.inputs["dates"][-2].date())
+        self.calendar_path.write_text(json.dumps(self.calendar))
+        error = io.StringIO()
+        with redirect_stderr(error), self.assertRaises(SystemExit):
+            self.run_cli()
+        self.assertIn("calendar coverage must include", error.getvalue())
         self.assertFalse((self.root / "symbols.txt").exists())
 
     def test_date_cutoff_and_custom_csv_are_respected(self):

@@ -134,7 +134,7 @@ def _batches(values: list[str], size: int) -> Iterable[list[str]]:
 
 
 def targets_from_trade_csv(
-    path: Path, date_column: str = "entry_date"
+    path: Path, date_column: str
 ) -> dict[date, set[str]]:
     """Read the exact daily basket from a simulator trade CSV.
 
@@ -804,10 +804,9 @@ def main() -> None:
     parser.add_argument("--overlap-days", type=int, default=7)
     parser.add_argument("--lookback-seconds", type=int, default=60)
     parser.add_argument(
-        "--target-date-column",
-        choices=("entry_date", "exit_date"),
-        default="entry_date",
-        help="trade CSV date to query: entry_date for entry quotes, exit_date for exit quotes",
+        "--trade-date",
+        choices=("entry", "exit"),
+        help="required with --targets-from-trades: query each trade's entry or exit date (no default)",
     )
     parser.add_argument(
         "--targets-from-trades",
@@ -830,6 +829,10 @@ def main() -> None:
         parser.error("overlap, lookback, batch size, and request rate must be positive")
     if bool(args.targets_from_trades) == bool(args.symbols_file):
         parser.error("provide either --symbols-file or --targets-from-trades")
+    if args.targets_from_trades and args.trade_date is None:
+        parser.error("--trade-date entry|exit is required with --targets-from-trades")
+    if args.symbols_file and args.trade_date is not None:
+        parser.error("--trade-date only applies to --targets-from-trades")
     output = Path(args.output)
     try:
         incremental = use_incremental_download(output, update=args.update, rebuild=args.rebuild)
@@ -858,7 +861,7 @@ def main() -> None:
         targets = targets_from_symbols(symbols, start, end, target)
     else:
         targets = merge_target_schedules(
-            targets_from_trade_csv(Path(value), args.target_date_column)
+            targets_from_trade_csv(Path(value), f"{args.trade_date}_date")
             for value in args.targets_from_trades
         )
         close_minutes = auction_close_minutes(Path(args.auctions_path), targets)

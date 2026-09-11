@@ -162,6 +162,7 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             self.assertAlmostEqual(row["simulator_exit_price"], 110.0)
             self.assertAlmostEqual(row["entry_slippage_bps"], 50.0)
             self.assertAlmostEqual(totals["actual_gross_pnl"], 95.0)
+            self.assertAlmostEqual(totals["entry_equity"], 1000.0)
             self.assertAlmostEqual(totals["simulator_gross_pnl"], 100.5)
             self.assertAlmostEqual(totals["actual_minus_simulator_gross_pnl"], -5.5)
             self.assertAlmostEqual(totals["entry_execution_slippage_bps"], 50.0)
@@ -537,7 +538,7 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertEqual(summary["status"], "complete")
         self.assertEqual(summary["cost"], 0.0)
 
-    def test_overview_uses_dollar_totals_and_notional_weighted_bps(self):
+    def test_overview_uses_dollar_totals_and_pooled_price_averages(self):
         results = [
             {
                 "entry_date": "2026-08-28",
@@ -546,12 +547,20 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 "transaction_cost_bps_per_side": 1.0,
                 "broker_fees": {"status": "complete"},
                 "ranking_replay": {"status": "complete", "overlap_count": 1},
+                "rows": [
+                    {"entry_quantity": 5, "actual_entry_price": 100, "simulator_entry_price_comparable": 100,
+                     "actual_exit_price": 101, "simulator_exit_price_comparable": 100.8,
+                     "entry_execution_pnl_impact": 0, "exit_execution_pnl_impact": 1}
+                    for _ in range(2)
+                ],
                 "totals": {
                     "actual_entry_notional": 1_000.0,
+                    "entry_equity": 2_000.0,
                     "actual_gross_pnl": 10.0,
                     "simulator_gross_pnl": 8.0,
-                    "entry_execution_slippage_bps": 2.0,
-                    "exit_execution_slippage_bps": -1.0,
+                    "entry_execution_pnl_impact": 0.0,
+                    "exit_execution_pnl_impact": 2.0,
+                    "quantity_pnl_impact": 0.0,
                     "actual_broker_fee_cost": 1.0,
                     "simulator_transaction_cost": 2.0,
                     "actual_net_pnl_after_broker_fees": 9.0,
@@ -566,12 +575,19 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 "symbols": ["C"],
                 "transaction_cost_bps_per_side": 1.0,
                 "broker_fees": {"status": "pending"},
+                "rows": [
+                    {"entry_quantity": 30, "actual_entry_price": 100, "simulator_entry_price_comparable": 100,
+                     "actual_exit_price": 101, "simulator_exit_price_comparable": 101.1,
+                     "entry_execution_pnl_impact": 0, "exit_execution_pnl_impact": -3},
+                ],
                 "totals": {
                     "actual_entry_notional": 3_000.0,
+                    "entry_equity": 3_500.0,
                     "actual_gross_pnl": 30.0,
                     "simulator_gross_pnl": 33.0,
-                    "entry_execution_slippage_bps": 6.0,
-                    "exit_execution_slippage_bps": 3.0,
+                    "entry_execution_pnl_impact": 0.0,
+                    "exit_execution_pnl_impact": -3.0,
+                    "quantity_pnl_impact": 0.0,
                     "simulator_transaction_cost": 6.0,
                     "simulator_net_pnl": 27.0,
                     "broker_equity_pnl": None,
@@ -587,16 +603,127 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertAlmostEqual(summary["simulator_gross_pnl_total"], 41.0)
         self.assertAlmostEqual(summary["actual_minus_simulator_gross_pnl_total"], -1.0)
         self.assertAlmostEqual(summary["actual_minus_simulator_gross_bps"], -2.5)
-        self.assertAlmostEqual(summary["entry_execution_slippage_bps"], 5.0)
-        self.assertAlmostEqual(summary["exit_execution_slippage_bps"], 2.0)
+        self.assertAlmostEqual(summary["actual_entry_price_average"], 100.0)
+        self.assertAlmostEqual(summary["simulator_entry_price_average"], 100.0)
+        self.assertAlmostEqual(summary["actual_exit_price_average"], 101.0)
+        self.assertAlmostEqual(summary["simulator_exit_price_average"], 101.025)
+        self.assertAlmostEqual(summary["entry_execution_slippage_bps"], 0.0)
+        self.assertAlmostEqual(summary["exit_execution_slippage_bps"], (101 / 101.025 - 1) * 10_000)
+        self.assertAlmostEqual(summary["entry_execution_pnl_impact"], 0.0)
+        self.assertAlmostEqual(summary["exit_execution_pnl_impact"], -1.0)
+        self.assertAlmostEqual(summary["exit_execution_pnl_impact_bps"], -2.5)
         self.assertEqual(summary["fee_confirmed_sessions"], 1)
         self.assertAlmostEqual(summary["actual_broker_fee_cost_total"], 1.0)
-        self.assertAlmostEqual(summary["simulator_transaction_cost_total"], 2.0)
-        self.assertAlmostEqual(summary["actual_net_pnl_total"], 9.0)
-        self.assertAlmostEqual(summary["simulator_net_pnl_total"], 6.0)
-        self.assertAlmostEqual(summary["actual_minus_simulator_net_pnl_total"], 3.0)
+        self.assertAlmostEqual(summary["simulator_transaction_cost_total"], 8.0)
+        self.assertIsNone(summary.get("actual_net_pnl_total"))
+        self.assertAlmostEqual(summary["simulator_net_pnl_total"], 33.0)
+        self.assertIsNone(summary.get("actual_minus_simulator_net_pnl_total"))
         self.assertAlmostEqual(summary["unexplained_residual_total"], 0.5)
         self.assertAlmostEqual(summary["ranking_overlap_fraction"], 0.5)
+        self.assertEqual(summary["starting_equity"], 2000)
+        output = StringIO()
+        with patch("trading_rl.overnight.reconcile_live_sessions.CONSOLE", Console(file=output, width=180)):
+            print_overview(list(reversed(results)))
+        gross_return_row = next(line for line in output.getvalue().splitlines() if "│ Gross P&L (%)" in line)
+        self.assertIn("+2.00%", gross_return_row)
+        self.assertIn("+2.05%", gross_return_row)
+        self.assertIn("$2,000.00 starting equity", gross_return_row)
+        net_return_row = next(line for line in output.getvalue().splitlines() if "│ Net P&L (%)" in line)
+        self.assertIn("Actual fees confirmed for 1/2 sessions", output.getvalue())
+        self.assertIn("Unavailable", net_return_row)
+        self.assertIn("+1.65%", net_return_row)
+        self.assertIn("$2,000.00 starting equity", net_return_row)
+        # A later session's equity or deployed capital cannot replace a missing baseline.
+        for missing_equity in (None, 0.0):
+            results[0]["totals"]["entry_equity"] = missing_equity
+            output = StringIO()
+            with patch("trading_rl.overnight.reconcile_live_sessions.CONSOLE", Console(file=output, width=180)):
+                print_overview(list(reversed(results)))
+            gross_return_row = next(line for line in output.getvalue().splitlines() if "│ Gross P&L (%)" in line)
+            self.assertEqual(gross_return_row.count("Unavailable"), 2)
+            self.assertIn("Starting account equity unavailable", gross_return_row)
+            net_return_row = next(line for line in output.getvalue().splitlines() if "│ Net P&L (%)" in line)
+            self.assertEqual(net_return_row.count("Unavailable"), 2)
+
+    def test_pending_fee_losses_are_not_dropped_from_overview_net(self):
+        # The second session loses money. Omitting it from net would make
+        # net exceed the gross total despite positive costs on both sessions.
+        for benchmark in ("scheduled", "actual_time_1_min"):
+            for confirmed in (0, 1, 2):
+                with self.subTest(benchmark=benchmark, confirmed=confirmed):
+                    results = []
+                    for index, gross in enumerate((100.0, -40.0)):
+                        result = {
+                            "entry_date": f"2026-09-0{index + 1}",
+                            "exit_date": f"2026-09-0{index + 2}",
+                            "symbols": ["A"],
+                            "reporting_benchmark": benchmark,
+                            "transaction_cost_bps_per_side": 1.0,
+                            "rows": [{
+                                "entry_quantity": 10, "actual_entry_price": 100,
+                                "actual_exit_price": 100 + gross / 10,
+                                "simulator_entry_price_comparable": 100,
+                                "simulator_exit_price_comparable": 100 + gross / 10,
+                                "actual_time_entry_price_comparable": 100,
+                                "actual_time_exit_price_comparable": 100 + (gross + 5) / 10,
+                                "entry_execution_pnl_impact": 0,
+                                "exit_execution_pnl_impact": 0,
+                                "actual_time_entry_execution_pnl_impact": 0,
+                                "actual_time_exit_execution_pnl_impact": -5,
+                            }],
+                            "totals": {
+                                "entry_equity": 2000.0,
+                                "actual_entry_notional": 1000.0,
+                                "actual_gross_pnl": gross,
+                                "simulator_gross_pnl": gross,
+                                "simulator_transaction_cost": 2.0,
+                                "simulator_net_pnl": gross - 2,
+                                "actual_time_simulator_gross_pnl": gross + 5,
+                                "actual_time_simulator_transaction_cost": 3.0,
+                                "actual_time_simulator_net_pnl": gross + 2,
+                                "quantity_pnl_impact": 0.0,
+                            },
+                        }
+                        attach_broker_fees(result, {
+                            "status": "complete" if index < confirmed else "pending",
+                            "cost": 1.0,
+                        })
+                        results.append(result)
+
+                    summary = summarize_results(results)
+                    actual_time = benchmark == "actual_time_1_min"
+                    expected_net = 64.0 if actual_time else 56.0
+                    self.assertEqual(summary["fee_confirmed_sessions"], confirmed)
+                    self.assertAlmostEqual(summary["actual_gross_pnl_total"], 60.0)
+                    self.assertAlmostEqual(summary["simulator_net_pnl_total"], expected_net)
+                    self.assertAlmostEqual(
+                        summary["simulator_gross_pnl_total"]
+                        - summary["simulator_transaction_cost_total"],
+                        expected_net,
+                    )
+                    output = StringIO()
+                    with patch("trading_rl.overnight.reconcile_live_sessions.CONSOLE", Console(file=output, width=180)):
+                        print_overview(results)
+                    net_row = next(line for line in output.getvalue().splitlines() if "│ Net P&L " in line)
+                    percentage_row = next(line for line in output.getvalue().splitlines() if "│ Net P&L (%)" in line)
+                    self.assertIn(format_usd(expected_net, signed=True), net_row)
+                    self.assertIn(f"{expected_net / 2000:+.2%}", percentage_row)
+                    if confirmed == 2:
+                        self.assertAlmostEqual(summary["actual_net_pnl_total"], 58.0)
+                        self.assertAlmostEqual(
+                            summary["actual_gross_pnl_total"] - summary["actual_broker_fee_cost_total"],
+                            summary["actual_net_pnl_total"],
+                        )
+                        self.assertAlmostEqual(summary["actual_minus_simulator_net_pnl_total"], 58 - expected_net)
+                        self.assertAlmostEqual(summary["actual_minus_simulator_net_bps"], (58 - expected_net) / 2000 * 10_000)
+                        self.assertIn("+$58.00", net_row)
+                        self.assertIn("+2.90%", percentage_row)
+                    else:
+                        self.assertIsNone(summary.get("actual_net_pnl_total"))
+                        self.assertIsNone(summary.get("actual_minus_simulator_net_pnl_total"))
+                        self.assertIsNone(summary.get("actual_minus_simulator_net_bps"))
+                        self.assertIn("Unavailable", net_row)
+                        self.assertIn("Unavailable", percentage_row)
 
     def test_overview_uses_selected_actual_time_entry_and_exit_benchmarks(self):
         result = {
@@ -606,8 +733,16 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
             "reporting_benchmark": "actual_time_1_min",
             "transaction_cost_bps_per_side": 1.0,
             "broker_fees": {"status": "pending"},
+            "rows": [{
+                "entry_quantity": 10, "actual_entry_price": 100, "actual_exit_price": 109.1,
+                "simulator_entry_price_comparable": 90, "simulator_exit_price_comparable": 94.5,
+                "actual_time_entry_price_comparable": 100, "actual_time_exit_price_comparable": 109,
+                "entry_execution_pnl_impact": -105, "exit_execution_pnl_impact": 146,
+                "actual_time_entry_execution_pnl_impact": 0, "actual_time_exit_execution_pnl_impact": 1,
+            }],
             "totals": {
                 "actual_entry_notional": 1_000.0,
+                "entry_equity": 2_000.0,
                 "actual_gross_pnl": 91.0,
                 "simulator_gross_pnl": 50.0,
                 "actual_time_simulator_gross_pnl": 90.0,
@@ -615,6 +750,9 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 "actual_time_entry_slippage_bps": 2.0,
                 "exit_execution_slippage_bps": 100.0,
                 "actual_time_exit_slippage_bps": 10.0,
+                "entry_execution_pnl_impact": -105.0,
+                "exit_execution_pnl_impact": 146.0,
+                "quantity_pnl_impact": 0.0,
                 "simulator_transaction_cost": 2.0,
                 "actual_time_simulator_transaction_cost": 2.0,
                 "simulator_net_pnl": 48.0,
@@ -628,8 +766,12 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
         self.assertEqual(summary["actual_time_benchmark_sessions"], 1)
         self.assertAlmostEqual(summary["simulator_gross_pnl_total"], 90.0)
         self.assertAlmostEqual(summary["actual_minus_simulator_gross_pnl_total"], 1.0)
-        self.assertAlmostEqual(summary["entry_execution_slippage_bps"], 2.0)
-        self.assertAlmostEqual(summary["exit_execution_slippage_bps"], 10.0)
+        self.assertAlmostEqual(summary["entry_execution_slippage_bps"], 0.0)
+        self.assertAlmostEqual(summary["exit_execution_slippage_bps"], (109.1 / 109 - 1) * 10_000)
+        self.assertAlmostEqual(summary["simulator_entry_price_average"], 100.0)
+        self.assertAlmostEqual(summary["simulator_exit_price_average"], 109.0)
+        self.assertAlmostEqual(summary["entry_execution_pnl_impact"], 0.0)
+        self.assertAlmostEqual(summary["exit_execution_pnl_impact"], 1.0)
         self.assertAlmostEqual(summary["simulator_net_pnl_total"], 88.0)
 
         output = StringIO()
@@ -645,6 +787,19 @@ class ReconcileLiveSessionsTest(unittest.TestCase):
                 ],
             )
         rendered = output.getvalue()
+        gross_return_row = next(line for line in rendered.splitlines() if "│ Gross P&L (%)" in line)
+        self.assertIn("+4.55%", gross_return_row)
+        self.assertIn("+4.50%", gross_return_row)
+        net_return_row = next(line for line in rendered.splitlines() if "│ Net P&L (%)" in line)
+        self.assertIn("Unavailable", net_return_row)
+        self.assertIn("+4.40%", net_return_row)
+        exit_price_row = next(line for line in rendered.splitlines() if "│ Exit price " in line)
+        self.assertEqual(exit_price_row.split("│")[2].strip(), "0.00 bps")
+        self.assertEqual(exit_price_row.split("│")[3].strip(), "-9.17 bps")
+        self.assertNotIn("Exit P&L impact", rendered)
+        self.assertNotIn("Entry P&L impact", rendered)
+        self.assertNotIn("Avg entry price", rendered)
+        self.assertNotIn("Avg exit price", rendered)
         self.assertIn("Skipped sessions", rendered)
         self.assertIn("2026-09-02: exit schedule mismatch", rendered)
 
