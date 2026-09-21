@@ -625,8 +625,13 @@ Before ranking, it refreshes every symbol already present in the broad
 split-adjusted daily cache at `/data/ppv1/updates/bars_1day_2022-01-01` using
 batched SIP requests with 30 days of overlap. An exact overlap is appended;
 any changed bar (including a newly reflected split) triggers a full retained-history
-refresh for that symbol. The rank step fails closed unless Alpaca returns the
-immediately preceding completed session, and it never uses the unfinished entry-day bar.
+refresh for that symbol. The overall response must include the immediately preceding
+completed market session. Each full replacement must cover that symbol's stored
+start and latest observed bar, reproduce the fresh overlap exactly, and exclude
+unfinished sessions. A halted or inactive symbol need not have a bar on the latest
+market day: a consistent repair can end on its own last observed session. Invalid
+replacements are retried individually; persistent validation failures abort ranking
+before any pending cache updates are saved. Missing sessions are not fabricated.
 Active eligible companies missing from the cache are first seeded with split-adjusted
 history from the shortlist epoch, so new listings can enter later shortlist rebuilds.
 

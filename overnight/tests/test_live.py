@@ -6,6 +6,7 @@ import time
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -755,6 +756,73 @@ class LiveOvernightLiquidityTest(unittest.TestCase):
 
         self.assertEqual(diagnostics["full_refreshes"], 2)
         self.assertIn((("APXT",), date(2016, 1, 1)), client.requests)
+
+    def test_full_refresh_repairs_split_without_a_bar_on_the_latest_market_day(self):
+        base = [full_bar("2026-09-09", 5000, 0.26), full_bar("2026-09-10", 10000, 0.33)]
+        adjusted = [full_bar("2026-09-09", 100, 13.0), full_bar("2026-09-10", 200, 16.5)]
+        healthy = [full_bar("2026-09-10", 100), full_bar("2026-09-11", 110)]
+        client = FakeDailyBarsClient({"NFE": adjusted, "MSFT": healthy})
+        with tempfile.TemporaryDirectory() as directory:
+            bars_dir = Path(directory)
+            (bars_dir / "_download_manifest.json").write_text(json.dumps({"since": "2022-01-01"}))
+            np.save(bars_dir / "NFE.npy", _daily_bars_to_array(base, "NFE"))
+            np.save(bars_dir / "MSFT.npy", _daily_bars_to_array(healthy[:1], "MSFT"))
+            diagnostics = refresh_daily_cache(
+                client, bars_dir, ["NFE", "MSFT"], date(2026, 9, 11),
+                _completed_session_end(date(2026, 9, 11)), "sip", 100, 1, 30,
+            )
+            np.testing.assert_array_equal(
+                np.load(bars_dir / "NFE.npy"), _daily_bars_to_array(adjusted, "NFE"),
+            )
+            np.testing.assert_array_equal(
+                np.load(bars_dir / "MSFT.npy"), _daily_bars_to_array(healthy, "MSFT"),
+            )
+        self.assertEqual(diagnostics["updated_files"], 2)
+        self.assertEqual(diagnostics["full_refreshes"], 1)
+        # The full refresh agrees with the recent request; no futile retry.
+        self.assertEqual(len(client.adjustments), 2)
+
+    def test_full_refresh_rejects_incomplete_or_inconsistent_history_before_any_write(self):
+        base = [full_bar("2026-09-08", 5000), full_bar("2026-09-09", 5000)]
+        revised = [full_bar("2026-09-08", 100), full_bar("2026-09-09", 100)]
+        update = revised[1:] + [full_bar("2026-09-10", 200)]
+        complete = revised + update[1:]
+        healthy = [full_bar("2026-09-10", 100), full_bar("2026-09-11", 110)]
+        cases = {
+            "empty response": [],
+            "starts after retained history": complete[1:],
+            "precedes observed history": revised,
+            "does not match the fresh overlap": revised + [full_bar("2026-09-10", 999)],
+            "includes incomplete future session": complete + [full_bar("2026-09-14", 200)],
+        }
+        for message, replacement in cases.items():
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                bars_dir = Path(directory)
+                manifest_path = bars_dir / "_download_manifest.json"
+                manifest_text = json.dumps({"since": "2022-01-01"})
+                manifest_path.write_text(manifest_text)
+                original = {
+                    "NFE": _daily_bars_to_array(base, "NFE"),
+                    "MSFT": _daily_bars_to_array(healthy[:1], "MSFT"),
+                }
+                for symbol, array in original.items():
+                    np.save(bars_dir / f"{symbol}.npy", array)
+                with mock.patch(
+                    "trading_rl.overnight.live._download_bars",
+                    side_effect=[
+                        {"NFE": update, "MSFT": healthy},
+                        {"NFE": replacement}, {"NFE": replacement},
+                    ],
+                ) as download:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        refresh_daily_cache(
+                            None, bars_dir, ["NFE", "MSFT"], date(2026, 9, 11),
+                            _completed_session_end(date(2026, 9, 11)), "sip", 100, 1, 30,
+                        )
+                    self.assertEqual(download.call_count, 3)
+                for symbol, array in original.items():
+                    np.testing.assert_array_equal(np.load(bars_dir / f"{symbol}.npy"), array)
+                self.assertEqual(manifest_path.read_text(), manifest_text)
 
     def test_dollar_volume_shortlist_uses_daily_union_and_excludes_int32_prices(self):
         with tempfile.TemporaryDirectory() as directory:

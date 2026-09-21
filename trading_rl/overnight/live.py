@@ -767,6 +767,38 @@ def _array_session_date(seconds: int) -> date:
     return (DAILY_BAR_ANNO + timedelta(seconds=int(seconds))).astimezone(EASTERN).date()
 
 
+def _daily_replacement_error(
+    base: np.ndarray,
+    update: np.ndarray,
+    replacement: np.ndarray,
+    expected_session: date,
+) -> str | None:
+    """Validate a repair against observed history, including non-trading days.
+
+    A halt or delisting can legitimately leave a symbol behind the exchange's
+    latest session. A repair must retain its stored range and independently
+    reproduce the fresh overlap, rather than invent a bar on that session.
+    """
+    if len(replacement) == 0:
+        return "empty response"
+    latest = _array_session_date(replacement[-1, 0])
+    if latest > expected_session:
+        return f"includes incomplete future session {latest}; cutoff {expected_session}"
+    if replacement[0, 0] > base[0, 0]:
+        return f"starts after retained history {_array_session_date(base[0, 0])}"
+    required_last = max(int(base[-1, 0]), int(update[-1, 0]))
+    if replacement[-1, 0] < required_last:
+        return (
+            f"latest session {latest} precedes observed history "
+            f"{_array_session_date(required_last)}"
+        )
+    first = np.searchsorted(replacement[:, 0], update[0, 0])
+    last = np.searchsorted(replacement[:, 0], update[-1, 0], side="right")
+    if not np.array_equal(replacement[first:last], update):
+        return "does not match the fresh overlap"
+    return None
+
+
 def seed_missing_daily_cache(
     client: AlpacaClient,
     bars_dir: Path,
@@ -852,7 +884,7 @@ def refresh_daily_cache(
             "daily SIP refresh unexpectedly included an incomplete future session"
         )
 
-    revised: list[str] = []
+    revised: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     pending: dict[Path, np.ndarray] = {}
     for symbol in symbols:
         rows = downloaded.get(symbol) or []
@@ -867,7 +899,7 @@ def refresh_daily_cache(
         update = _daily_bars_to_array(rows, symbol)
         merged = _merge_daily_arrays(base, update)
         if merged is None:
-            revised.append(symbol)
+            revised[symbol] = (base, update)
         else:
             pending[cache_path] = merged
 
@@ -886,7 +918,7 @@ def refresh_daily_cache(
         )
         replacements = _download_bars(
             client,
-            revised,
+            list(revised),
             full_start,
             end,
             feed,
@@ -901,15 +933,16 @@ def refresh_daily_cache(
         retry_symbols = [
             symbol
             for symbol, replacement in replacement_arrays.items()
-            if len(replacement) == 0
-            or _array_session_date(replacement[-1, 0]) < expected_session
+            if _daily_replacement_error(
+                *revised[symbol], replacement, expected_session
+            ) is not None
         ]
         if retry_symbols:
             # Alpaca can omit an otherwise available symbol from a large,
             # deeply paginated multi-symbol response. Retry only those symbols
-            # individually before treating the ranking data as stale.
+            # individually before rejecting an incomplete or inconsistent repair.
             LOGGER.warning(
-                "batch full-history response was stale for %d symbol(s); "
+                "batch full-history response failed validation for %d symbol(s); "
                 "retrying individually: %s",
                 len(retry_symbols),
                 ", ".join(retry_symbols),
@@ -930,13 +963,22 @@ def refresh_daily_cache(
                     for symbol in retry_symbols
                 }
             )
-        for symbol in revised:
+        for symbol, (base, update) in revised.items():
             replacement = replacement_arrays[symbol]
-            if (
-                len(replacement) == 0
-                or _array_session_date(replacement[-1, 0]) < expected_session
-            ):
-                raise RuntimeError(f"full daily-history refresh is stale for {symbol}")
+            error = _daily_replacement_error(
+                base, update, replacement, expected_session
+            )
+            if error is not None:
+                raise RuntimeError(
+                    f"full daily-history refresh is invalid for {symbol}: {error}"
+                )
+            latest = _array_session_date(replacement[-1, 0])
+            if latest < expected_session:
+                LOGGER.info(
+                    "repaired %s history through its latest observed session %s; "
+                    "fresh overlap agrees, no bar returned through market session %s",
+                    symbol, latest, expected_session,
+                )
             pending[bars_dir / f"{symbol}.npy"] = replacement
 
     for cache_path, array in pending.items():
