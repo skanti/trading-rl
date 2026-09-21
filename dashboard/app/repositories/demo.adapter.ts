@@ -125,6 +125,21 @@ function buildSnapshot(): Snapshot {
       sessions: curve.length
     },
     equity_curve: curve,
+    benchmark: {
+      symbol: 'SPY',
+      basis: 'adjusted_daily_close',
+      status: 'available',
+      as_of: last.day,
+      points: curve.map((point, index) => {
+        const change = index * 0.00028 + Math.sin(index / 8) * 0.008
+        return {
+          day: point.day,
+          equity: 100000 * (1 + change),
+          profit_loss: 100000 * change,
+          profit_loss_pct: change
+        }
+      })
+    },
     positions: [
       { symbol: 'NVDA', qty: 52.31, side: 'long', avg_entry_price: 178.2, current_price: 180.05, market_value: 9418.4, cost_basis: 9321.64, unrealized_pl: 96.76, unrealized_plpc: 0.0104, change_today: 0.0104 },
       { symbol: 'TSLA', qty: 31.05, side: 'long', avg_entry_price: 302.11, current_price: 298.44, market_value: 9266.56, cost_basis: 9380.52, unrealized_pl: -113.96, unrealized_plpc: -0.0121, change_today: -0.0121 },

@@ -46,6 +46,20 @@ Account-equity change remains a separate reconciliation value, with any differen
 shown as the unexplained residual. This keeps strategy performance independent of
 deposits, settlement rounding, and Alpaca's delayed portfolio-history rollover.
 
+The equity chart overlays a muted SPY buy-and-hold reference, normalized to the
+strategy's first chart date and starting capital. It uses SIP daily closes with
+Alpaca's `adjustment=all` (including splits and cash dividends). This is a daily-close
+reference, not an execution-matched 15:45-to-opening-auction backtest. Its first
+investment mark is the inception date's close. Only prior-day completed bars are
+published; the reference ends before the current intraday strategy point. Hovering
+shows the reference value for the same date, and missing dates remain gaps.
+
+The dashboard publisher fetches this optional reference independently. It uses
+`ALPACA_DATA_KEY` / `ALPACA_DATA_SECRET` when provided, falling back to the trading
+credentials. Failed market-data requests leave the reference unavailable without
+preventing the account snapshot from publishing. Older snapshots without benchmark
+data continue to render normally. Restart the publisher when deploying this change.
+
 The publisher reads the credential-free schedule, strategy, data, and execution
 sections from the live runner's `effective_config.json` on every poll, falling back to
 `overnight/config.yaml` when no active-runtime artifact exists. The frontend renders

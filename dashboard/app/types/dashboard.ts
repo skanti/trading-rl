@@ -29,6 +29,14 @@ export interface EquityPoint {
   trades?: number
 }
 
+export interface Benchmark {
+  symbol: 'SPY'
+  basis: 'adjusted_daily_close'
+  status: 'available' | 'unavailable' | 'pending'
+  as_of: string | null
+  points: EquityPoint[]
+}
+
 export interface AccountSummary {
   account_number?: string
   status?: string
@@ -146,6 +154,7 @@ export interface Snapshot {
   performance: Record<BucketKey, PerformanceBucket>
   statistics: Statistics
   equity_curve: EquityPoint[]
+  benchmark?: Benchmark
   positions: Position[]
   strategy: StrategyState
   closed_basket: ClosedTrade[]

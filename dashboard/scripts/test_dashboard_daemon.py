@@ -342,6 +342,7 @@ class SnapshotTest(unittest.TestCase):
                 "account",
                 "performance",
                 "statistics",
+                "benchmark",
                 "equity_curve",
                 "positions",
                 "strategy",

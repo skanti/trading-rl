@@ -86,6 +86,7 @@ const accountRows = computed<AccountRow[]>(() => [
 
       <EquityChart
         :points="curve"
+        :benchmark="snapshot.benchmark"
         :baseline="inception?.start_equity"
         :sessions="snapshot.statistics?.sessions"
         :open-pnl="openPerformance.pnl"

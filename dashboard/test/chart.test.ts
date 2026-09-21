@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { areaPath, buildScale, gridValues, linePath, tickIndices } from '~/utils/chart'
+import { alignReference, areaPath, buildScale, gridValues, linePath, referencePath, tickIndices } from '~/utils/chart'
 import type { EquityPoint } from '~/types/dashboard'
 
 const GEOMETRY = { width: 900, height: 300, padding: { top: 10, right: 10, bottom: 30, left: 60 } }
@@ -64,6 +64,35 @@ describe('paths', () => {
     const data = points([100, 120])
     const path = areaPath(data, buildScale(data, GEOMETRY), 270)
     expect(path.endsWith('Z')).toBe(true)
+  })
+})
+
+describe('benchmark reference', () => {
+  it('shares the value scale without changing strategy date positions', () => {
+    const data = points([100, 110, 120])
+    const scale = buildScale(data, GEOMETRY, 0.12, points([100, 160]))
+    expect(scale.max).toBeGreaterThan(160)
+    expect(scale.x(2)).toBe(890)
+  })
+
+  it('aligns dates and leaves gaps and the unfinished session unavailable', () => {
+    const data = points([100, 110, 120, 130])
+    const reference = [points([100])[0]!, points([100, 110, 140])[2]!]
+    const aligned = alignReference(data, reference)
+    expect(aligned.map(point => point?.equity ?? null)).toEqual([100, null, 140, null])
+    const scale = buildScale(data, GEOMETRY, 0.12, reference)
+    const path = referencePath(aligned, scale)
+    expect(path.match(/M /g)).toHaveLength(2)
+    expect(path).not.toContain('L ')
+    expect(path).toContain(`M ${scale.x(2)} ${scale.y(140)}`)
+  })
+
+  it('draws a complete reference and handles older snapshots without one', () => {
+    const data = points([100, 110, 120])
+    const scale = buildScale(data, GEOMETRY)
+    expect(referencePath(alignReference(data, data), scale).match(/L /g)).toHaveLength(2)
+    expect(referencePath(alignReference(data, []), scale)).toBe('')
+    expect(referencePath(alignReference([], data), scale)).toBe('')
   })
 })
 

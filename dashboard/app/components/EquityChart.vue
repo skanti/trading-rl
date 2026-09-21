@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { areaPath, buildScale, gridValues, linePath, tickIndices } from '~/utils/chart'
+import { alignReference, areaPath, buildScale, gridValues, linePath, referencePath, tickIndices } from '~/utils/chart'
 import { formatAxisCurrency, formatCurrency, formatDay, formatSignedCurrency, formatSignedPercent, toneClass } from '~/utils/format'
-import type { EquityPoint } from '~/types/dashboard'
+import type { Benchmark, EquityPoint } from '~/types/dashboard'
 
 const props = withDefaults(defineProps<{
   points: EquityPoint[]
+  benchmark?: Benchmark
   baseline?: number
   height?: number
   sessions?: number
@@ -13,6 +14,7 @@ const props = withDefaults(defineProps<{
   openPositions?: number
 }>(), {
   baseline: undefined,
+  benchmark: undefined,
   height: 300,
   sessions: undefined,
   openPnl: 0,
@@ -62,7 +64,12 @@ const openPoint = computed<EquityPoint | null>(() => {
 const displayPoints = computed(() => openPoint.value
   ? [...props.points, openPoint.value]
   : props.points)
-const scale = computed(() => buildScale(displayPoints.value, geometry.value))
+const referencePoints = computed(() => alignReference(displayPoints.value, props.benchmark?.points ?? []))
+const visibleReference = computed(() => referencePoints.value.filter((point): point is EquityPoint => point !== null))
+const scale = computed(() => buildScale(displayPoints.value, geometry.value, 0.12, visibleReference.value))
+const referenceLine = computed(() => referencePath(referencePoints.value, scale.value))
+const referenceLatest = computed(() => visibleReference.value.at(-1))
+const referenceActive = computed(() => hovered.value === null ? referenceLatest.value : referencePoints.value[hovered.value])
 const latest = computed(() => displayPoints.value[displayPoints.value.length - 1]?.equity ?? 0)
 const palette = computed(() => {
   const change = latest.value - anchor.value
@@ -218,6 +225,21 @@ function shortDay(day: string | null | undefined): string {
         </div>
       </div>
 
+      <div class="mb-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-slate-400">
+        <span class="inline-flex items-center gap-2">
+          <span class="inline-block w-5 border-t border-dashed border-slate-400" />
+          SPY buy &amp; hold
+          <span
+            v-if="referenceActive"
+            class="numeric"
+          >{{ formatCurrency(referenceActive.equity) }} ({{ formatSignedPercent(referenceActive.profit_loss_pct) }})</span>
+          <span v-else>{{ benchmark?.status === 'pending' ? 'Awaiting first close' : 'Unavailable for this date' }}</span>
+        </span>
+        <span class="text-slate-500">
+          Adjusted daily close<span v-if="referenceActive"> · {{ shortDay(referenceActive.day) }}</span>
+        </span>
+      </div>
+
       <div
         ref="chartHost"
         class="min-w-0"
@@ -228,7 +250,7 @@ function shortDay(day: string | null | undefined): string {
           :style="{ height: `${height}px` }"
           preserveAspectRatio="xMidYMid meet"
           role="img"
-          :aria-label="`Strategy equity from ${dayLabel(points[0]?.day)} to ${dayLabel(displayPoints[displayPoints.length - 1]?.day)}`"
+          :aria-label="`Strategy equity with SPY buy-and-hold daily-close reference from ${dayLabel(points[0]?.day)} to ${dayLabel(displayPoints[displayPoints.length - 1]?.day)}`"
           @pointerdown="onMove"
           @pointermove="onMove"
           @pointerleave="hovered = null"
@@ -292,6 +314,18 @@ function shortDay(day: string | null | undefined): string {
             :fill="`url(#${gradientId})`"
           />
           <path
+            v-if="referenceLine"
+            :d="referenceLine"
+            fill="none"
+            stroke="#94a3b8"
+            stroke-opacity="0.65"
+            stroke-width="1.5"
+            stroke-dasharray="5 4"
+            stroke-linejoin="round"
+            stroke-linecap="round"
+            vector-effect="non-scaling-stroke"
+          />
+          <path
             :d="line"
             fill="none"
             :stroke="seriesColor"
@@ -342,6 +376,15 @@ function shortDay(day: string | null | undefined): string {
           />
 
           <g v-if="active">
+            <circle
+              v-if="referenceActive"
+              :cx="active.x"
+              :cy="scale.y(referenceActive.equity)"
+              r="3"
+              fill="#94a3b8"
+              stroke="#020617"
+              stroke-width="2"
+            />
             <line
               :x1="active.x"
               :x2="active.x"

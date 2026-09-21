@@ -25,13 +25,14 @@ export interface ChartScale {
 export function buildScale(
   points: EquityPoint[],
   geometry: ChartGeometry,
-  domainPaddingRatio = 0.12
+  domainPaddingRatio = 0.12,
+  referencePoints: EquityPoint[] = []
 ): ChartScale {
   const { width, height, padding } = geometry
   const innerWidth = Math.max(1, width - padding.left - padding.right)
   const innerHeight = Math.max(1, height - padding.top - padding.bottom)
 
-  const values = points.map(point => point.equity).filter(value => Number.isFinite(value))
+  const values = [...points, ...referencePoints].map(point => point.equity).filter(value => Number.isFinite(value))
   let min = values.length ? Math.min(...values) : 0
   let max = values.length ? Math.max(...values) : 1
 
@@ -56,6 +57,26 @@ export function buildScale(
     innerWidth,
     innerHeight
   }
+}
+
+/** Match dates, never stretch a shorter reference over the strategy's whole axis. */
+export function alignReference(points: EquityPoint[], reference: EquityPoint[]): (EquityPoint | null)[] {
+  const byDay = new Map(reference.filter(point => Number.isFinite(point.equity)).map(point => [point.day, point]))
+  return points.map(point => byDay.get(point.day) ?? null)
+}
+
+/** Break the reference line at missing observations instead of implying flat returns. */
+export function referencePath(points: (EquityPoint | null)[], scale: ChartScale): string {
+  let connected = false
+  return points.map((point, index) => {
+    if (!point) {
+      connected = false
+      return ''
+    }
+    const command = connected ? 'L' : 'M'
+    connected = true
+    return `${command} ${scale.x(index)} ${scale.y(point.equity)}`
+  }).filter(Boolean).join(' ')
 }
 
 /** `d` attribute for the equity line. */

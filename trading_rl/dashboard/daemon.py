@@ -27,6 +27,7 @@ import requests
 
 from . import digest as dashboard_digest
 from . import metrics as performance
+from .benchmark import spy_buy_and_hold
 from .config import (
     DashboardConfigError,
     load_dashboard_config,
@@ -40,10 +41,11 @@ from trading_rl.overnight.broker_fees import (
     cache_fee_activities,
 )
 from trading_rl.overnight.live_config import DEFAULT_LIVE_CONFIG_PATH
+from trading_rl.market_data.bars import download_alpaca_bars
 
 LOGGER = logging.getLogger("dashboard-daemon")
 
-SNAPSHOT_VERSION = 6
+SNAPSHOT_VERSION = 7
 SESSIONS_SUBCOLLECTION = "sessions"
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 DEFAULT_WORK_DIRS = {
@@ -175,8 +177,15 @@ class AlpacaClient:
         trading_url: str = PAPER_TRADING_URL,
         timeout_seconds: float = 30.0,
         max_retries: int = 4,
+        *,
+        data_key: str | None = None,
+        data_secret: str | None = None,
+        data_url: str = "https://data.alpaca.markets/v2",
     ) -> None:
+        if (data_key is None) != (data_secret is None):
+            raise ValueError("data_key and data_secret must be provided together")
         self.trading_url = _normalize_api_base(trading_url)
+        self.data_url = _normalize_api_base(data_url)
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = int(max_retries)
         self.session = requests.Session()
@@ -188,27 +197,44 @@ class AlpacaClient:
                 "User-Agent": "trading-dashboard/1",
             }
         )
+        self.data_session = requests.Session()
+        self.data_session.headers.update({
+            **self.session.headers,
+            "APCA-API-KEY-ID": data_key or key,
+            "APCA-API-SECRET-KEY": data_secret or secret,
+        })
 
-    def _get(self, path: str, **params: object) -> Any:
-        url = f"{self.trading_url}/{path.lstrip('/')}"
-        for attempt in range(self.max_retries + 1):
+    def _get(self, path: str, *, data: bool = False, **params: object) -> Any:
+        url = f"{self.data_url if data else self.trading_url}/{path.lstrip('/')}"
+        session = self.data_session if data else self.session
+        retries = min(self.max_retries, 1) if data else self.max_retries
+        timeout = min(self.timeout_seconds, 10.0) if data else self.timeout_seconds
+        for attempt in range(retries + 1):
             try:
-                response = self.session.get(url, params=params, timeout=self.timeout_seconds)
+                response = session.get(url, params=params, timeout=timeout)
                 if 200 <= response.status_code < 300:
                     return response.json() if response.content else None
                 if response.status_code != 429 and response.status_code < 500:
                     response.raise_for_status()
             except requests.RequestException:
-                if attempt >= self.max_retries:
+                if attempt >= retries:
                     raise
                 time_module.sleep(min(2**attempt, 8))
                 continue
-            if attempt >= self.max_retries:
+            if attempt >= retries:
                 response.raise_for_status()
             retry_after = response.headers.get("Retry-After")
             delay = float(retry_after) if retry_after and retry_after.isdigit() else min(2**attempt, 8)
+            if data:
+                delay = min(delay, 8.0)
             time_module.sleep(delay)
         raise AssertionError("unreachable retry loop")
+
+    def spy_daily_bars(self, start: date, end: datetime) -> list[dict[str, Any]]:
+        return download_alpaca_bars(
+            ["SPY"], start, end, "1Day", "sip", "all",
+            lambda params: self._get("stocks/bars", data=True, **params),
+        )["SPY"]
 
     def account(self) -> dict[str, Any]:
         return dict(self._get("account"))
@@ -713,6 +739,17 @@ def build_snapshot(
         }
     stats = performance.statistics(confirmed_series, baseline_is_first=True)
 
+    # Never use the unfinished current daily bar, including an intraday close.
+    benchmark_end = reference.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(microseconds=1)
+    benchmark = spy_buy_and_hold(series, [], benchmark_end.date())
+    if series and series[0].day <= benchmark_end.date():
+        try:
+            benchmark = spy_buy_and_hold(
+                series, client.spy_daily_bars(series[0].day, benchmark_end), benchmark_end.date(),
+            )
+        except Exception:  # noqa: BLE001 - an optional reference must not prevent publication
+            LOGGER.warning("could not load the SPY daily-close reference; publishing without it")
+
     position = state.get("position") or {}
     closed = performance.closed_basket(position) if position else []
     if position.get("status") == "closed" and position.get("entry_date"):
@@ -737,6 +774,7 @@ def build_snapshot(
         "account": _numeric(account, _ACCOUNT_FIELDS),
         "performance": performance_payload,
         "statistics": stats.as_dict(),
+        "benchmark": benchmark,
         "equity_curve": [
             {
                 "day": point.day.isoformat(),
@@ -969,7 +1007,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     key, secret = load_credentials()
-    client = AlpacaClient(key, secret, trading_url)
+    client = AlpacaClient(
+        key, secret, trading_url,
+        data_key=os.environ.get("ALPACA_DATA_KEY"),
+        data_secret=os.environ.get("ALPACA_DATA_SECRET"),
+        data_url=os.environ.get("ALPACA_DATA_URL") or "https://data.alpaca.markets/v2",
+    )
 
     def publish_once() -> None:
         reference = datetime.now(tz=UTC)
