@@ -95,7 +95,7 @@ class BacktestCliTest(unittest.TestCase):
         self.assertEqual(args.exit_price_source, "opening-auction")
         self.assertEqual(args.entry_time, 15 * 60 + 45)
         self.assertEqual(args.exit_time, 9 * 60 + 30)
-        self.assertEqual(args.transaction_cost_bps, 0.0)
+        self.assertIsNone(args.transaction_cost_bps)
         self.assertEqual(args.entry_price_source, reconciliation.entry_price_source)
         self.assertEqual(args.exit_price_source, reconciliation.exit_price_source)
         self.assertEqual(
@@ -107,7 +107,7 @@ class BacktestCliTest(unittest.TestCase):
         alternate_exit = build_parser().parse_args([
             "--exit-price-source", "nbbo-bid", "--exit-time", "09:35",
         ])
-        self.assertEqual(alternate_exit.transaction_cost_bps, 0.0)
+        self.assertIsNone(alternate_exit.transaction_cost_bps)
         explicit_cost = build_parser().parse_args(["--transaction-cost-bps", "1"])
         self.assertEqual(explicit_cost.transaction_cost_bps, 1.0)
 
@@ -665,7 +665,6 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
             "stale_exit_marks_over_10_minutes": 0,
             "maximum_exit_staleness_minutes": 1.0,
             "strategy_metrics": metrics,
-            "spy_overnight_metrics": metrics,
             "spy_buy_and_hold_metrics": metrics,
         }
         for entry in (*MINUTE_PRICE_COLUMNS, "nbbo-ask"):
@@ -679,9 +678,9 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
                     print_summary_table(summary, console)
                     rendered = console.export_text()
 
-                    self.assertIn("Overnight liquidity baseline", rendered)
+                    self.assertIn("Liquidity: fixed exposure", rendered)
                     self.assertIn("Top 50", rendered)
-                    self.assertIn("SPY overnight", rendered)
+                    self.assertNotIn("SPY overnight", rendered)
                     self.assertIn("SPY buy & hold", rendered)
                     self.assertNotIn('"strategy_metrics"', rendered)
                     self.assertRegex(rendered, rf"Entry price source\s+{entry}:.*15:45")

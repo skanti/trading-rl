@@ -10,29 +10,29 @@ client order IDs make the workflow restartable and idempotent.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
 import fcntl
 import json
 import logging
 import math
 import os
-from pathlib import Path
 import tempfile
 import threading
 import time as time_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import requests
-from rich.console import Console
-from rich.table import Table
 from omegaconf import DictConfig
 from omegaconf.errors import OmegaConfBaseException
+from rich.console import Console
+from rich.table import Table
 
 from trading_rl.market_data.bars import (
     BAR_COLUMNS,
@@ -44,18 +44,18 @@ from trading_rl.market_data.bars import (
 )
 from trading_rl.market_data.calendar import calendar_session_supports_entry
 
+from .callbacks import (
+    RankingFailureCallback,
+    RankingFailureEmail,
+    notify_ranking_failure,
+)
+from .decision_replay import capture_decision_inputs
+from .entry_sizing import available_budget, trend_vol_budget
 from .history import (
     DEFAULT_SECURITY_MASTER_CACHE,
     _security_symbol,
     is_company_security,
     load_nasdaq_security_master,
-)
-from .backtest import (
-    basket_quantities,
-)
-from .ranking import (
-    causal_completed_trading_days, issuer_key, liquidity_scores,
-    ranked_indices, select_ranked_indices,
 )
 from .live_config import (
     DEFAULT_LIVE_CONFIG_PATH,
@@ -64,7 +64,24 @@ from .live_config import (
     effective_live_settings,
     load_live_settings,
 )
-
+from .live_risk import prepare_live_risk, signal_is_current
+from .portfolio import (
+    basket_quantities,
+    equal_notional,
+    market_entry_order,
+)
+from .portfolio import (
+    client_order_id as _client_order_id,
+)
+from .portfolio import (
+    select_unconflicted_candidates as _select_unconflicted_candidates,
+)
+from .ranking import (
+    issuer_key,
+    liquidity_features,
+    ranked_indices,
+)
+from .strategies import STRATEGIES, LiquidityTrendVolConfig
 
 EASTERN = ZoneInfo("America/New_York")
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
@@ -237,6 +254,12 @@ class DailyArtifacts:
         exit_notional = filled_notional(exit_orders)
         realized_pnl = exit_notional - entry_notional if exit_orders else None
         configuration: dict[str, object] = {
+            "strategy_name": position.get("strategy_name", "liquidity-fixed")
+            if position.get("entry_date") == day.isoformat()
+            else config.strategy_name,
+            "risk_parameters": position.get("strategy_parameters", {})
+            if position.get("entry_date") == day.isoformat()
+            else config.risk_config.as_dict(),
             "top": config.top,
             "ema_span": config.ema_span,
             "min_history_days": config.min_history_days,
@@ -273,7 +296,10 @@ class DailyArtifacts:
                     "could not read session schedule from %s", effective_path
                 )
         existing_configuration = existing.get("configuration")
-        if isinstance(existing_configuration, Mapping):
+        if isinstance(existing_configuration, Mapping) and (
+            (existing.get("position") or {}).get("entry_date") == day.isoformat()
+            or (existing.get("ranking") or {}).get("trade_date") == day.isoformat()
+        ):
             # The first write on the entry day is the immutable configuration record.
             # An exit may be written after a restart with different defaults.
             configuration = dict(existing_configuration)
@@ -294,7 +320,7 @@ class DailyArtifacts:
 
         summary: dict[str, object] = {
             "version": 1,
-            "strategy": "overnight_liquidity_long",
+            "strategy": configuration.get("strategy_name", "liquidity-fixed"),
             "trading_day": day.isoformat(),
             "updated_at": _iso_now(),
             "last_action": action,
@@ -692,6 +718,12 @@ class StrategyConfig:
     entry_preflight_seconds: float
     share_mode: str
     quote_max_age_seconds: float
+    strategy_name: str = "liquidity-fixed"
+    risk_config: LiquidityTrendVolConfig = field(default_factory=LiquidityTrendVolConfig)
+    risk_minute_bars_dir: Path = Path("/data/ppv1/updates/bars_1min_2022-01-01")
+    risk_nbbo_path: Path = Path("/data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz")
+    risk_auctions_path: Path = Path("/data/ppv1/updates/alpaca_auctions_2022-01-01.npz")
+    entry_minute: int = 945
 
 
 class StateStore:
@@ -1158,11 +1190,11 @@ def completed_liquidity_ranking(
                 price = _float(bar.get("c"), "bar.c")
             if volume > 0.0 and price > 0.0:
                 values[row, column] = price * volume
-    score_matrix = liquidity_scores(
+    score_matrix, completed_counts = liquidity_features(
         values, scheme, ema_span, min_history_days, dispersion_span=dispersion_span,
     )
     latest_scores = score_matrix[-1]
-    observations = causal_completed_trading_days(values)[-1]
+    observations = completed_counts[-1]
     required_sessions = (
         int(min_history_days)
         if minimum_trading_days is None
@@ -1266,14 +1298,24 @@ def rank_for_day(
     trade_date: date,
     now: datetime | None = None,
     artifacts: DailyArtifacts | None = None,
+    *,
+    on_ranking_failure: RankingFailureCallback | None = None,
 ) -> dict[str, Any]:
-    with store.locked():
+    log_root = artifacts.work_dir if artifacts is not None else store.path.parent
+    with notify_ranking_failure(
+        on_ranking_failure, trade_date, config.strategy_name,
+        log_root / trade_date.isoformat() / "live.log",
+    ), store.locked():
         state = store.load()
         prior = state.get("ranking") or {}
         if (
             prior.get("trade_date") == trade_date.isoformat()
             and prior.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
             and prior.get("liquidity_scheme") == config.liquidity_scheme
+            and (
+                config.strategy_name != "liquidity-trend-vol"
+                or signal_is_current(prior.get("risk_signal"), config, trade_date)
+            )
         ):
             LOGGER.info("ranking for %s already exists; reusing it", trade_date)
             return dict(prior)
@@ -1470,6 +1512,15 @@ def rank_for_day(
                 )
             ],
         }
+        if config.strategy_name == "liquidity-trend-vol":
+            result["risk_signal"] = prepare_live_risk(
+                client,
+                config,
+                trade_date,
+                security_master,
+                store.path.parent,
+                now,
+            )
         state["ranking"] = result
         state["updated_at"] = _iso_now(now)
         store.save(state)
@@ -1506,42 +1557,6 @@ def _print_ranking(ranking: Mapping[str, object], top: int) -> None:
         f"historical members; {ranking['eligible_asset_count']} currently eligible companies; "
         f"{ranking['candidate_diagnostics']['cache_symbols']} broad-cache symbols refreshed"
     )
-
-
-def _client_order_id(entry_date: date, side: str, symbol: str, attempt: int = 1) -> str:
-    clean_symbol = "".join(
-        character for character in symbol.upper() if character.isalnum()
-    )
-    marker = "e" if side == "buy" else "x"
-    suffix = "" if attempt == 1 else f"-{attempt}"
-    return f"olq-{entry_date:%Y%m%d}-{marker}-{clean_symbol}{suffix}"[:128]
-
-
-def available_budget(account: Mapping[str, object], config: StrategyConfig) -> float:
-    cash = max(0.0, _float(account.get("cash"), "account.cash"))
-    buying_power_value = account.get("buying_power")
-    stock_buying_power = (
-        max(0.0, _float(buying_power_value, "account.buying_power"))
-        if buying_power_value is not None
-        else cash
-    )
-    # These are marginable US equities. ``non_marginable_buying_power`` tracks
-    # settled dollars for assets such as crypto and can exclude same-day stock-sale
-    # proceeds until T+1, even though Alpaca permits those proceeds to be reused for
-    # equities immediately. Cap at cash to avoid borrowing, and at regular buying
-    # power so account restrictions or other open orders are still respected.
-    usable_cash = cash * (1.0 - config.cash_buffer_fraction)
-    requested = (
-        config.capital if config.capital is not None else cash * config.capital_fraction
-    )
-    budget = min(float(requested), usable_cash, stock_buying_power)
-    if budget <= 0.0:
-        raise RuntimeError("account has no cash available for the basket")
-    if budget / config.top < 1.0:
-        raise RuntimeError(
-            "per-symbol notional would be below Alpaca's $1 fractional minimum"
-        )
-    return math.floor(budget * 100.0) / 100.0
 
 
 def whole_share_order_plan(
@@ -1625,6 +1640,26 @@ def _order_summary(order: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _exit_order_summary(order, position):
+    """Record broker receipt against Nasdaq's cutoff, including fractional DAY exits."""
+    summary = _order_summary(order)
+    received = order.get("submitted_at")
+    before_cutoff = None
+    if received:
+        try:
+            stamp = _parse_timestamp(str(received))
+            if stamp.tzinfo is not None:
+                local = stamp.astimezone(EASTERN)
+                before_cutoff = local.date().isoformat() == position.get(
+                    "exit_date"
+                ) and local.time() < time(9, 28)
+        except (TypeError, ValueError):
+            pass
+    summary["received_before_nasdaq_open_cutoff"] = before_cutoff
+    summary["opening_price_basis"] = "nasdaq-official-open-before-09:28"
+    return summary
+
+
 def _submit_entry_order(
     client: AlpacaClient,
     symbol: str,
@@ -1693,7 +1728,7 @@ def _capture_flat_exit_account_snapshot(
             )
             return False
         account = client.account()
-    except Exception as error:  # noqa: BLE001 - a snapshot cannot hold up a completed exit
+    except Exception as error:
         LOGGER.warning("could not record the flat exit account snapshot: %s", error)
         return False
 
@@ -1760,47 +1795,6 @@ def _wait_for_orders(
     return latest
 
 
-def _select_unconflicted_candidates(
-    ranking: Mapping[str, object],
-    held_symbols: set[str],
-    open_order_symbols: set[str],
-    top: int,
-    dedupe_share_classes: bool = True,
-) -> list[str]:
-    """Take the top ranked candidates, skipping conflicts and duplicate share classes.
-
-    Alphabet lists as both GOOGL and GOOG, and the liquidity ranking scores them
-    separately, so a basket can hold one company at double weight while reporting the
-    nominal size. Candidates are walked in rank order, so the first class encountered is
-    the more liquid one and the basket backfills from further down the reserve.
-
-    A ranking written before issuers were recorded has no ``issuer`` field; such a
-    candidate falls back to its own symbol, which disables deduping rather than failing.
-    """
-    # Broker conflicts are live-specific eligibility constraints. Preserve the
-    # archived ranking order and delegate issuer deduplication/top-N to the core.
-    candidates = [
-        candidate for candidate in ranking["candidates"]
-        if str(candidate["symbol"]) not in held_symbols | open_order_symbols
-    ]
-    symbols = np.asarray([str(candidate["symbol"]) for candidate in candidates])
-    issuers = {
-        str(candidate["symbol"]): str(candidate.get("issuer") or candidate["symbol"])
-        for candidate in candidates
-    }
-    try:
-        selected = select_ranked_indices(
-            np.arange(len(symbols)), symbols, top,
-            issuers=issuers if dedupe_share_classes else None,
-        )
-    except ValueError as error:
-        raise RuntimeError(
-            "not enough ranked candidates remain after excluding existing positions/orders: "
-            + str(error)
-        ) from error
-    return symbols[selected].tolist()
-
-
 def enter_for_day(
     client: AlpacaClient,
     store: StateStore,
@@ -1840,6 +1834,7 @@ def enter_for_day(
             budget = float(previous["budget"])
             per_symbol = float(previous["per_symbol_notional"])
             position = dict(previous)
+            position.setdefault("strategy_name", "liquidity-fixed")
             share_mode = str(position.get("share_mode") or "fractional")
             if share_mode != config.share_mode:
                 LOGGER.warning(
@@ -1854,16 +1849,41 @@ def enter_for_day(
                     f"strategy position from {previous.get('entry_date')} is still {previous.get('status')}"
                 )
             preflight_started_at = now or datetime.now(tz=EASTERN)
-            held_symbols = {str(item["symbol"]) for item in client.positions()}
-            open_order_symbols = {
-                str(item["symbol"]) for item in client.list_orders("open")
-            }
+            held_positions = client.positions()
+            open_orders = client.list_orders("open")
+            held_symbols = {str(item["symbol"]) for item in held_positions}
+            open_order_symbols = {str(item["symbol"]) for item in open_orders}
             selected = _select_unconflicted_candidates(
                 ranking, held_symbols, open_order_symbols, config.top
             )
             account = client.account()
-            budget = available_budget(account, config)
-            per_symbol = math.floor((budget / config.top) * 100.0) / 100.0
+            risk = None
+            selected_assets = []
+            exposure_sizing = None
+            if config.strategy_name == "liquidity-trend-vol":
+                risk = ranking.get("risk_signal")
+                if not signal_is_current(risk, config, trade_date):
+                    raise RuntimeError(
+                        "a current complete risk signal is required; run ranking preparation first"
+                    )
+                assets = {str(asset["symbol"]): asset for asset in client.list_assets()}
+                if any(symbol not in assets for symbol in selected):
+                    raise RuntimeError(
+                        "selected asset metadata is unavailable for margin validation"
+                    )
+                selected_assets = [assets[symbol] for symbol in selected]
+                exposure_sizing = trend_vol_budget(
+                    account,
+                    config,
+                    risk["target_exposure"],
+                    held_positions,
+                    open_orders,
+                    selected_assets,
+                )
+                budget = exposure_sizing["budget"]
+            else:
+                budget = available_budget(account, config)
+            per_symbol = equal_notional(budget, config.top, round_to_cents=True)
             share_mode = config.share_mode
             sizing: dict[str, object] = {}
             if share_mode == "whole":
@@ -1875,6 +1895,15 @@ def enter_for_day(
                     config.quote_max_age_seconds,
                 )
             position = {
+                "strategy_name": config.strategy_name,
+                "decision_inputs": capture_decision_inputs(
+                    config, account, held_positions, open_orders, selected_assets,
+                ),
+                "benchmark_paths": {"entry_nbbo": str(config.risk_nbbo_path),
+                                    "opening_auctions": str(config.risk_auctions_path)},
+                "risk_signal": risk,
+                "exposure_sizing": exposure_sizing,
+                "strategy_parameters": config.risk_config.as_dict() if risk else {},
                 "entry_date": trade_date.isoformat(),
                 "exit_date": _next_session(client, trade_date).isoformat(),
                 # The global ranking is replaced on the next session. Keep the exact
@@ -1954,20 +1983,12 @@ def enter_for_day(
 
         payloads: dict[str, dict[str, object]] = {}
         for symbol in order_symbols:
-            client_id = _client_order_id(trade_date, "buy", symbol)
             size = (
                 {"qty": str(target_quantities[symbol])}
                 if share_mode == "whole"
                 else {"notional": f"{per_symbol:.2f}"}
             )
-            payloads[symbol] = {
-                "symbol": symbol,
-                **size,
-                "side": "buy",
-                "type": "market",
-                "time_in_force": "day",
-                "client_order_id": client_id,
-            }
+            payloads[symbol] = market_entry_order(trade_date, symbol, size)
 
         recover_existing = bool(position.get("entry_dispatch_started_at"))
         dispatch_started_at = datetime.now(tz=EASTERN)
@@ -2010,7 +2031,7 @@ def enter_for_day(
                 symbol = futures[future]
                 try:
                     _, order, telemetry = future.result()
-                except Exception as error:  # noqa: BLE001 - persist partial dispatch
+                except Exception as error:
                     failures[symbol] = error
                 else:
                     results[symbol] = (order, telemetry)
@@ -2175,7 +2196,7 @@ def exit_position(
                 )
             attempts[symbol] = attempt
             submitted[symbol] = order
-            position.setdefault("exit_orders", {})[symbol] = _order_summary(order)
+            position.setdefault("exit_orders", {})[symbol] = _exit_order_summary(order, position)
             state["position"] = position
             store.save(state)
 
@@ -2188,7 +2209,7 @@ def exit_position(
                 _client_order_id(entry_date, "sell", symbol, attempt)
             )
             if order is not None:
-                position.setdefault("exit_orders", {})[symbol] = _order_summary(order)
+                position.setdefault("exit_orders", {})[symbol] = _exit_order_summary(order, position)
 
         if not wait_for_fill:
             remaining = [
@@ -2221,7 +2242,7 @@ def exit_position(
             cancel_on_timeout=False,
         )
         for symbol, order in final_orders.items():
-            position["exit_orders"][symbol] = _order_summary(order)
+            position["exit_orders"][symbol] = _exit_order_summary(order, position)
         remaining = [
             symbol for symbol in owned_symbols if client.position(symbol) is not None
         ]
@@ -2279,6 +2300,14 @@ def _print_entry_plan(
     else:
         title = (
             "Overnight basket entry" if submit else "DRY RUN — overnight basket entry"
+        )
+    console.print(f"Strategy: {position.get('strategy_name', 'liquidity-fixed')}")
+    if position.get("exposure_sizing"):
+        sizing = position["exposure_sizing"]
+        signal = position["risk_signal"]
+        console.print(
+            f"Signal through {signal['completed_exit_date']}: target {sizing['target_exposure']:.3f}x; "
+            f"allocated {sizing['effective_exposure']:.3f}x after buffer/limits ({sizing['binding_limit']})"
         )
     table = Table(title=title)
     table.add_column("Symbol")
@@ -2450,6 +2479,8 @@ def run_daemon(
     minimum_ranking_lead_minutes: int,
     entry_grace_seconds: int,
     artifacts: DailyArtifacts,
+    *,
+    on_ranking_failure: RankingFailureCallback | None = None,
 ) -> None:
     LOGGER.info(
         "daemon started: rank %s, enter %s, exit %s America/New_York",
@@ -2555,10 +2586,19 @@ def run_daemon(
                     ranking.get("trade_date") != today.isoformat()
                     or ranking.get("ranking_pipeline_version")
                     != RANKING_PIPELINE_VERSION
+                    or (
+                        config.strategy_name == "liquidity-trend-vol"
+                        and not signal_is_current(
+                            ranking.get("risk_signal"), config, today
+                        )
+                    )
                 )
                 and may_attempt("rank", now)
             ):
-                result = rank_for_day(client, store, config, today, artifacts=artifacts)
+                result = rank_for_day(
+                    client, store, config, today, artifacts=artifacts,
+                    on_ranking_failure=on_ranking_failure,
+                )
                 _print_ranking(result, config.top)
                 artifacts.write_summary(today, "rank", store, config)
             state = store.load()
@@ -2575,6 +2615,10 @@ def run_daemon(
             ranking_ready = (
                 ranking.get("trade_date") == today.isoformat()
                 and ranking.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
+                and (
+                    config.strategy_name != "liquidity-trend-vol"
+                    or signal_is_current(ranking.get("risk_signal"), config, today)
+                )
             )
             ranking_early = ranking_ready and _ranking_is_early_enough(
                 ranking, entry_at, minimum_ranking_lead_minutes
@@ -2694,6 +2738,22 @@ def build_parser(
         default="America/New_York",
         help="exchange schedule time zone (fixed for US equities)",
     )
+    parser.add_argument("--strategy", dest="strategy_name", choices=STRATEGIES)
+    parser.add_argument("--ranking-failure-email", help="admin recipient; empty disables email")
+    parser.add_argument("--smtp-config-path", type=Path, help="YAML containing existing smtp settings")
+    parser.add_argument("--smtp-timeout-seconds", type=float)
+    for parameter in (
+        "volatility_target",
+        "max_exposure",
+        "warmup_exposure",
+        "weak_trend_multiplier",
+    ):
+        parser.add_argument("--" + parameter.replace("_", "-"), type=float)
+    for parameter in ("volatility_window", "trend_window"):
+        parser.add_argument("--" + parameter.replace("_", "-"), type=int)
+    parser.add_argument("--risk-history-start")
+    for parameter in ("risk_minute_bars_dir", "risk_nbbo_path", "risk_auctions_path"):
+        parser.add_argument("--" + parameter.replace("_", "-"), type=Path)
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument(
         "--entry-time",
@@ -2893,6 +2953,24 @@ def parse_live_arguments(
 def _validate_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> StrategyConfig:
+    if not math.isfinite(args.smtp_timeout_seconds) or args.smtp_timeout_seconds <= 0:
+        parser.error("smtp-timeout-seconds must be finite and positive")
+    if args.ranking_failure_email and (
+        "@" not in args.ranking_failure_email
+        or any(char in args.ranking_failure_email for char in "\r\n,;")
+    ):
+        parser.error("ranking-failure-email must be a single email address")
+    if args.strategy_name not in STRATEGIES:
+        parser.error("unknown live strategy")
+    try:
+        risk_config = LiquidityTrendVolConfig(
+            **{
+                key: getattr(args, key)
+                for key in LiquidityTrendVolConfig.__dataclass_fields__
+            }
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if args.time_zone != EASTERN.key:
         parser.error(f"time-zone must be {EASTERN.key} for US equity execution")
     if args.liquidity_scheme not in {"dollar_ema", "turnover_stability"}:
@@ -2988,6 +3066,12 @@ def _validate_args(
     )
     if not exchanges:
         parser.error("exchanges cannot be empty")
+    if args.strategy_name == "liquidity-trend-vol" and exchanges != frozenset(
+        {"NASDAQ"}
+    ):
+        parser.error(
+            "liquidity-trend-vol risk history currently requires the NASDAQ universe"
+        )
     return StrategyConfig(
         top=args.top,
         ema_span=args.ema_span,
@@ -3014,6 +3098,12 @@ def _validate_args(
         entry_preflight_seconds=args.entry_preflight_seconds,
         share_mode=args.share_mode,
         quote_max_age_seconds=args.quote_max_age_seconds,
+        strategy_name=args.strategy_name,
+        risk_config=risk_config,
+        risk_minute_bars_dir=Path(args.risk_minute_bars_dir),
+        risk_nbbo_path=Path(args.risk_nbbo_path),
+        risk_auctions_path=Path(args.risk_auctions_path),
+        entry_minute=args.entry_time.hour * 60 + args.entry_time.minute,
     )
 
 
@@ -3029,6 +3119,7 @@ def _print_effective_configuration(
     table.add_column("Value")
     table.add_row("Config", str(config_path.expanduser().resolve()))
     table.add_row("Action", str(args.action))
+    table.add_row("Strategy", args.strategy_name)
     table.add_row(
         "Orders",
         "SUBMIT ENABLED" if args.submit else "preview / no submission",
@@ -3052,7 +3143,7 @@ def _print_effective_configuration(
     capital = (
         f"${args.capital:,.2f} cap"
         if args.capital is not None
-        else f"{args.capital_fraction:.1%} of cash"
+        else f"{args.capital_fraction:.1%} of {'equity' if args.strategy_name == 'liquidity-trend-vol' else 'cash'}"
     )
     table.add_row(
         "Sizing",
@@ -3124,6 +3215,17 @@ def main() -> None:
     store = StateStore(state_path)
     artifacts = DailyArtifacts(work_dir)
     artifacts.directory(trade_date)
+    ranking_failure_callback = (
+        RankingFailureEmail(
+            args.ranking_failure_email,
+            work_dir / ".ranking-failure-notifications.json",
+            config_path=Path(args.smtp_config_path).expanduser() if args.smtp_config_path else None,
+            timeout_seconds=args.smtp_timeout_seconds,
+            account_mode="paper" if _is_paper_endpoint(args.trading_url) else "live",
+        )
+        if args.ranking_failure_email and args.action in {"run", "rank"}
+        else None
+    )
     if args.action == "status":
         _state_status(store)
         artifacts.write_summary(trade_date, "status", store, config)
@@ -3156,7 +3258,10 @@ def main() -> None:
                 return
         if args.action == "rank":
             _print_ranking(
-                rank_for_day(client, store, config, trade_date, artifacts=artifacts),
+                rank_for_day(
+                    client, store, config, trade_date, artifacts=artifacts,
+                    on_ranking_failure=ranking_failure_callback,
+                ),
                 config.top,
             )
             artifacts.write_summary(trade_date, "rank", store, config)
@@ -3213,6 +3318,7 @@ def main() -> None:
                 args.minimum_ranking_lead_minutes,
                 args.entry_grace_seconds,
                 artifacts,
+                on_ranking_failure=ranking_failure_callback,
             )
     except Exception as error:
         LOGGER.exception("%s action failed: %s", args.action, error)

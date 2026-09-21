@@ -9,7 +9,6 @@ from typing import Any
 
 from omegaconf import MISSING, DictConfig, OmegaConf
 
-
 PACKAGED_LIVE_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 _REPOSITORY_LIVE_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "overnight" / "config.yaml"
@@ -25,6 +24,7 @@ DEFAULT_LIVE_CONFIG_PATH = (
 EFFECTIVE_CONFIG_FILENAME = "effective_config.json"
 
 CONFIG_FIELDS = {
+    "notifications": ("ranking_failure_email", "smtp_config_path", "smtp_timeout_seconds"),
     "schedule": (
         "time_zone",
         "ranking_time",
@@ -34,6 +34,7 @@ CONFIG_FIELDS = {
         "entry_grace_seconds",
     ),
     "strategy": (
+        "name",
         "top",
         "liquidity_scheme",
         "ema_span",
@@ -42,7 +43,19 @@ CONFIG_FIELDS = {
         "liquidity_lookback_days",
         "exchanges",
     ),
+    "risk": (
+        "volatility_target",
+        "max_exposure",
+        "volatility_window",
+        "warmup_exposure",
+        "trend_window",
+        "weak_trend_multiplier",
+        "risk_history_start",
+    ),
     "data": (
+        "risk_minute_bars_dir",
+        "risk_nbbo_path",
+        "risk_auctions_path",
         "daily_bars_dir",
         "shortlist_since",
         "shortlist_daily_top",
@@ -90,6 +103,7 @@ class ScheduleSettings:
 
 @dataclass
 class StrategySettings:
+    name: str = "liquidity-fixed"
     top: int = MISSING
     liquidity_scheme: str = MISSING
     ema_span: int = MISSING
@@ -100,7 +114,21 @@ class StrategySettings:
 
 
 @dataclass
+class RiskSettings:
+    volatility_target: float = 0.35
+    max_exposure: float = 2.0
+    volatility_window: int = 20
+    warmup_exposure: float = 1.0
+    trend_window: int = 100
+    weak_trend_multiplier: float = 0.25
+    risk_history_start: str = "2023-01-01"
+
+
+@dataclass
 class DataSettings:
+    risk_minute_bars_dir: str = "/data/ppv1/updates/bars_1min_2022-01-01"
+    risk_nbbo_path: str = "/data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz"
+    risk_auctions_path: str = "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
     daily_bars_dir: str = MISSING
     shortlist_since: str = MISSING
     shortlist_daily_top: int = MISSING
@@ -139,9 +167,18 @@ class RuntimeSettings:
 
 
 @dataclass
+class NotificationSettings:
+    ranking_failure_email: str | None = None
+    smtp_config_path: str | None = None
+    smtp_timeout_seconds: float = 10.0
+
+
+@dataclass
 class LiveSettings:
+    notifications: NotificationSettings = field(default_factory=NotificationSettings)
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
     strategy: StrategySettings = field(default_factory=StrategySettings)
+    risk: RiskSettings = field(default_factory=RiskSettings)
     data: DataSettings = field(default_factory=DataSettings)
     execution: ExecutionSettings = field(default_factory=ExecutionSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
@@ -157,7 +194,9 @@ def load_live_settings(path: Path | str = DEFAULT_LIVE_CONFIG_PATH) -> DictConfi
     merged = OmegaConf.merge(schema, loaded)
     missing = sorted(OmegaConf.missing_keys(merged))
     if missing:
-        raise ValueError(f"live config is missing required values: {', '.join(missing)}")
+        raise ValueError(
+            f"live config is missing required values: {', '.join(missing)}"
+        )
     OmegaConf.resolve(merged)
     OmegaConf.set_readonly(merged, True)
     return merged
@@ -170,6 +209,8 @@ def argparse_defaults(settings: DictConfig) -> dict[str, Any]:
         payload = OmegaConf.to_container(settings[section], resolve=True)
         if not isinstance(payload, dict):
             raise TypeError(f"live config section {section!r} must be a mapping")
+        if section == "strategy":
+            payload["strategy_name"] = payload.pop("name")
         values.update(payload)
     return values
 
@@ -180,7 +221,10 @@ def effective_live_settings(values: Any) -> dict[str, dict[str, Any]]:
     for section, fields in CONFIG_FIELDS.items():
         section_values: dict[str, Any] = {}
         for name in fields:
-            value = getattr(values, name)
+            value = getattr(
+                values,
+                "strategy_name" if section == "strategy" and name == "name" else name,
+            )
             if isinstance(value, (date, time)):
                 value = (
                     value.isoformat(timespec="minutes")

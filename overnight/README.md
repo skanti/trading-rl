@@ -41,19 +41,23 @@ Run the tests from this directory:
 python -m unittest discover -s tests
 ```
 
-The backtester defaults to **0.0 bps per side** of additional transaction costs,
-including when overriding the price sources. Set `--transaction-cost-bps 1`
-explicitly for a 1 bp-per-side cost assumption. The reconciler retains its
-source-dependent default: **0.0 bps** for `nbbo-ask` → `opening-auction` and
+The backtester and reconciler use source-dependent additional cost defaults: **0.0 bps** for `nbbo-ask` → `opening-auction` and
 **1.0 bp** for other source pairs, with explicit overrides supported.
 Zero assumes no additional fees or slippage beyond the selected prices;
 reconciliation still reports actual broker fees separately.
 The potentially long per-symbol trade-frequency table is hidden by default;
 include `--show-symbol-trade-frequency` when that breakdown is needed.
 
-The comparison table shows starting and ending capital for the strategy and both
-SPY benchmarks, using the same starting amount from `--budget`. Without a budget,
+The comparison table shows starting and ending capital for the strategy and the
+SPY buy-and-hold benchmark, using the same starting amount from `--budget`. Without a budget,
 capital is normalized to a $1.00 start. Unavailable benchmark results show `n/a`.
+
+Backtests default to `liquidity-trend-vol` for volatility targeting with a SPY
+trend filter. Choose `--strategy liquidity-fixed` for fixed exposure.
+See [strategy configuration and variant comparisons](STRATEGIES.md).
+`liquidity-trend-vol` outputs are grouped under
+`/tmp/trading-backtests/candidate/liquidity-trend-vol/`; `--output-dir` selects a
+run directory for either strategy.
 
 Every CLI backtest also writes a WebP equity plot for the strategy and SPY buy &
 hold under `/tmp/trading-backtests` (or the configured system temporary directory).
@@ -738,18 +742,42 @@ dashboard publisher prefers that active-runtime artifact and falls back to YAML 
 does not exist, so an override or an unapplied YAML edit cannot make the displayed
 schedule drift from the running trader.
 
-`--capital-fraction` defaults to `1.0`. Basket sizing remains cash-only even on a
-margin-enabled account. The requested
-capital is capped by positive cash after `--cash-buffer-fraction` and by Alpaca's
-regular stock `buying_power`. It deliberately does not use
-`non_marginable_buying_power`, because that settlement-sensitive field can exclude
-same-day stock-sale proceeds even though they are immediately reusable for equities.
-The pre-entry account fields used for sizing are saved in strategy state and daily
-summaries for auditability.
+Ranking failures in `run` and `rank` email the configured admin, currently
+`armen.avetisyan.to@gmail.com`, with the session, strategy, error, traceback and
+log path. This includes failures preparing the trend/volatility risk signal.
+The `notifications` YAML section configures `ranking_failure_email`,
+`smtp_config_path` and `smtp_timeout_seconds` (also available as CLI options).
+SMTP settings are read from `--smtp-config-path`, otherwise `DASHBOARD_CONFIG`,
+otherwise the repository's `dashboard/config.yaml`; only its `smtp` section is
+used, and live trading imports no dashboard code. Set `ranking_failure_email`
+to `null` or pass `--ranking-failure-email ''` to disable alerts. `preview` never
+sends an alert.
+
+The callback runs after releasing the strategy-state lock. Successful delivery
+is recorded in `WORK_DIR/.ranking-failure-notifications.json`, suppressing further
+emails for that strategy/session across restarts. Subsequent failures remain in
+the log. Failed SMTP delivery is retried on the next ranking failure; it cannot
+replace the ranking error or stop the daemon's normal retry loop. No email
+worker runs during entry preflight. Restart the live daemon after changing code
+or notification settings.
+
+The shipped strategy is `liquidity-trend-vol`: a 35% annual volatility target,
+20 completed modeled basket returns, a 100-session SPY trend filter, and a maximum
+2x exposure. `--strategy liquidity-fixed` retains cash-only fixed sizing. Both use
+the same execution workflow; see [strategy and risk details](STRATEGIES.md).
+
+For `liquidity-trend-vol`, `--capital-fraction` defaults to `1.0` of account equity.
+`--capital` instead caps the allocated equity before policy exposure is applied.
+Sizing respects Reg T and regular buying power, existing account exposure, asset
+margin eligibility and reported maintenance requirements, then applies the 2%
+buffer. Cash accounts and non-marginable baskets remain capped by cash. The state
+records target and effective exposure, limiting broker constraints, and the risk
+snapshot used for entry. Missing risk inputs prevent new entries while existing
+positions retain their exit workflow.
 
 In persistent `run` mode, entry is a two-phase operation. By default, the daemon
-checks the account and conflicts, fetches the basket's latest quotes, calculates
-whole-share quantities, and durably records the plan 10 seconds before
+checks the account and conflicts, validates the prepared risk signal, sizes the
+basket, and durably records the plan 10 seconds before
 `--entry-time`. At the target second it performs no quote or account refresh; it
 dispatches the prepared orders with up to eight concurrent workers. Configure
 these values with `--entry-preflight-seconds` and `--order-submit-workers`.
@@ -935,11 +963,18 @@ The simulator's source-dependent transaction cost remains a separate modeled
 deduction. Account-equity residuals stay separate from confirmed Alpaca fee activities,
 and gross actual-versus-simulator execution attribution always excludes costs.
 
+Reconciliation now also replays the saved strategy decision: risk exposure,
+account limits, selection, budget and exact order payloads. Use
+`trading-reconcile --since YYYY-MM-DD --decision-only` for an offline audit of
+all closed sessions, including off-schedule fills. See
+[decision replay and historical migration](STRATEGIES.md#exact-live-decision-replay).
+
 Entry and exit order IDs are deterministic, so restarting the process does not
 intentionally duplicate an order. It also excludes symbols with pre-existing
 account positions or open orders and exits only the symbols recorded as owned
-by this strategy. Sizing uses cash rather than margin buying power and leaves a
-2% cash buffer by default; use `--capital 50000` for a fixed cap instead.
+by this strategy. Sizing applies the strategy's equity exposure and broker limits,
+then leaves a 2% buffer; use `--capital 50000` to cap allocated equity before
+exposure. The fixed-exposure policy retains its cash-only capital cap.
 
 To export the current Alpaca-available company universe used by the live
 strategy, run:

@@ -10,6 +10,7 @@ schedule:
   entry_grace_seconds: 75
 
 strategy:
+  name: "liquidity-trend-vol"
   top: 12
   liquidity_scheme: "turnover_stability"
   ema_span: 10
@@ -18,7 +19,19 @@ strategy:
   liquidity_lookback_days: 180
   exchanges: "NASDAQ"
 
+risk:
+  volatility_target: 0.35
+  max_exposure: 2.0
+  volatility_window: 20
+  warmup_exposure: 1.0
+  trend_window: 100
+  weak_trend_multiplier: 0.25
+  risk_history_start: "2023-01-01"
+
 data:
+  risk_minute_bars_dir: "/data/ppv1/updates/bars_1min_2022-01-01"
+  risk_nbbo_path: "/data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz"
+  risk_auctions_path: "/data/ppv1/updates/alpaca_auctions_2022-01-01.npz"
   daily_bars_dir: "/data/ppv1/updates/bars_1day_2022-01-01"
   shortlist_since: "2022-01-01"
   shortlist_daily_top: 50
@@ -39,6 +52,12 @@ execution:
   fill_timeout_seconds: 45.0
   poll_seconds: 1.0
   entry_preflight_seconds: 10.0
+
+notifications:
+  ranking_failure_email: "armen.avetisyan.to@gmail.com"
+  # Reuse DASHBOARD_CONFIG or the repository dashboard/config.yaml SMTP section.
+  smtp_config_path: null
+  smtp_timeout_seconds: 10.0
 
 runtime:
   work_dir: "/data/ppv1/live"

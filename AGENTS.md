@@ -1,5 +1,11 @@
 # Process ownership
 
+Keep experiment and research source code inside this repository, under `research/`.
+Save generated run summaries, CSVs, and charts under `/tmp` by default, not in
+the code folder. Candidate run results belong in `/tmp/trading-backtests/candidate/`.
+Do not create sibling clones or external worktrees unless the user explicitly
+requests an external location.
+
 The user manages all long-running processes in this repository, including live
 trading and the dashboard/digest publisher.
 

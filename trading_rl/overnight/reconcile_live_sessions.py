@@ -9,41 +9,42 @@ from __future__ import annotations
 
 import argparse
 import csv
-from datetime import UTC, date, datetime, time
 import json
 import math
 import os
-from pathlib import Path
 import re
 import tempfile
+from datetime import UTC, date, datetime, time
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 from rich.console import Console
 from rich.table import Table
 
+from .broker_fees import broker_fees_for_session
+from .decision_replay import replay_entry_decision
+from .execution_prices import (
+    DEFAULT_EXIT_NBBO_PATH,
+    DEFAULT_NBBO_PATH,
+    ENTRY_PRICE_SOURCES,
+    EXIT_PRICE_SOURCES,
+    MINUTE_PRICE_COLUMNS,
+    resolve_transaction_cost_bps,
+)
 from .history import (
     DEFAULT_AUCTIONS_PATH,
     DEFAULT_DATA_DIR,
     EASTERN,
     _dataset_manifest,
 )
-from .backtest import (
-    DEFAULT_NBBO_PATH,
-    DEFAULT_EXIT_NBBO_PATH,
-    ENTRY_PRICE_SOURCES,
-    EXIT_PRICE_SOURCES,
-    MINUTE_PRICE_COLUMNS,
-    resolve_transaction_cost_bps,
-)
-from .broker_fees import broker_fees_for_session
-from .reconciliation_prices import MissingBenchmarkData, load_benchmark_prices
 from .live import (
     OPENING_AUCTION_CUTOFF,
     AlpacaClient,
     completed_liquidity_ranking,
     load_credentials,
 )
-
+from .reconciliation_prices import MissingBenchmarkData, load_benchmark_prices
 
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
 DEFAULT_SCHEDULE_TOLERANCE_MINUTES = 1.0
@@ -464,6 +465,10 @@ def summary_execution_timing(
     if not symbols:
         raise ValueError("closed position has no symbols")
     entry_orders = position.get("entry_orders") or {}
+    symbols = [symbol for symbol in symbols
+               if float((entry_orders.get(symbol) or {}).get("filled_qty") or 0) > 0]
+    if not symbols:
+        raise ValueError("session has no filled entries")
     exit_orders = position.get("exit_orders") or {}
     if not isinstance(entry_orders, Mapping) or not isinstance(exit_orders, Mapping):
         raise ValueError("position orders must be mappings")
@@ -490,6 +495,40 @@ def _equity(position: Mapping[str, object], side: str) -> float | None:
     except ValueError:
         return None
 
+
+
+def replay_planned_performance(decision, marks, entry_equity):
+    """Value the exact intended order sizes, independently of actual partial fills."""
+    if decision['status'] != 'complete':
+        return {'status': 'unavailable', 'reason': 'entry decision did not replay exactly'}
+    rows = []
+    for symbol, order in decision['orders'].items():
+        entry, exit_mark = marks['entry'][symbol], marks['exit'][symbol]
+        notional = float(order['notional']) if 'notional' in order else float(order['qty']) * entry.raw_price
+        gross = notional * (exit_mark.price / entry.price - 1)
+        rows.append({'symbol': symbol, 'entry_notional': notional, 'gross_pnl': gross})
+    deployed = math.fsum(row['entry_notional'] for row in rows)
+    gross = math.fsum(row['gross_pnl'] for row in rows)
+    return {'status': 'complete', 'basis': 'persisted-order-plan-at-scheduled-benchmark-prices',
+            'entry_notional': deployed, 'gross_pnl': gross,
+            'gross_return_on_account_equity': gross / entry_equity if entry_equity else None,
+            'financing': 'excluded; reconcile actual broker fees and account residual separately',
+            'rows': rows}
+
+
+def replay_archived_plan_performance(decision, reconciliation):
+    """Enrich old reports without changing their historical marks or fee results."""
+    if reconciliation.get('reporting_benchmark') != SCHEDULED_REPORTING_BENCHMARK:
+        return {'status': 'unavailable', 'reason': 'no archived scheduled benchmark result'}
+    marks = {'entry': {}, 'exit': {}}
+    try:
+        for row in reconciliation['rows']:
+            marks['entry'][row['symbol']] = SimpleNamespace(
+                price=row['simulator_entry_price'], raw_price=row['simulator_entry_price_comparable'])
+            marks['exit'][row['symbol']] = SimpleNamespace(price=row['simulator_exit_price'])
+        return replay_planned_performance(decision, marks, reconciliation['totals'].get('entry_equity'))
+    except (KeyError, TypeError, ValueError) as error:
+        return {'status': 'unavailable', 'reason': 'incomplete archived plan benchmarks: ' + str(error)}
 
 def reconcile_execution(
     summary: Mapping[str, object],
@@ -520,6 +559,10 @@ def reconcile_execution(
     if not symbols:
         raise ValueError("closed position has no symbols")
     entry_orders = position.get("entry_orders") or {}
+    symbols = [symbol for symbol in symbols
+               if float((entry_orders.get(symbol) or {}).get("filled_qty") or 0) > 0]
+    if not symbols:
+        raise ValueError("session has no filled entries")
     exit_orders = position.get("exit_orders") or {}
     if not isinstance(entry_orders, Mapping) or not isinstance(exit_orders, Mapping):
         raise ValueError("position orders must be mappings")
@@ -543,14 +586,19 @@ def reconcile_execution(
     for side, source in (("entry", entry_price_source), ("exit", exit_price_source)):
         timing[side]["actual_time_benchmark"]["price_source"] = source
     calculate_actual_time = actual_time_benchmark
-    entry_targets = {symbol: (entry_day, entry_minute) for symbol in symbols}
-    exit_targets = {symbol: (exit_day, exit_minute) for symbol in symbols}
+    decision = replay_entry_decision(summary)
+    benchmark_symbols = (symbols if actual_time_benchmark else
+                         sorted(set(symbols) | set(decision.get("orders", {}))))
+    entry_targets = {symbol: (entry_day, entry_minute) for symbol in benchmark_symbols}
+    exit_targets = {symbol: (exit_day, exit_minute) for symbol in benchmark_symbols}
     if calculate_actual_time:
         for symbol in symbols:
             for side, orders, targets in (("entry", entry_orders, entry_targets), ("exit", exit_orders, exit_targets)):
                 stamp = _fill_bar_timestamp(orders, symbol, side)
                 targets[symbol] = (stamp.date(), stamp.hour * 60 + stamp.minute)
-    entry_path = nbbo_path if entry_price_source == "nbbo-ask" else data_dir
+    archived_paths = position.get("benchmark_paths") or {}
+    resolved_nbbo_path = Path(nbbo_path or archived_paths.get("entry_nbbo") or DEFAULT_NBBO_PATH)
+    entry_path = resolved_nbbo_path if entry_price_source == "nbbo-ask" else data_dir
     exit_path = (auctions_path if exit_price_source == "opening-auction"
                  else exit_nbbo_path if exit_price_source == "nbbo-bid" else data_dir)
     missing = []
@@ -778,7 +826,15 @@ def reconcile_execution(
         if entry_equity is not None and exit_equity is not None
         else None
     )
+    decision = replay_entry_decision(summary)
+    if decision["status"] != "complete" and (position.get("decision_inputs") or decision["strategy_name"] == "liquidity-trend-vol"):
+        warnings.append("entry decision replay " + decision["status"] + ": " + str(decision.get("reason") or decision.get("checks")))
+    planned = (replay_planned_performance(decision, marks, entry_equity)
+               if not actual_time_benchmark else {"status": "unavailable", "reason": "planned strategy requires scheduled benchmarks"})
     return {
+        "strategy_name": decision["strategy_name"],
+        "decision_replay": decision,
+        "planned_strategy": planned,
         "entry_date": entry_day.isoformat(),
         "exit_date": exit_day.isoformat(),
         "entry_time": _clock_text(entry_minute),
@@ -908,8 +964,8 @@ def replay_ranking(
 ) -> dict[str, object]:
     """Re-run the shared live/simulator ranker from the archived daily-bar dump."""
     position = summary.get("position") or {}
-    configuration = summary.get("configuration") or {}
-    ranking = summary.get("ranking") or {}
+    configuration = (position.get("decision_inputs") or {}).get("configuration") or summary.get("configuration") or {}
+    ranking = position.get("ranking_snapshot") or summary.get("ranking") or {}
     if not all(
         isinstance(value, Mapping) for value in (position, configuration, ranking)
     ):
@@ -1011,9 +1067,14 @@ def replay_ranking(
         for candidate in ranking.get("candidates") or []
         if isinstance(candidate, Mapping)
     }
+    inputs = position.get("decision_inputs") or {}
+    excluded = {str(row["symbol"]) for key in ("positions", "open_orders")
+                for row in inputs.get(key, [])}
     selected: list[str] = []
     seen_issuers: set[str] = set()
     for symbol, _, _ in replayed:
+        if symbol in excluded:
+            continue
         issuer = issuer_by_symbol.get(symbol, symbol)
         if issuer in seen_issuers:
             continue
@@ -1025,6 +1086,8 @@ def replay_ranking(
     overlap = actual_set & selected_set
     return {
         "status": "complete",
+        "exact_match": actual == selected,
+        "excluded_symbols": sorted(excluded),
         "ticks_path": str(ticks_path),
         "liquidity_scheme": scheme,
         "liquidity_scheme_source": scheme_source,
@@ -1859,8 +1922,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--nbbo-path",
         type=Path,
-        default=Path(DEFAULT_NBBO_PATH),
-        help="scheduled split-adjusted SIP NBBO data written by download_nbbo.py",
+        default=None,
+        help="override the archived session NBBO path (otherwise use its saved path or the default 15:45 archive)",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--entry-time", type=parse_clock, default=None)
@@ -1896,6 +1959,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--skip-ranking-replay", action="store_true")
+    parser.add_argument("--decision-only", action="store_true",
+                        help="replay saved strategy, risk, selection and sizing offline, including off-schedule sessions")
     parser.add_argument(
         "--trading-url",
         default=None,
@@ -1965,6 +2030,27 @@ def main() -> None:
         selected_days = [max(summaries)] if summaries else []
     if not selected_days:
         parser.error("no matching closed live sessions were found")
+
+    if args.decision_only:
+        output_dir = args.output_dir or args.work_dir / "reconciliations" / "decisions"
+        failed = False
+        for day in selected_days:
+            _, summary = summaries[day]
+            result = replay_entry_decision(summary)
+            if not args.skip_ranking_replay:
+                try:
+                    result['ranking_replay'] = replay_ranking(summary, args.work_dir / str(day) / 'ticks.jsonl')
+                    if not result['ranking_replay']['exact_match']:
+                        failed = True
+                except (OSError, TypeError, ValueError) as error:
+                    result['ranking_replay'] = {'status': 'unavailable', 'reason': str(error)}
+                    failed = True
+            _atomic_json(output_dir / f'{day}.json', result)
+            CONSOLE.print(f"{day}: {result['strategy_name']} decision replay {result['status']}")
+            failed |= result['status'] != 'complete'
+        if failed:
+            raise SystemExit(1)
+        return
 
     skipped_sessions: list[tuple[date, list[str]]] = []
     strict_schedule = args.reconciliation_mode == "strict-schedule"
@@ -2064,7 +2150,7 @@ def main() -> None:
             if fee_warning:
                 result["warnings"].append(fee_warning)
 
-            result["version"] = 7
+            result["version"] = 8
             result["generated_at"] = datetime.now(tz=UTC).isoformat()
             result["live_summary_path"] = str(summary_path)
             if not args.skip_ranking_replay:
@@ -2081,6 +2167,11 @@ def main() -> None:
                         "error": str(error),
                         "warnings": ["execution reconciliation is still complete"],
                     }
+            audit = result["decision_replay"]
+            CONSOLE.print(f"{entry_day}: {audit['strategy_name']} decision replay {audit['status']}")
+            if audit['status'] == 'complete':
+                CONSOLE.print(f"  Replayed budget {format_usd(audit['budget'])}"
+                              + (f"; target exposure {audit['target_exposure']:.4f}x" if audit["target_exposure"] is not None else "; cash sizing"))
             json_path = output_dir / f"{entry_day.isoformat()}.json"
             csv_path = output_dir / f"{entry_day.isoformat()}.csv"
             _atomic_json(json_path, result)

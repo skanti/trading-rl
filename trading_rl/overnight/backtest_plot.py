@@ -55,7 +55,7 @@ def write_equity_plot(
     FigureCanvasAgg(figure)
     try:
         axis = figure.subplots()
-        strategy_name = f"Top {summary['top']} strategy"
+        strategy_name = summary.get("strategy_label", f"Top {summary['top']} strategy")
         for key, label, color, metrics_key in (
             ("strategy", strategy_name, "#2563eb", "strategy_metrics"),
             (
@@ -95,10 +95,13 @@ def write_equity_plot(
         axis.legend(loc="upper left", frameon=False, fontsize=9)
         entry_time = str(summary["entry_time_eastern"]).split()[0]
         exit_time = str(summary["exit_time_eastern"]).split()[0]
+        leverage_label = summary.get(
+            "leverage_label", f"{float(summary.get('leverage', 1.0)):g}× leverage"
+        )
         caption = (
             f"{first:%Y-%m-%d} – {last:%Y-%m-%d} · Start ${curves.strategy.iloc[0]:,.2f}"
             f" · {float(summary['transaction_cost_bps_per_side']):g} bp per side"
-            f" · {float(summary.get('leverage', 1.0)):g}× leverage\n"
+            f" · {leverage_label}\n"
             f"{summary['entry_price_source']} {entry_time} → {summary['exit_price_source']} {exit_time} ET"
         )
         missing = int(summary.get("missing_benchmark_sessions", 0))

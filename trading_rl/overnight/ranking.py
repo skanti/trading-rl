@@ -337,3 +337,12 @@ def replay_strategy_selections(
             for rank, chosen in enumerate(selected, 1)
         )
     return pd.DataFrame.from_records(records)
+
+
+def liquidity_features(dollar_volume, scheme, ema_span, min_history_days, *, dispersion_span=None):
+    """Build the paired causal scores/history counts used by every execution path."""
+    return (
+        liquidity_scores(dollar_volume, scheme, ema_span, min_history_days,
+                         dispersion_span=dispersion_span),
+        causal_completed_trading_days(dollar_volume),
+    )

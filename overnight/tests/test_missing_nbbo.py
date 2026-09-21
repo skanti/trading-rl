@@ -100,12 +100,44 @@ class MissingNbboTest(unittest.TestCase):
         self.assertEqual(summary["ending_equity"], 1000.0)
         self.assertEqual(summary["skipped_missing_prices"], 4)
         self.assertEqual(summary["missing_benchmark_sessions"], 2)
-        self.assertTrue(np.isnan(summary["spy_overnight_metrics"]["total_return"]))
+        self.assertTrue(np.isnan(summary["spy_buy_and_hold_metrics"]["total_return"]))
         console = Console(file=io.StringIO(), record=True, width=160)
         print_summary_table(summary, console)
         text = console.export_text()
         self.assertIn("WARNING: missing prices", text)
         self.assertIn("WARNING: benchmark gaps", text)
+
+    def test_buy_and_hold_ignores_entry_quotes_after_initial_purchase(self):
+        args = self.inputs()
+        _, expected = run_backtest(**args)
+        args["entry_prices"][3:, 0] = np.nan
+        args["entry_staleness"][3:, 0] = np.inf
+        with self.assertNoLogs("trading_rl.overnight.backtest", level="WARNING"):
+            _, actual = run_backtest(**args)
+        self.assertEqual(actual["missing_benchmark_sessions"], 0)
+        self.assertEqual(
+            actual["spy_buy_and_hold_metrics"], expected["spy_buy_and_hold_metrics"]
+        )
+
+    def test_buy_and_hold_requires_a_valid_initial_purchase(self):
+        for price, age in ((np.nan, 0.0), (0.0, 0.0), (100.0, 2.0)):
+            with self.subTest(price=price, age=age):
+                args = self.inputs()
+                args["entry_prices"][2, 0] = price
+                args["entry_staleness"][2, 0] = age
+                with self.assertLogs("trading_rl.overnight.backtest", level="WARNING"):
+                    _, summary = run_backtest(**args)
+                self.assertEqual(summary["missing_benchmark_sessions"], 1)
+                self.assertTrue(np.isnan(summary["spy_buy_and_hold_metrics"]["total_return"]))
+
+    def test_buy_and_hold_requires_exit_marks_during_strategy_cash_sessions(self):
+        args = self.inputs()
+        args["entry_session_mask"] = np.array([True, True, True, False, True])
+        args["morning_prices"][4, 0] = np.nan
+        with self.assertLogs("trading_rl.overnight.backtest", level="WARNING"):
+            _, summary = run_backtest(**args)
+        self.assertEqual(summary["missing_benchmark_sessions"], 1)
+        self.assertTrue(np.isnan(summary["spy_buy_and_hold_metrics"]["total_return"]))
 
     def test_whole_share_skip_preserves_slot_budget(self):
         args = self.inputs()

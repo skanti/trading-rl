@@ -9,15 +9,15 @@ import numpy as np
 import pandas as pd
 
 from ..market_data.schema import validate_bar_columns
+from .execution_prices import (
+    MINUTE_PRICE_COLUMNS,
+    load_scheduled_nbbo_prices,
+)
 from .history import (
     BAR_ORIGIN,
     EASTERN,
     _official_opening_auctions,
     _security_symbol,
-)
-from .backtest import (
-    MINUTE_PRICE_COLUMNS,
-    load_scheduled_nbbo_prices,
 )
 
 

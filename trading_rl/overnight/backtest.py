@@ -1,4 +1,4 @@
-"""Causal daily-liquidity overnight baseline.
+"""Causal overnight liquidity strategies.
 
 Rank stocks using only completed sessions, buy an equal-weight basket at the
 configured afternoon entry, and liquidate it the following morning. Raw daily
@@ -11,13 +11,15 @@ trade count through a pre-entry ranking time.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import itertools
 import json
 import logging
 import os
-from pathlib import Path
 import tempfile
-from typing import Mapping
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -26,7 +28,21 @@ from rich.table import Table
 from tqdm import tqdm
 
 from ..market_data.calendar import auction_close_minutes
-from ..market_data.schema import BAR_INDEX, validate_bar_columns
+from ..market_data.schema import validate_bar_columns
+
+# Re-export historical helper names for compatibility with existing callers.
+from .execution_prices import (  # noqa: F401
+    DEFAULT_EXIT_NBBO_PATH,
+    DEFAULT_NBBO_PATH,
+    DEFAULT_TRANSACTION_COST_BPS,
+    ENTRY_PRICE_SOURCES,
+    EXIT_PRICE_SOURCES,
+    MINUTE_PRICE_COLUMNS,
+    load_opening_auction_prices,
+    load_scheduled_nbbo_asks,
+    load_scheduled_nbbo_prices,
+    resolve_transaction_cost_bps,
+)
 from .history import (
     DEFAULT_AUCTIONS_PATH,
     DEFAULT_DAILY_DATA_DIR,
@@ -41,185 +57,39 @@ from .history import (
     _security_symbol,
     company_universe_mask,
     exchange_universe_mask,
+    historical_window,
+    load_daily_dollar_volume,
     load_nasdaq_security_master,
     load_primary_auction_exchange_mask,
     reference_session_calendar,
     simulation_symbols,
-    historical_window, load_daily_dollar_volume,
 )
-from .ranking import (
-    build_issuer_map, causal_completed_trading_days, liquidity_scores, top_ranked_indices,
+from .portfolio import (
+    basket_quantities,
+    basket_returns,
+    equal_notional,
+    select_strategy_basket,  # noqa: F401 - compatibility export
 )
-
+from .ranking import build_issuer_map
+from .risk_history import BasketHistory
+from .strategies import (
+    MAX_OVERNIGHT_EXPOSURE as MAX_OVERNIGHT_LEVERAGE,
+)
+from .strategies import (
+    STRATEGIES,
+    STRATEGY_LABELS,
+    LiquidityTrendVolConfig,
+    LiquidityTrendVolPolicy,
+    load_trend_vol_config,
+)
 
 LOGGER = logging.getLogger(__name__)
 
-MINUTE_PRICE_COLUMNS = {
-    f"minute-{field}": BAR_INDEX[f"{field}_mills"]
-    for field in ("open", "high", "low", "close", "vwap")
-}
-ENTRY_PRICE_SOURCES = (*MINUTE_PRICE_COLUMNS, "nbbo-ask")
-EXIT_PRICE_SOURCES = (*MINUTE_PRICE_COLUMNS, "opening-auction", "nbbo-bid")
-
-DEFAULT_TRANSACTION_COST_BPS = 1.0
-
-# Reg T governs anything held past the close, so an overnight strategy cannot reach the
-# 4x day-trading buying power Alpaca reports as `multiplier`.
-MAX_OVERNIGHT_LEVERAGE = 2.0
 # Base Reg T maintenance is 25%; brokers raise it on concentrated, volatile books, and
 # Alpaca's own requirement on this basket sits near 32%. Used only for reporting.
 MAINTENANCE_MARGIN = 0.30
 # Alpaca accrues margin interest on a 360-day year, per calendar day.
 MARGIN_INTEREST_DIVISOR = 360.0
-DEFAULT_NBBO_PATH = "/data/ppv1/updates/alpaca_nbbo_1545_2022-01-01.npz"
-DEFAULT_EXIT_NBBO_PATH = "/data/ppv1/updates/alpaca_nbbo_0935_2022-01-01.npz"
-
-
-def resolve_transaction_cost_bps(
-    value: float | None, entry_price_source: str, exit_price_source: str,
-) -> float:
-    """Default additional costs by source pair, preserving explicit overrides."""
-    if value is None:
-        value = (
-            0.0
-            if (entry_price_source, exit_price_source) == ("nbbo-ask", "opening-auction")
-            else DEFAULT_TRANSACTION_COST_BPS
-        )
-    if not np.isfinite(value) or value < 0.0:
-        raise ValueError("transaction_cost_bps must be finite and non-negative")
-    return float(value)
-
-
-def load_opening_auction_prices(
-    path: Path,
-    dates: pd.DatetimeIndex,
-    symbols: np.ndarray,
-    *,
-    official: pd.DataFrame | None = None,
-) -> np.ndarray:
-    """Build a date-by-symbol primary-opening matrix from adjusted NPZ prices."""
-    if official is None:
-        official = _official_opening_auctions(path, dates, symbols)
-    prices = np.full((len(dates), len(symbols)), np.nan, dtype=np.float64)
-    rows = pd.Index(dates).get_indexer(pd.DatetimeIndex(official["date"]))
-    symbol_index = pd.Index([_security_symbol(sample_id) for sample_id in symbols])
-    columns = symbol_index.get_indexer(official["symbol"].astype(str).str.upper())
-    valid = (rows >= 0) & (columns >= 0)
-    prices[rows[valid], columns[valid]] = official["price"].to_numpy(dtype=np.float64)[
-        valid
-    ]
-    return prices
-
-
-def load_scheduled_nbbo_prices(
-    path: Path,
-    dates: pd.DatetimeIndex,
-    symbols: np.ndarray,
-    side: str,
-    target_minute: int | None,
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Load one quote side at the configured clock; missing rows remain unavailable."""
-    if side not in {"bid", "ask"}:
-        raise ValueError("NBBO side must be bid or ask")
-    if path.suffix.lower() != ".npz":
-        raise ValueError(f"NBBO data must use the split-adjusted NPZ format: {path}")
-    with np.load(path, allow_pickle=False) as data:
-        required = {
-            "symbol",
-            "date",
-            "target_timestamp",
-            "timestamp",
-            f"{side}_price",
-            f"raw_{side}_price",
-            f"{side}_exchange",
-        }
-        missing = required.difference(data.files)
-        if missing:
-            raise ValueError(f"{path} is missing NBBO arrays: {sorted(missing)}")
-        if "split_adjusted" not in data.files or not bool(
-            data["split_adjusted"].item()
-        ):
-            raise ValueError(f"{path} does not contain pre-adjusted NBBO prices")
-        symbol_values = np.char.upper(
-            np.asarray(data["symbol"]).astype(str, copy=False)
-        )
-        date_values = np.asarray(data["date"], dtype="datetime64[D]")
-        # SIP quotes mix whole seconds and fractional precision up to nanoseconds.
-        # Infer neither column's format from its first row: all are ISO 8601.
-        targets = pd.to_datetime(
-            np.asarray(data["target_timestamp"]).astype(str, copy=False),
-            format="ISO8601", utc=True,
-        )
-        stamps = pd.to_datetime(
-            np.asarray(data["timestamp"]).astype(str, copy=False),
-            format="ISO8601", utc=True,
-        )
-        if targets.hasnans or stamps.hasnans:
-            raise ValueError(f"{path} contains missing NBBO timestamps")
-        quote_prices = np.asarray(data[f"{side}_price"], dtype=np.float64)
-        raw_prices = np.asarray(data[f"raw_{side}_price"], dtype=np.float64)
-        exchanges = np.asarray(data[f"{side}_exchange"]).astype(str, copy=False)
-        wanted_dates = np.asarray(pd.DatetimeIndex(dates), dtype="datetime64[D]")
-        wanted_symbols = np.asarray(
-            [_security_symbol(sample_id) for sample_id in symbols], dtype=str
-        )
-        selected = (
-            np.isin(date_values, wanted_dates)
-            & np.isin(symbol_values, wanted_symbols)
-            & np.isfinite(quote_prices)
-            & (quote_prices > 0.0)
-        )
-        local_targets = targets[selected].tz_convert("America/New_York")
-        if (
-            (target_minute is not None and
-             ((local_targets.hour * 60 + local_targets.minute) != target_minute).any())
-            or (local_targets.second != 0).any()
-            or (local_targets.microsecond != 0).any()
-            or (local_targets.nanosecond != 0).any()
-            or not np.array_equal(
-                local_targets.tz_localize(None).normalize().to_numpy(dtype="datetime64[D]"),
-                date_values[selected],
-            )
-        ):
-            raise ValueError(f"{path} NBBO target timestamps do not match the configured time/date")
-        if (stamps[selected] > targets[selected]).any():
-            raise ValueError(f"{path} contains a post-target NBBO quote")
-        rows = pd.DataFrame(
-            {
-                "symbol": symbol_values[selected],
-                "date": pd.to_datetime(date_values[selected]),
-                "price": quote_prices[selected],
-                "raw_price": raw_prices[selected],
-                "staleness_minutes": (
-                    (targets[selected] - stamps[selected]).total_seconds() / 60.0
-                ),
-                "timestamp": stamps[selected],
-                "target_timestamp": targets[selected],
-                "exchange": exchanges[selected],
-            }
-        )
-    if rows.duplicated(["symbol", "date"]).any():
-        raise ValueError(f"{path} contains duplicate symbol-date NBBO snapshots")
-    prices = np.full((len(dates), len(symbols)), np.nan, dtype=np.float64)
-    staleness = np.full_like(prices, np.inf)
-    row_indices = pd.Index(dates).get_indexer(pd.DatetimeIndex(rows["date"]))
-    symbol_index = pd.Index(
-        [_security_symbol(sample_id) for sample_id in symbols]
-    )
-    columns = symbol_index.get_indexer(rows["symbol"])
-    valid = (row_indices >= 0) & (columns >= 0)
-    prices[row_indices[valid], columns[valid]] = rows["price"].to_numpy()[valid]
-    staleness[row_indices[valid], columns[valid]] = rows[
-        "staleness_minutes"
-    ].to_numpy()[valid]
-    return prices, staleness, rows
-
-
-def load_scheduled_nbbo_asks(
-    path: Path, dates: pd.DatetimeIndex, symbols: np.ndarray,
-    target_minute: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    return load_scheduled_nbbo_prices(path, dates, symbols, "ask", target_minute)
 
 
 def _parse_percentage(value: str) -> float:
@@ -511,7 +381,7 @@ def strategy_metrics(returns: pd.Series) -> dict[str, float | int]:
     wins = values[values > 0.0]
     losses = values[values < 0.0]
     return {
-        "periods": int(len(values)),
+        "periods": len(values),
         "total_return": float(equity.iloc[-1] - 1.0),
         "annualized_return": annualized_return,
         "mean_return": float(values.mean()),
@@ -536,39 +406,6 @@ def strategy_metrics(returns: pd.Series) -> dict[str, float | int]:
         if maximum_drawdown > 0.0
         else float("nan"),
     }
-
-
-def select_strategy_basket(
-    symbols: np.ndarray,
-    scores: np.ndarray,
-    completed_days: np.ndarray,
-    entry_prices: np.ndarray,
-    entry_staleness: np.ndarray,
-    *,
-    top: int,
-    minimum_trading_days: int,
-    max_entry_staleness_minutes: int,
-    entry_price_source: str,
-    issuers: Mapping[str, str] | None = None,
-    dedupe_share_classes: bool = True,
-    execution_exchange_mask: np.ndarray | None = None,
-    reference_symbol: str = REFERENCE_SYMBOL,
-) -> np.ndarray:
-    """Select intended members before execution availability or sizing drops trades."""
-    eligible = symbols != str(reference_symbol)
-    if execution_exchange_mask is not None:
-        eligible &= execution_exchange_mask
-    # Sparse NBBO coverage must never replace an intended member with a lower rank.
-    if entry_price_source != "nbbo-ask":
-        eligible &= (
-            np.isfinite(entry_prices) & (entry_prices > 0.0)
-            & (entry_staleness <= max_entry_staleness_minutes)
-        )
-    return top_ranked_indices(
-        scores, symbols, top, completed_days=completed_days,
-        minimum_trading_days=minimum_trading_days, eligible_mask=eligible,
-        issuers=issuers if dedupe_share_classes else None,
-    )
 
 
 def _benchmark_metrics(returns: pd.Series) -> dict[str, object]:
@@ -598,23 +435,20 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
     """Render the human-facing CLI report while leaving JSON optional."""
     output = console or Console()
     strategy = summary["strategy_metrics"]
-    spy_overnight = summary["spy_overnight_metrics"]
     spy_buy_hold = summary["spy_buy_and_hold_metrics"]
-    if not all(isinstance(metrics, dict) for metrics in (strategy, spy_overnight, spy_buy_hold)):
+    if not all(isinstance(metrics, dict) for metrics in (strategy, spy_buy_hold)):
         raise TypeError("summary metric groups must be mappings")
 
-    comparison = Table(title="Overnight liquidity baseline", show_header=True, header_style="bold")
+    comparison = Table(title=summary.get("strategy_label", STRATEGY_LABELS["liquidity-fixed"]), show_header=True, header_style="bold")
     comparison.add_column("Metric")
     comparison.add_column(f"Top {summary['top']}", justify="right")
-    comparison.add_column("SPY overnight", justify="right")
     comparison.add_column("SPY buy & hold", justify="right")
     starting_capital = float(summary["budget"]) if summary.get("budget") is not None else 1.0
-    comparison.add_row("Start capital", *(f"${starting_capital:,.2f}" for _ in range(3)))
+    comparison.add_row("Start capital", *(f"${starting_capital:,.2f}" for _ in range(2)))
     ending_capitals = (
         float(summary.get(
             "ending_equity", starting_capital * (1.0 + float(strategy["total_return"])),
         )),
-        starting_capital * (1.0 + float(spy_overnight["total_return"])),
         starting_capital * (1.0 + float(spy_buy_hold["total_return"])),
     )
     comparison.add_row(
@@ -622,8 +456,7 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         *(f"${value:,.2f}" if np.isfinite(value) else "n/a" for value in ending_capitals),
     )
     strategy_trades = int(summary["trades"])
-    spy_overnight_trades = int(spy_overnight["periods"])
-    trade_counts = (strategy_trades, spy_overnight_trades, int(spy_buy_hold["periods"] > 0))
+    trade_counts = (strategy_trades, int(spy_buy_hold["periods"] > 0))
     best_trade_count = min(trade_counts)
     comparison.add_row(
         "Round trips",
@@ -652,7 +485,6 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
     for label, key, scale, suffix, precision, higher_is_better in rows:
         values = (
             float(strategy[key]) * scale,
-            float(spy_overnight[key]) * scale,
             float(spy_buy_hold[key]) * scale,
         )
         finite_values = [value for value in values if np.isfinite(value)]
@@ -689,6 +521,9 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         "Liquidity ranking",
         _metric_text(summary),
     )
+    if summary.get("strategy") == "liquidity-trend-vol":
+        details.add_row("Exposure policy", f"{summary['strategy_config']}; mean exposure {summary['average_exposure']:.2f}x")
+        details.add_row("Financing", f"{summary['margin_interest_rate']:.2%} annual; calendar days / 360; borrow drag {summary['annual_borrow_drag']:.2%}/yr")
     details.add_row("Cost", f"{summary['transaction_cost_bps_per_side']:.2f} bps per side")
     source_descriptions = {
         **{
@@ -834,34 +669,6 @@ def print_symbol_trade_counts(
     output.print(table)
 
 
-def basket_quantities(
-    entry_prices: np.ndarray,
-    budget: float,
-    share_mode: str = "fractional",
-) -> np.ndarray:
-    """Size one equal-notional basket in fractional or whole shares.
-
-    Whole-share sizing deliberately rounds each name down independently. This never
-    exceeds the budget and never redistributes a costly name's unused allocation into
-    cheaper names, which would change the strategy's intended equal weighting. A stock
-    priced above its per-name target therefore receives zero shares and its allocation
-    remains cash.
-    """
-    prices = np.asarray(entry_prices, dtype=np.float64)
-    if prices.ndim != 1 or not prices.size:
-        raise ValueError("entry_prices must be a non-empty one-dimensional array")
-    if not np.isfinite(prices).all() or (prices <= 0.0).any():
-        raise ValueError("entry_prices must be finite and positive")
-    if not np.isfinite(budget) or float(budget) <= 0.0:
-        raise ValueError("budget must be finite and positive")
-    if share_mode not in {"fractional", "whole"}:
-        raise ValueError("share_mode must be 'fractional' or 'whole'")
-
-    target_notional = float(budget) / prices.size
-    quantities = target_notional / prices
-    return np.floor(quantities) if share_mode == "whole" else quantities
-
-
 def run_backtest(
     dates: pd.DatetimeIndex,
     symbols: np.ndarray,
@@ -885,7 +692,7 @@ def run_backtest(
     issuers: Mapping[str, str] | None = None,
     dedupe_share_classes: bool = True,
     leverage: float = 1.0,
-    margin_interest_rate: float = 0.0,
+    margin_interest_rate: float | None = None,
     maintenance_margin: float = MAINTENANCE_MARGIN,
     reference_symbol: str = REFERENCE_SYMBOL,
     share_mode: str = "fractional",
@@ -894,8 +701,34 @@ def run_backtest(
     exit_price_source: str = "opening-auction",
     execution_exchange_mask: np.ndarray | None = None,
     entry_session_mask: np.ndarray | None = None,
+    strategy: str = "liquidity-fixed",
+    strategy_config: LiquidityTrendVolConfig | None = None,
+    spy_trend_marks: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    if transaction_cost_bps < 0.0:
+    if strategy not in STRATEGIES:
+        raise ValueError(f"strategy must be one of {STRATEGIES}")
+    trend_vol = strategy == "liquidity-trend-vol"
+    if not np.isfinite(leverage) or not 0 < leverage <= MAX_OVERNIGHT_LEVERAGE:
+        raise ValueError("leverage must be in (0, 2]")
+    if strategy_config is not None and not trend_vol:
+        raise ValueError("strategy_config applies only to liquidity-trend-vol")
+    config = strategy_config or LiquidityTrendVolConfig()
+    policy = None
+    if margin_interest_rate is None:
+        margin_interest_rate = 0.0675 if trend_vol else 0.0
+    if trend_vol:
+        if exit_minute >= entry_minute:
+            raise ValueError("liquidity-trend-vol requires exit-time before entry-time so risk observations are completed")
+        if leverage != 1.0:
+            raise ValueError("liquidity-trend-vol controls exposure; --leverage applies only to liquidity-fixed")
+        if spy_trend_marks is None or np.asarray(spy_trend_marks).shape != (len(dates),):
+            raise ValueError("liquidity-trend-vol requires one SPY 15:59 minute-open trend mark per date")
+        if start_date < pd.Timestamp(config.risk_history_start):
+            raise ValueError("liquidity-trend-vol start_date precedes risk_history_start")
+        policy = LiquidityTrendVolPolicy(config, spy_trend_marks)
+    if not np.isfinite(margin_interest_rate) or not 0 <= margin_interest_rate <= 1:
+        raise ValueError("margin_interest_rate must be a fraction between 0 and 1")
+    if not np.isfinite(transaction_cost_bps) or transaction_cost_bps < 0.0:
         raise ValueError("transaction_cost_bps must be non-negative")
     if int(minimum_trading_days) < 1:
         raise ValueError("minimum_trading_days must be positive")
@@ -910,13 +743,19 @@ def run_backtest(
     if share_mode == "whole" and budget is None:
         raise ValueError("whole-share sizing requires a budget")
     simulation_budget = float(budget) if budget is not None else 1.0
-    scores = liquidity_scores(dollar_volume, liquidity_scheme, ema_span, min_history_days)
-    completed_trading_days = causal_completed_trading_days(dollar_volume)
+    basket_history = BasketHistory(
+        symbols, dollar_volume, top=top, ema_span=ema_span, min_history_days=min_history_days,
+        minimum_trading_days=int(minimum_trading_days), liquidity_scheme=liquidity_scheme,
+        issuers=issuers, dedupe_share_classes=dedupe_share_classes, reference_symbol=reference_symbol,
+    )
+    scores = basket_history.scores
     if execution_exchange_mask is not None:
         execution_exchange_mask = np.asarray(execution_exchange_mask, dtype=bool)
         if execution_exchange_mask.shape != scores.shape:
             raise ValueError("execution_exchange_mask must match the liquidity arrays")
     interval_entries = (dates >= start_date) & (dates < end_date)
+    interval_entries[-1] = False
+    interval_entries[:-1] &= dates[1:] <= end_date
     if entry_session_mask is None:
         entry_session_mask = np.ones(len(dates), dtype=bool)
     else:
@@ -924,7 +763,7 @@ def run_backtest(
         if entry_session_mask.shape != (len(dates),):
             raise ValueError("entry_session_mask must match dates")
     skipped_short_entries = int((interval_entries & ~entry_session_mask).sum())
-    entries = np.flatnonzero(interval_entries & entry_session_mask)
+    entries = np.flatnonzero(interval_entries)
     if not entries.size:
         raise ValueError("the requested interval contains no entry sessions")
     if entries[-1] + 1 >= len(dates):
@@ -941,34 +780,49 @@ def run_backtest(
     missing_benchmark_dates: list[str] = []
     entry_age_limit = min(max_entry_staleness_minutes, 1) if entry_price_source == "nbbo-ask" else max_entry_staleness_minutes
     exit_age_limit = min(max_exit_staleness_minutes, 1) if exit_price_source == "nbbo-bid" else max_exit_staleness_minutes
-    spy_returns: list[float] = []
+    spy_initial_entry = float(entry_prices[entries[0], reference_index])
     spy_exit_prices: list[float] = []
     current_equity = simulation_budget
-    for date_index in entries:
-        selected = select_strategy_basket(
-            symbols, scores[date_index], completed_trading_days[date_index],
-            entry_prices[date_index], entry_staleness[date_index],
-            top=top, minimum_trading_days=int(minimum_trading_days),
-            max_entry_staleness_minutes=int(max_entry_staleness_minutes),
-            entry_price_source=entry_price_source, issuers=issuers,
-            dedupe_share_classes=dedupe_share_classes, reference_symbol=reference_symbol,
-            execution_exchange_mask=(execution_exchange_mask[date_index + 1] if execution_exchange_mask is not None else None),
+    replay_entries = entries
+    if trend_vol:
+        replay_entries = np.flatnonzero(
+            (dates >= pd.Timestamp(config.risk_history_start)) & (dates < end_date)
         )
-        selected_ranks = np.arange(1, int(top) + 1)
+        replay_entries = replay_entries[replay_entries < len(dates) - 1]
+        replay_entries = replay_entries[dates[replay_entries + 1] <= end_date]
+    for date_index in replay_entries:
+        cash_session = not entry_session_mask[date_index]
+        exposure = policy.exposure(date_index) if policy is not None else float(leverage)
+        selected = basket_history.select(
+            date_index, entry_allowed=not cash_session,
+            entry_prices=entry_prices[date_index], entry_staleness=entry_staleness[date_index],
+            max_entry_staleness_minutes=int(max_entry_staleness_minutes),
+            entry_price_source=entry_price_source,
+            # The legacy fixed-exposure model used exit-day venue membership.
+            # Trend/vol and live warmup both use entry-day membership.
+            exchange_mask=(execution_exchange_mask[date_index if trend_vol else date_index + 1]
+                           if execution_exchange_mask is not None else None),
+        )
+        selected_ranks = np.arange(1, len(selected) + 1)
         selected_entries = entry_prices[date_index, selected]
         selected_entry_staleness = entry_staleness[date_index, selected]
         exits = morning_prices[date_index + 1, selected]
         exit_staleness = morning_staleness[date_index + 1, selected]
-        missing_entry = (
-            ~np.isfinite(selected_entries) | (selected_entries <= 0.0)
-            | ~np.isfinite(selected_entry_staleness)
-            | (selected_entry_staleness > entry_age_limit)
+        observation = basket_returns(
+            selected_entries, exits, slots=top, cost_bps=transaction_cost_bps,
+            entry_staleness=selected_entry_staleness, exit_staleness=exit_staleness,
+            max_entry_age=entry_age_limit, max_exit_age=exit_age_limit,
         )
-        missing_exit = (
-            ~np.isfinite(exits) | (exits <= 0.0)
-            | ~np.isfinite(exit_staleness) | (exit_staleness > exit_age_limit)
-        )
-        missing = missing_entry | missing_exit
+        missing_entry, missing_exit = observation.missing_entry, observation.missing_exit
+        missing = observation.missing
+        if trend_vol and missing.any():
+            names = ", ".join(symbols[selected[missing]])
+            raise ValueError(f"liquidity-trend-vol requires complete fresh prices on {dates[date_index].date()}: {names}")
+        unscaled_return = observation.unscaled_return
+        if policy is not None:
+            policy.observe(unscaled_return)
+        if dates[date_index] < start_date:
+            continue
         for index in np.flatnonzero(missing):
             reason = ", ".join(side for side, mask in (("entry", missing_entry), ("exit", missing_exit)) if mask[index])
             record = {
@@ -986,11 +840,11 @@ def run_backtest(
         if valid.any():
             # Preserve the original per-stock allocation, including skipped slots.
             quantities[valid] = basket_quantities(
-                selected_entries[valid], session_budget * (valid.sum() / int(top)), share_mode
+                selected_entries[valid], session_budget * exposure, share_mode, slots=top
             )
         executed = quantities > 0.0
         skipped = int((~executed).sum())
-        if not executed.any() and not missing.any():
+        if not executed.any() and not missing.any() and not cash_session:
             raise ValueError(
                 f"equity ${session_budget:,.2f} cannot buy one share from the selected "
                 f"basket on {dates[date_index].date()}"
@@ -1008,9 +862,16 @@ def run_backtest(
         gross_pnl = exit_notional - entry_notional
         transaction_cost_dollars = entry_notional * cost
         net_pnl = entry_notional * net_return
-        session_net_pnl = float(net_pnl.sum())
+        holding_calendar_days = max(1, (dates[date_index + 1] - dates[date_index]).days)
+        borrow_dollars = (
+            max(0.0, float(entry_notional.sum()) - session_budget)
+            * margin_interest_rate * holding_calendar_days / MARGIN_INTEREST_DIVISOR
+        )
+        session_net_pnl = float(net_pnl.sum()) - borrow_dollars
         session_return = session_net_pnl / session_budget
         current_equity = session_budget + session_net_pnl
+        if current_equity <= 0:
+            raise ValueError(f"portfolio equity exhausted on {dates[date_index + 1].date()}")
         session_records.append({
             "entry_date": str(dates[date_index].date()),
             "exit_date": str(dates[date_index + 1].date()),
@@ -1018,6 +879,12 @@ def run_backtest(
             "portfolio_end_equity": current_equity,
             "portfolio_return": session_return,
             "capital_deployed": float(entry_notional.sum()),
+            "exit_position_value": float(exit_notional.sum()),
+            "exposure": exposure,
+            "unscaled_return": unscaled_return,
+            "borrow_cost": borrow_dollars,
+            "borrow_return": borrow_dollars / session_budget,
+            "traded": bool(executed.any()),
             "skipped_selections": skipped,
             "skipped_missing_prices": int(missing.sum()),
         })
@@ -1032,7 +899,8 @@ def run_backtest(
                     "liquidity_score": scores[date_index, selected],
                     "share_mode": share_mode,
                     "budget": session_budget,
-                    "target_notional": session_budget / int(top),
+                    "target_notional": equal_notional(session_budget * exposure, top),
+                    "exposure": exposure,
                     "portfolio_start_equity": session_budget,
                     "portfolio_end_equity": current_equity,
                     "portfolio_return": session_return,
@@ -1055,60 +923,43 @@ def run_backtest(
                 }
             )
         )
-        spy_entry = entry_prices[date_index, reference_index]
         spy_exit = morning_prices[date_index + 1, reference_index]
-        if (
-            not np.isfinite(spy_entry) or spy_entry <= 0.0
-            or not np.isfinite(spy_exit) or spy_exit <= 0.0
+        # Buy once at the reporting window's start, then retain SPY continuously.
+        # Subsequent afternoon entry quotes are irrelevant, including cash sessions.
+        missing_spy_entry = date_index == entries[0] and (
+            not np.isfinite(spy_initial_entry) or spy_initial_entry <= 0.0
             or not np.isfinite(entry_staleness[date_index, reference_index])
-            or not np.isfinite(morning_staleness[date_index + 1, reference_index])
             or entry_staleness[date_index, reference_index] > entry_age_limit
+        )
+        if missing_spy_entry:
+            spy_initial_entry = float("nan")
+        if (
+            missing_spy_entry
+            or not np.isfinite(spy_exit) or spy_exit <= 0.0
+            or not np.isfinite(morning_staleness[date_index + 1, reference_index])
             or morning_staleness[date_index + 1, reference_index] > exit_age_limit
         ):
             day = str(dates[date_index].date())
             missing_benchmark_dates.append(day)
-            LOGGER.warning("%s benchmark unavailable for %s -> %s: missing or stale price",
+            LOGGER.warning("%s buy-and-hold benchmark unavailable for %s -> %s: missing or stale price",
                            reference_symbol, day, dates[date_index + 1].date())
-            spy_returns.append(float("nan"))
             spy_exit_prices.append(float("nan"))
         else:
-            spy_returns.append(float(spy_exit / spy_entry - 1.0 - cost))
             spy_exit_prices.append(float(spy_exit))
 
     trades = pd.concat(pieces, ignore_index=True)
     sessions = pd.DataFrame(session_records).set_index("entry_date")
     deployed_by_entry = sessions.capital_deployed
     utilization_by_entry = deployed_by_entry / sessions.portfolio_start_equity
-    unlevered_daily = sessions.portfolio_return
+    unlevered_daily = sessions.unscaled_return if trend_vol else (sessions.portfolio_return + sessions.borrow_return) / leverage
 
-    # Leverage is not a free scalar. Scaling returns alone leaves the Sharpe ratio
-    # unchanged, so it would say nothing. What makes it a real trade-off is the borrow
-    # cost and the compounding of a deeper drawdown. Per-trade returns in `trades` stay
-    # unlevered; only the portfolio series is levered.
-    #
-    # Alpaca accrues margin interest on the overnight debit balance as
-    # rate / 360 per CALENDAR day, so a Friday entry held to Monday is charged three
-    # days, not one. Deriving the accrual from each trade's actual entry-to-exit span
-    # captures weekends and holidays instead of assuming a flat trading-day divisor.
-    exit_by_entry = sessions.exit_date
     holding_days = pd.Series(
-        (pd.to_datetime(exit_by_entry.values) - pd.to_datetime(exit_by_entry.index)).days,
-        index=exit_by_entry.index,
-        dtype=np.float64,
+        (pd.to_datetime(sessions.exit_date.values) - pd.to_datetime(sessions.index)).days,
+        index=sessions.index, dtype=np.float64,
     ).clip(lower=1.0)
-    borrow_per_session = (
-        max(0.0, leverage - 1.0)
-        * float(margin_interest_rate)
-        * holding_days
-        * utilization_by_entry
-        / MARGIN_INTEREST_DIVISOR
-    )
-    daily = float(leverage) * unlevered_daily - borrow_per_session
-    spy_daily = pd.Series(spy_returns, index=daily.index, dtype=np.float64)
-    difference = daily - spy_daily
-    spy_buy_hold_equity = np.asarray(spy_exit_prices, dtype=np.float64) / float(
-        entry_prices[entries[0], reference_index]
-    )
+    borrow_per_session = sessions.borrow_return
+    daily = sessions.portfolio_return
+    spy_buy_hold_equity = np.asarray(spy_exit_prices, dtype=np.float64) / spy_initial_entry
     spy_buy_hold_returns = np.empty_like(spy_buy_hold_equity)
     spy_buy_hold_returns[0] = spy_buy_hold_equity[0] - 1.0
     spy_buy_hold_returns[1:] = spy_buy_hold_equity[1:] / spy_buy_hold_equity[:-1] - 1.0
@@ -1122,27 +973,24 @@ def run_backtest(
     by_date = {day: set(group.sample_id) for day, group in trades.groupby("entry_date", sort=True)}
     memberships = [by_date.get(day, set()) for day in sessions.index]
     replacements = [
-        len(current - previous) for previous, current in zip(memberships, memberships[1:])
+        len(current - previous) for previous, current in itertools.pairwise(memberships)
     ]
     retentions = [
         len(current & previous) / len(current) if current else 1.0
-        for previous, current in zip(memberships, memberships[1:])
+        for previous, current in itertools.pairwise(memberships)
     ]
     jaccards = [
         len(current & previous) / len(current | previous) if current | previous else 1.0
-        for previous, current in zip(memberships, memberships[1:])
+        for previous, current in itertools.pairwise(memberships)
     ]
-    # A levered book is force-liquidated when equity / position value falls through the
-    # maintenance requirement. Report the worst session against that floor rather than
-    # silently producing an equity curve the broker would never have let you hold.
+    exposed = sessions.capital_deployed / sessions.portfolio_start_equity
+    ratios = sessions.portfolio_end_equity / sessions.exit_position_value.replace(0, np.nan)
+    margin_ratio = float(ratios[exposed > 1].min()) if (exposed > 1).any() else 1.0
     worst_session = float(unlevered_daily.min())
-    if leverage > 1.0 and worst_session < 0.0:
-        drop = abs(worst_session)
-        margin_ratio = (1.0 - leverage * drop) / (leverage * (1.0 - drop))
-        breach_leverage = 1.0 / (float(maintenance_margin) * (1.0 - drop) + drop)
-    else:
-        margin_ratio = 1.0
-        breach_leverage = float("inf")
+    breach_leverage = (
+        1.0 / (float(maintenance_margin) * (1.0 + worst_session) - worst_session)
+        if worst_session < 0 else float("inf")
+    )
 
     # The dedupe rule reads company names out of the security master, so it can fail
     # quietly if a name format changes or a symbol is missing. Report both, rather than
@@ -1165,7 +1013,13 @@ def run_backtest(
         "turnover_stability": "completed dollar volume less its own dispersion",
     }
     summary: dict[str, object] = {
-        "strategy": f"causal_{liquidity_scheme}_overnight_long",
+        "strategy": strategy,
+        "strategy_config": config.as_dict() if trend_vol else {"leverage": float(leverage)},
+        "exchange_membership_session": "entry" if trend_vol else "exit",
+        "strategy_label": STRATEGY_LABELS[strategy],
+        "leverage_label": f"dynamic exposure, {config.max_exposure:g}× cap" if trend_vol else f"{leverage:g}× leverage",
+        "average_exposure": float(sessions.exposure.mean()),
+        "maximum_exposure": float(sessions.exposure.max()),
         "liquidity_scheme": liquidity_scheme,
         "entry_time_eastern": f"{entry_minute // 60:02d}:{entry_minute % 60:02d}",
         "entry_price_source": entry_price_source,
@@ -1215,7 +1069,7 @@ def run_backtest(
         "max_exit_staleness_minutes": int(max_exit_staleness_minutes),
         "stale_exit_marks_over_10_minutes": int(trades.exit_staleness_minutes.gt(10.0).sum()),
         "maximum_exit_staleness_minutes": float(trades.exit_staleness_minutes.max()),
-        "trades": int(len(trades)),
+        "trades": len(trades),
         "unique_symbols_traded": int(trades.sample_id.nunique()),
         "average_daily_membership_replacements": float(np.mean(replacements))
         if replacements
@@ -1226,15 +1080,7 @@ def run_backtest(
         else 1.0,
         "average_daily_membership_jaccard": float(np.mean(jaccards)) if jaccards else 1.0,
         "strategy_metrics": strategy_metrics(daily),
-        "spy_overnight_metrics": _benchmark_metrics(spy_daily),
         "spy_buy_and_hold_metrics": _benchmark_metrics(spy_buy_hold_daily),
-        "versus_spy": {
-            "mean_excess_return": float(difference.mean()),
-            "median_excess_return": float(difference.median()),
-            "outperformance_days": int(difference.gt(0.0).sum()),
-            "underperformance_days": int(difference.lt(0.0).sum()),
-            "daily_return_correlation": float(daily.corr(spy_daily)),
-        },
         "versus_spy_buy_and_hold": {
             "mean_excess_return": float(difference_buy_hold.mean()),
             "median_excess_return": float(difference_buy_hold.median()),
@@ -1243,6 +1089,8 @@ def run_backtest(
             "daily_return_correlation": float(daily.corr(spy_buy_hold_daily)),
         },
     }
+    years = (pd.Timestamp(summary["last_exit_date"]) - pd.Timestamp(summary["first_entry_date"])).days / 365.25
+    summary["strategy_metrics"]["calendar_cagr"] = float((1 + summary["strategy_metrics"]["total_return"]) ** (1 / years) - 1)
     return trades, summary
 
 
@@ -1252,6 +1100,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Backtest the causal overnight basket used by live trading."
         )
     )
+    parser.add_argument(
+        "--strategy", choices=STRATEGIES, default="liquidity-trend-vol",
+        help="strategy family (default: liquidity-trend-vol)",
+    )
+    parser.add_argument("--strategy-config", type=Path, default=None,
+                        help="JSON overrides for liquidity-trend-vol exposure parameters")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="save trades, portfolio, summary and chart together; liquidity-trend-vol defaults under /tmp/trading-backtests/candidate/liquidity-trend-vol")
     parser.add_argument("--top", type=int, default=12, help="daily basket size")
     period = parser.add_mutually_exclusive_group()
     period.add_argument(
@@ -1329,8 +1185,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transaction-cost-bps",
         type=float,
-        default=0.0,
-        help="additional cost in bps per side (default: 0.0)",
+        default=None,
+        help="additional bps per side (default: 0 for ask/auction, 1 otherwise)",
     )
     parser.add_argument(
         "--share-mode",
@@ -1420,9 +1276,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        config = load_trend_vol_config(args.strategy_config) if args.strategy == "liquidity-trend-vol" else None
+        if args.strategy_config is not None and args.strategy != "liquidity-trend-vol":
+            raise ValueError("--strategy-config requires --strategy liquidity-trend-vol")
+        if args.strategy == "liquidity-trend-vol":
+            if args.leverage != 1.0:
+                raise ValueError("liquidity-trend-vol controls exposure; --leverage applies only to liquidity-fixed")
+            if args.margin_interest_rate is None:
+                args.margin_interest_rate = 0.0675
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     try:
         args.transaction_cost_bps = resolve_transaction_cost_bps(
             args.transaction_cost_bps, args.entry_price_source, args.exit_price_source,
@@ -1430,7 +1297,7 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
 
-    if args.leverage < 1.0:
+    if not np.isfinite(args.leverage) or args.leverage < 1.0:
         parser.error("--leverage must be at least 1.0")
     if args.leverage > MAX_OVERNIGHT_LEVERAGE:
         # Alpaca's 4x multiplier is day-trading buying power. This strategy holds
@@ -1499,6 +1366,21 @@ def main() -> None:
     requested_start, end_date = window.requested_start, window.end_date
     cache_dates, cache_context_sod = window.dates, window.context_sod
     entry_session_mask, shortened_entries = window.entry_session_mask, window.shortened_entries
+    # Shared history and session calendar make strategy comparisons independent
+    # of a report's start date; feature caches can be reused across variants.
+    history = all_dates <= end_date
+    cache_dates, cache_context_sod = all_dates[history], all_context_sod[history]
+    entry_session_mask = np.array([
+        known_session_closes.get(day.date(), 960) > args.entry_time for day in cache_dates
+    ])
+    spy_trend_marks = None
+    if args.strategy == "liquidity-trend-vol":
+        if requested_start < pd.Timestamp(config.risk_history_start):
+            parser.error("--since precedes liquidity-trend-vol risk_history_start")
+        spy_trend_marks = _symbol_daily_arrays(
+            REFERENCE_SYMBOL, {day: i for i, day in enumerate(cache_dates)},
+            cache_context_sod, data_dir, daily_data_dir, 959, 570, len(cache_dates),
+        )[2]
     if shortened_entries:
         print(
             f"short sessions: skipping {len(shortened_entries):,} afternoon entr"
@@ -1683,6 +1565,9 @@ def main() -> None:
         exit_price_source=args.exit_price_source,
         execution_exchange_mask=execution_exchange_mask,
         entry_session_mask=entry_session_mask,
+        strategy=args.strategy,
+        strategy_config=config,
+        spy_trend_marks=spy_trend_marks,
     )
     summary["cache_path"] = str(cache_path)
     summary["asset_filter"] = args.asset_filter
@@ -1702,6 +1587,41 @@ def main() -> None:
         _security_symbol(str(symbol)): float(mean_return)
         for symbol, mean_return in trades.groupby("sample_id")["net_return"].mean().items()
     }
+    output_dir = args.output_dir
+    if output_dir is None and args.strategy == "liquidity-trend-vol":
+        root = Path("/tmp/trading-backtests/candidate") / args.strategy
+        root.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(tempfile.mkdtemp(prefix=f"{requested_start:%Y%m%d}_{end_date:%Y%m%d}_", dir=root))
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        args.output_csv = args.output_csv or str(output_dir / "trades.csv")
+        args.summary_json = args.summary_json or str(output_dir / "summary.json")
+        pd.DataFrame(summary["daily_portfolio"]).to_csv(output_dir / "portfolio.csv", index=False)
+    summary["run_config"] = {key: str(value) if isinstance(value, (Path, pd.Timestamp)) else value for key, value in vars(args).items()}
+    summary["data_metadata"] = metadata
+    def fingerprint(path):
+        with Path(path).open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    summary["input_sha256"] = {
+        str(path): fingerprint(path)
+        for path in dict.fromkeys([
+            auction_path, Path(args.security_master_cache),
+            *([Path(args.nbbo_path)] if args.entry_price_source == "nbbo-ask" else []),
+            *([Path(args.exit_nbbo_path)] if args.exit_price_source == "nbbo-bid" else []),
+        ]) if path.is_file()
+    }
+    summary["source_sha256"] = {
+        str(path.relative_to(Path(__file__).parents[1])): fingerprint(path)
+        for path in Path(__file__).parents[1].rglob("*.py")
+    }
+    summary["risk_history_start"] = config.risk_history_start if config else None
+    if args.strategy == "liquidity-trend-vol":
+        from .backtest_audit import minute_mark_audit
+
+        marks, audit = minute_mark_audit(trades, summary, data_dir)
+        summary["minute_mark_audit"] = audit
+        marks.to_csv(output_dir / "minute_marks.csv", index=False)
+        print(f"Minute-open mark drawdown: {audit['minute_open_mark_drawdown']:.2%}")
     print_summary_table(summary)
     if args.show_symbol_trade_frequency:
         print_symbol_trade_counts(trades)
@@ -1709,7 +1629,7 @@ def main() -> None:
     try:
         from .backtest_plot import write_equity_plot
 
-        summary["plot_path"] = str(write_equity_plot(summary))
+        summary["plot_path"] = str(write_equity_plot(summary, output_dir=output_dir))
         print(f"wrote equity plot to {summary['plot_path']}")
     except Exception as error:  # noqa: BLE001 - plot failure must not discard numerical results
         LOGGER.warning("could not write equity plot: %s", error)
