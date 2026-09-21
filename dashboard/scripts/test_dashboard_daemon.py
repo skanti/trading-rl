@@ -983,13 +983,19 @@ class DigestTest(unittest.TestCase):
         self.assertIn("NVDA", text)
         self.assertIn("TOTAL", text)
         self.assertIn("Today's strategy P&L (provisional)", text)
+        performance_table = text.split("Closed basket", 1)[0]
+        self.assertNotIn("Status", performance_table)
+        self.assertNotIn("provisional", performance_table)
+        self.assertIn("+$500.00", performance_table)
 
     def test_html_labels_mode_and_includes_fill_based_total(self):
         html = dashboard_digest.render_html(self.snapshot, self.state, self.config)
         self.assertIn("[LIVE]", html)
         self.assertIn("TOTAL", html)
         self.assertIn("+$100.00", html)
-        self.assertIn("provisional", html)
+        self.assertNotIn("provisional", html)
+        self.assertNotIn(">Status</th>", html)
+        self.assertIn("+$500.00", html)
 
     def test_html_colors_profits_green_and_losses_red(self):
         html = dashboard_digest.render_html(self.snapshot, self.state, self.config)

@@ -227,16 +227,13 @@ function shortDay(day: string | null | undefined): string {
 
       <div class="mb-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-slate-400">
         <span class="inline-flex items-center gap-2">
-          <span class="inline-block w-5 border-t border-dashed border-slate-400" />
+          <span class="inline-block w-5 border-t border-solid border-blue-400/65" />
           SPY buy &amp; hold
           <span
             v-if="referenceActive"
             class="numeric"
           >{{ formatCurrency(referenceActive.equity) }} ({{ formatSignedPercent(referenceActive.profit_loss_pct) }})</span>
           <span v-else>{{ benchmark?.status === 'pending' ? 'Awaiting first close' : 'Unavailable for this date' }}</span>
-        </span>
-        <span class="text-slate-500">
-          Adjusted daily close<span v-if="referenceActive"> · {{ shortDay(referenceActive.day) }}</span>
         </span>
       </div>
 
@@ -317,10 +314,9 @@ function shortDay(day: string | null | undefined): string {
             v-if="referenceLine"
             :d="referenceLine"
             fill="none"
-            stroke="#94a3b8"
+            stroke="#60a5fa"
             stroke-opacity="0.65"
             stroke-width="1.5"
-            stroke-dasharray="5 4"
             stroke-linejoin="round"
             stroke-linecap="round"
             vector-effect="non-scaling-stroke"
@@ -346,7 +342,7 @@ function shortDay(day: string | null | undefined): string {
             vector-effect="non-scaling-stroke"
           />
           <circle
-            v-if="latestProvisional"
+            v-if="latestProvisional && openPoint"
             :cx="scale.x(points.length - 1)"
             :cy="scale.y(realizedLatest)"
             r="4"
@@ -365,15 +361,22 @@ function shortDay(day: string | null | undefined): string {
             stroke-linecap="round"
             vector-effect="non-scaling-stroke"
           />
-          <circle
-            v-if="openPoint"
-            :cx="scale.x(displayPoints.length - 1)"
-            :cy="scale.y(openPoint.equity)"
-            r="4"
-            :fill="seriesColor"
-            stroke="#020617"
-            stroke-width="2"
-          />
+          <g
+            :transform="`translate(${scale.x(displayPoints.length - 1)} ${scale.y(latest)})`"
+            pointer-events="none"
+          >
+            <circle
+              class="latest-point-pulse"
+              r="4"
+              :fill="seriesColor"
+            />
+            <circle
+              r="4"
+              :fill="latestProvisional && !openPoint ? '#020617' : seriesColor"
+              :stroke="latestProvisional && !openPoint ? seriesColor : '#020617'"
+              stroke-width="2"
+            />
+          </g>
 
           <g v-if="active">
             <circle
@@ -381,7 +384,7 @@ function shortDay(day: string | null | undefined): string {
               :cx="active.x"
               :cy="scale.y(referenceActive.equity)"
               r="3"
-              fill="#94a3b8"
+              fill="#60a5fa"
               stroke="#020617"
               stroke-width="2"
             />
@@ -424,5 +427,30 @@ function shortDay(day: string | null | undefined): string {
   -webkit-user-select: none;
   -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
+}
+
+.latest-point-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: latest-point-pulse 1.8s ease-out infinite;
+}
+
+@keyframes latest-point-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+
+  80%, 100% {
+    transform: scale(2);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .latest-point-pulse {
+    animation: none;
+    opacity: 0;
+  }
 }
 </style>

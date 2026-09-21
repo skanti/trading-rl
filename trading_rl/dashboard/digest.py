@@ -96,8 +96,8 @@ def render_text(
         f"Trading day {snapshot.get('trading_day')}",
         f"Basket {position.get('entry_date')} -> {position.get('exit_date')}: closed",
         "",
-        f"{'Period':<18}{'P&L':>16}{'P&L %':>12}{'Status':>12}",
-        "-" * 58,
+        f"{'Period':<18}{'P&L':>16}{'P&L %':>12}",
+        "-" * 46,
     ]
     buckets = snapshot.get("performance") or {}
     for key in performance.BUCKET_ORDER:
@@ -108,7 +108,6 @@ def render_text(
             f"{str(bucket.get('label') or key):<18}"
             f"{_money(bucket.get('pnl'), signed=True):>16}"
             f"{_percent(bucket.get('pnl_pct'), signed=True):>12}"
-            f"{_performance_status(bucket):>12}"
         )
 
     lines += ["", "Closed basket", "-" * 73]
@@ -167,7 +166,6 @@ def render_html(
         f"{_money(bucket.get('pnl'), signed=True)}</td>"
         f"<td class='number' style='color:{_tone(bucket.get('pnl'))}'>"
         f"{_percent(bucket.get('pnl_pct'), signed=True)}</td>"
-        f"<td class='status'>{_performance_status(bucket)}</td>"
         "</tr>"
         for key in performance.BUCKET_ORDER
         if (bucket := buckets.get(key))
@@ -211,7 +209,6 @@ th,td {{ border-bottom:1px solid #e2e8f0; padding:9px 10px; text-align:left }}
 th {{ color:#64748b; font-size:12px; text-transform:uppercase }}
 .total td {{ border-top:2px solid #cbd5e1; font-weight:bold }}
 .number {{ text-align:right; font-variant-numeric:tabular-nums }}
-.status {{ color:#b45309; font-weight:bold; text-align:right }}
 .muted {{ color:#64748b }}
 .button {{ background:#0f172a; border-radius:8px; color:white; display:inline-block; padding:10px 16px; text-decoration:none }}
 </style></head><body><div class="card">
@@ -219,7 +216,7 @@ th {{ color:#64748b; font-size:12px; text-transform:uppercase }}
 <p class="muted">Trading day {escape(str(snapshot.get('trading_day') or ''))} · equity {_money(account.get('equity'))}</p>
 <p>Basket {escape(str(position.get('entry_date') or ''))} → {escape(str(position.get('exit_date') or ''))}: closed</p>
 <h2>Performance</h2>
-<table><thead><tr><th>Period</th><th class="number">P&amp;L</th><th class="number">P&amp;L %</th><th class="number">Status</th></tr></thead><tbody>{performance_rows}</tbody></table>
+<table><thead><tr><th>Period</th><th class="number">P&amp;L</th><th class="number">P&amp;L %</th></tr></thead><tbody>{performance_rows}</tbody></table>
 <h2>Closed basket</h2>
 <table><thead><tr><th>Symbol</th><th class="number">Qty</th><th class="number">Entry</th><th class="number">Exit</th><th class="number">P&amp;L</th><th class="number">P&amp;L %</th></tr></thead><tbody>{trade_rows}</tbody></table>
 {link}
