@@ -20,3 +20,13 @@ for strategy behavior, data formats, and command examples.
 Installed commands include `trading-dashboard`, `trading-dashboard-auth`,
 `trading-live`, `trading-backtest`, `trading-rank`, `trading-reconcile`, `download-bars`,
 `download-auctions`, and `download-nbbo`.
+
+## Daemon management
+
+The user starts and restarts all long-running processes, including live trading
+and the dashboard/digest publisher. Agents must not launch or restart daemons as
+part of code changes or deployments unless explicitly asked to do so. If a
+restart is needed, identify the process and leave the restart to the user.
+Do not stop user-managed processes unless explicitly requested.
+
+These instructions also live in [AGENTS.md](AGENTS.md) for future coding agents.
