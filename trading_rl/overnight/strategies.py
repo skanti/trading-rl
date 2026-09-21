@@ -15,6 +15,7 @@ STRATEGY_LABELS = {
     "liquidity-trend-vol": "Liquidity: trend + volatility target",
 }
 STRATEGIES = tuple(STRATEGY_LABELS)
+SPY_TREND_PRICE_SOURCES = ("daily-close", "minute-open-1559")
 
 
 @dataclass(frozen=True)

@@ -762,7 +762,7 @@ worker runs during entry preflight. Restart the live daemon after changing code
 or notification settings.
 
 The shipped strategy is `liquidity-trend-vol`: a 35% annual volatility target,
-20 completed modeled basket returns, a 100-session SPY trend filter, and a maximum
+20 completed modeled basket returns, a 100-session SPY daily-close trend filter, and a maximum
 2x exposure. `--strategy liquidity-fixed` retains cash-only fixed sizing. Both use
 the same execution workflow; see [strategy and risk details](STRATEGIES.md).
 

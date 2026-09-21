@@ -219,6 +219,11 @@ class StrategyTest(unittest.TestCase):
         self.assertLessEqual(pd.Timestamp(summary["last_exit_date"]), args["end_date"])
 
     def test_cli_and_config_validation(self):
+        self.assertEqual(build_parser().parse_args([]).spy_trend_price_source, "daily-close")
+        self.assertEqual(
+            build_parser().parse_args(["--spy-trend-price-source", "minute-open-1559"]).spy_trend_price_source,
+            "minute-open-1559",
+        )
         self.assertEqual(build_parser().parse_args([]).strategy, "liquidity-trend-vol")
         self.assertEqual(
             build_parser().parse_args(["--strategy", "liquidity-fixed"]).strategy, "liquidity-fixed"

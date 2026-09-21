@@ -58,6 +58,7 @@ from .history import (
     company_universe_mask,
     exchange_universe_mask,
     historical_window,
+    load_daily_closes,
     load_daily_dollar_volume,
     load_nasdaq_security_master,
     load_primary_auction_exchange_mask,
@@ -76,6 +77,7 @@ from .strategies import (
     MAX_OVERNIGHT_EXPOSURE as MAX_OVERNIGHT_LEVERAGE,
 )
 from .strategies import (
+    SPY_TREND_PRICE_SOURCES,
     STRATEGIES,
     STRATEGY_LABELS,
     LiquidityTrendVolConfig,
@@ -704,9 +706,12 @@ def run_backtest(
     strategy: str = "liquidity-fixed",
     strategy_config: LiquidityTrendVolConfig | None = None,
     spy_trend_marks: np.ndarray | None = None,
+    spy_trend_price_source: str = "daily-close",
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     if strategy not in STRATEGIES:
         raise ValueError(f"strategy must be one of {STRATEGIES}")
+    if spy_trend_price_source not in SPY_TREND_PRICE_SOURCES:
+        raise ValueError("unsupported SPY trend price source")
     trend_vol = strategy == "liquidity-trend-vol"
     if not np.isfinite(leverage) or not 0 < leverage <= MAX_OVERNIGHT_LEVERAGE:
         raise ValueError("leverage must be in (0, 2]")
@@ -722,7 +727,7 @@ def run_backtest(
         if leverage != 1.0:
             raise ValueError("liquidity-trend-vol controls exposure; --leverage applies only to liquidity-fixed")
         if spy_trend_marks is None or np.asarray(spy_trend_marks).shape != (len(dates),):
-            raise ValueError("liquidity-trend-vol requires one SPY 15:59 minute-open trend mark per date")
+            raise ValueError("liquidity-trend-vol requires one SPY trend price per date")
         if start_date < pd.Timestamp(config.risk_history_start):
             raise ValueError("liquidity-trend-vol start_date precedes risk_history_start")
         policy = LiquidityTrendVolPolicy(config, spy_trend_marks)
@@ -1015,6 +1020,7 @@ def run_backtest(
     summary: dict[str, object] = {
         "strategy": strategy,
         "strategy_config": config.as_dict() if trend_vol else {"leverage": float(leverage)},
+        "spy_trend_price_source": spy_trend_price_source if trend_vol else None,
         "exchange_membership_session": "entry" if trend_vol else "exit",
         "strategy_label": STRATEGY_LABELS[strategy],
         "leverage_label": f"dynamic exposure, {config.max_exposure:g}× cap" if trend_vol else f"{leverage:g}× leverage",
@@ -1106,6 +1112,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--strategy-config", type=Path, default=None,
                         help="JSON overrides for liquidity-trend-vol exposure parameters")
+    parser.add_argument(
+        "--spy-trend-price-source", choices=SPY_TREND_PRICE_SOURCES, default="daily-close",
+        help="SPY trend input; minute-open-1559 reproduces the original research",
+    )
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="save trades, portfolio, summary and chart together; liquidity-trend-vol defaults under /tmp/trading-backtests/candidate/liquidity-trend-vol")
     parser.add_argument("--top", type=int, default=12, help="daily basket size")
@@ -1377,10 +1387,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.strategy == "liquidity-trend-vol":
         if requested_start < pd.Timestamp(config.risk_history_start):
             parser.error("--since precedes liquidity-trend-vol risk_history_start")
-        spy_trend_marks = _symbol_daily_arrays(
-            REFERENCE_SYMBOL, {day: i for i, day in enumerate(cache_dates)},
-            cache_context_sod, data_dir, daily_data_dir, 959, 570, len(cache_dates),
-        )[2]
+        if args.spy_trend_price_source == "daily-close":
+            spy_trend_marks = load_daily_closes(daily_data_dir / f"{REFERENCE_SYMBOL}.npy", cache_dates)
+        else:
+            spy_trend_marks = _symbol_daily_arrays(
+                REFERENCE_SYMBOL, {day: i for i, day in enumerate(cache_dates)},
+                cache_context_sod, data_dir, daily_data_dir, 959, 570, len(cache_dates),
+            )[2]
     if shortened_entries:
         print(
             f"short sessions: skipping {len(shortened_entries):,} afternoon entr"
@@ -1568,6 +1581,7 @@ def main(argv: list[str] | None = None) -> None:
         strategy=args.strategy,
         strategy_config=config,
         spy_trend_marks=spy_trend_marks,
+        spy_trend_price_source=args.spy_trend_price_source,
     )
     summary["cache_path"] = str(cache_path)
     summary["asset_filter"] = args.asset_filter
@@ -1606,6 +1620,8 @@ def main(argv: list[str] | None = None) -> None:
         str(path): fingerprint(path)
         for path in dict.fromkeys([
             auction_path, Path(args.security_master_cache),
+            daily_data_dir / f"{REFERENCE_SYMBOL}.npy",
+            data_dir / f"{REFERENCE_SYMBOL}.npy",
             *([Path(args.nbbo_path)] if args.entry_price_source == "nbbo-ask" else []),
             *([Path(args.exit_nbbo_path)] if args.exit_price_source == "nbbo-bid" else []),
         ]) if path.is_file()

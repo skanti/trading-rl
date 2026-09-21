@@ -112,8 +112,9 @@ class RankingNotificationTest(unittest.TestCase):
             "completed_liquidity_ranking": [("A", 2.0, 2), ("B", 1.0, 2)],
         }
         with ExitStack() as stack:
+            mocked = {}
             for name, value in mocks.items():
-                stack.enter_context(
+                mocked[name] = stack.enter_context(
                     patch("trading_rl.overnight.live." + name, return_value=value)
                 )
             stack.enter_context(
@@ -130,6 +131,7 @@ class RankingNotificationTest(unittest.TestCase):
         self.assertEqual(
             callback.call_args.args[0].error_message, "missing opening auction"
         )
+        self.assertIn("SPY", mocked["seed_missing_daily_cache"].call_args.args[2])
         self.assertFalse(self.store.path.exists())
 
     def test_successful_cached_ranking_does_not_notify(self):

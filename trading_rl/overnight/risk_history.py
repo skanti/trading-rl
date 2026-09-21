@@ -5,7 +5,11 @@ import pandas as pd
 
 from .portfolio import basket_returns, select_strategy_basket
 from .ranking import liquidity_features
-from .strategies import LiquidityTrendVolConfig, LiquidityTrendVolPolicy
+from .strategies import (
+    SPY_TREND_PRICE_SOURCES,
+    LiquidityTrendVolConfig,
+    LiquidityTrendVolPolicy,
+)
 
 
 class BasketHistory:
@@ -116,8 +120,13 @@ def unit_return(entry_prices, exit_prices):
     ).unscaled_return
 
 
-def risk_signal(dates, observations, spy_marks, config: LiquidityTrendVolConfig):
+def risk_signal(
+    dates, observations, spy_marks, config: LiquidityTrendVolConfig,
+    *, spy_trend_price_source="daily-close",
+):
     """Observe all completed exits before asking for today's afternoon exposure."""
+    if spy_trend_price_source not in SPY_TREND_PRICE_SOURCES:
+        raise ValueError("unsupported SPY trend price source")
     dates = pd.DatetimeIndex(dates)
     if dates.has_duplicates or not dates.is_monotonic_increasing:
         raise ValueError("risk calendar must be unique and increasing")
@@ -150,6 +159,7 @@ def risk_signal(dates, observations, spy_marks, config: LiquidityTrendVolConfig)
         "trade_date": str(dates[-1].date()),
         "completed_exit_date": str(dates[-1].date()),
         "spy_mark_date": str(dates[-2].date()),
+        "spy_trend_price_source": spy_trend_price_source,
         "parameters": config.as_dict(),
         "target_exposure": policy.exposure(len(dates) - 1),
         "annualized_volatility": policy.annualized_volatility,

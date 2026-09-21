@@ -33,7 +33,7 @@ These instructions also live in [AGENTS.md](AGENTS.md) for future coding agents.
 
 ## Strategy experiments
 
-The `liquidity-trend-vol` strategy combines liquidity ranking, a SPY trend filter,
+The `liquidity-trend-vol` strategy combines liquidity ranking, a SPY daily-close trend filter,
 and volatility targeting (35% target and 2x cap by default):
 
 ```bash

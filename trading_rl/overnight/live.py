@@ -53,6 +53,7 @@ from .decision_replay import capture_decision_inputs
 from .entry_sizing import available_budget, trend_vol_budget
 from .history import (
     DEFAULT_SECURITY_MASTER_CACHE,
+    REFERENCE_SYMBOL,
     _security_symbol,
     is_company_security,
     load_nasdaq_security_master,
@@ -1063,6 +1064,9 @@ def dollar_volume_shortlist(
     excluded: list[str] = []
     int32_max = np.iinfo(np.int32).max
     for cache_path in sorted(bars_dir.glob("*.npy")):
+        # SPY is retained for risk inputs, never a stock-shortlist candidate.
+        if cache_path.stem == REFERENCE_SYMBOL:
+            continue
         array = np.load(cache_path, mmap_mode="r", allow_pickle=False)
         if array.ndim != 2 or array.shape[1] != DAILY_BAR_COLUMNS:
             raise ValueError(f"invalid daily cache file {cache_path}: {array.shape}")
@@ -1370,7 +1374,9 @@ def rank_for_day(
         cache_seed = seed_missing_daily_cache(
             client,
             bars_dir,
-            sorted(eligible_companies),
+            sorted(eligible_companies | (
+                {REFERENCE_SYMBOL} if config.strategy_name == "liquidity-trend-vol" else set()
+            )),
             config.shortlist_since,
             bars_end,
             config.feed,

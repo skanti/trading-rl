@@ -50,7 +50,7 @@ def signal(settings):
         configuration_sha256=configuration_fingerprint(settings),
         input_sha256="fixture",
         spy_history=[
-            {"date": str(day.date()), "minute_open": float(mark)}
+            {"date": str(day.date()), "price": float(mark)}
             for day, mark in zip(dates[-101:-1], marks[-101:-1], strict=True)
         ],
     )
@@ -86,6 +86,22 @@ def captured_plan(root):
 
 
 class DecisionReplayTest(unittest.TestCase):
+    def test_old_minute_open_and_new_daily_close_sessions_both_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary, _ = captured_plan(Path(directory))
+        daily = replay_entry_decision(summary)
+        self.assertEqual(daily["status"], "complete", daily)
+        self.assertEqual(daily["spy_trend_price_source"], "daily-close")
+        legacy = copy.deepcopy(summary)
+        saved = legacy["position"]["risk_signal"]
+        del saved["spy_trend_price_source"]
+        for row in saved["spy_history"]:
+            row["minute_open"] = row.pop("price")
+        replay = replay_entry_decision(legacy)
+        self.assertEqual(replay["status"], "complete", replay)
+        self.assertEqual(replay["spy_trend_price_source"], "minute-open-1559")
+        self.assertEqual(replay["order_payloads"], daily["order_payloads"])
+
     def test_live_preflight_is_exactly_replayable_without_broker_or_current_config(
         self,
     ):
@@ -137,7 +153,8 @@ class DecisionReplayTest(unittest.TestCase):
             lambda p: p["risk_signal"]["observations"][-1]["exit_prices"].__setitem__(
                 0, 999
             ),
-            lambda p: p["risk_signal"]["spy_history"][-1].update(minute_open=1),
+            lambda p: p["risk_signal"]["spy_history"][-1].update(price=1),
+            lambda p: p["risk_signal"].update(spy_trend_price_source="unknown"),
             lambda p: p.update(symbols=["B", "A"]),
         ):
             modified = copy.deepcopy(original)

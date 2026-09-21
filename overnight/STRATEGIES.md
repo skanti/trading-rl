@@ -14,12 +14,12 @@ Names describe strategy families; parameter values belong in `--strategy-config`
 select either policy. Existing processes retain their startup configuration until
 the user restarts them.
 
-`liquidity-trend-vol` preserves the selected research rules: the usual top 12 distinct
+`liquidity-trend-vol` uses the selected research rules: the usual top 12 distinct
 Nasdaq issuers and turnover-stability ranking, a 35% annual volatility target,
 2x maximum exposure, 20 completed unscaled net basket returns for volatility,
 and a 100-session SPY trend average. It uses 1x while volatility warms up
 (and when volatility is zero). Exposure is multiplied by 0.25 when the previous
-session's SPY 15:59 minute-open mark is below its trailing average or the trend
+session's split-adjusted SPY daily close is below its trailing average or the trend
 history is incomplete. Both SPY inputs exclude the current session.
 
 Ranking and SPY indicators use all available earlier history. Risk observations
@@ -77,9 +77,20 @@ filter. Entry prices are SIP asks at 15:45; exits are primary opening auctions;
 additional modeled costs are zero. Raw prices and a refreshed split ledger keep
 each entry/exit pair on the same basis. Missing quotes and auction prints are
 fetched through read-only data requests. SPY uses the previous 100 sessions'
-15:59 minute-open marks, refreshed with split adjustment. The current afternoon
-is excluded. A missing or stale required input blocks new entries; exits do not
+split-adjusted daily closes from the same daily cache as the backtester. Ranking
+seeds missing SPY daily history and refreshes it with the stock bars; SPY never
+occupies a stock-shortlist slot. The current day's close is excluded. A missing
+required input blocks new entries; exits do not
 require risk data. Actual leveraged account returns never feed the risk estimate.
+
+Backtests also default to daily closes. Use `--spy-trend-price-source minute-open-1559`
+to reproduce the original research price basis for comparison. The volatility
+window, overnight return inputs and execution prices stay the same. Run summaries
+and new live snapshots identify `spy_trend_price_source`; new snapshots store each
+SPY observation as `{date, price}`. Reconciliation continues to replay old snapshots
+containing `minute_open` using their original prices, without rewriting past trades.
+Changing the source invalidates a cached ranking signal and requires fresh risk
+preparation. An already prepared entry keeps its saved plan.
 
 Snapshots under `WORK_DIR/risk/liquidity-trend-vol/YYYY-MM-DD.json` record inputs,
 parameters, timestamps, configuration and data fingerprints. Ranking state also

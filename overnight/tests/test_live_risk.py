@@ -14,15 +14,17 @@ from unittest.mock import Mock
 import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
-from test_live import FakeBroker, config
+from test_live import FakeBroker, config, full_bar
 
 from trading_rl.overnight.live import (
     EASTERN,
     RANKING_PIPELINE_VERSION,
     DailyArtifacts,
     StateStore,
+    _daily_bars_to_array,
     _exit_order_summary,
     _validate_args,
+    dollar_volume_shortlist,
     enter_for_day,
     exit_position,
     parse_live_arguments,
@@ -83,7 +85,7 @@ def snapshot(settings, day=date(2026, 8, 24)):
         dates, observations, np.arange(len(dates)) + 100, settings.risk_config
     )
     signal["spy_history"] = [
-        {"date": str(dates[i].date()), "minute_open": float(i + 100)}
+        {"date": str(dates[i].date()), "price": float(i + 100)}
         for i in range(len(dates) - 101, len(dates) - 1)
     ]
     signal.update(
@@ -93,6 +95,16 @@ def snapshot(settings, day=date(2026, 8, 24)):
 
 
 class RiskHistoryTest(unittest.TestCase):
+    def test_spy_daily_history_cannot_displace_stock_shortlist_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for symbol, volume in (("SPY", 1000000), ("A", 100), ("B", 50)):
+                np.save(root / f"{symbol}.npy", _daily_bars_to_array(
+                    [full_bar("2026-08-21", volume)], symbol,
+                ))
+            names, _, _ = dollar_volume_shortlist(root, date(2026, 1, 1), top=1)
+            self.assertEqual(names, ["A"])
+
     def test_live_import_boundary_in_fresh_interpreter(self):
         script = """
 import importlib.abc
@@ -187,28 +199,32 @@ import trading_rl.overnight.reconcile_live_sessions
             entry = provider.adjusted_entry("A", date(2026, 8, 21), date(2026, 8, 24))
             self.assertAlmostEqual(unit_return([entry], [101]), 0.01)
 
-    def test_stale_spy_mark_fails_instead_of_using_any_bar_that_day(self):
+    def test_spy_uses_completed_daily_closes_without_minute_api_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = trend_config(
+                daily_bars_dir=Path(directory),
                 risk_nbbo_path=Path(directory) / "absent.npz",
                 risk_auctions_path=Path(directory) / "absent.npz",
             )
-            broker = Mock(data_url="https://data.alpaca.markets/v2")
-            broker._request.return_value = {
-                "bars": {
-                    "SPY": [
-                        {"t": "2026-08-20T13:30:00Z", "o": 100},
-                        {"t": "2026-08-21T19:59:00Z", "o": 101},
-                    ]
-                }
-            }
+            rows = [
+                {**full_bar(day, 1000, vwap=99), "c": close}
+                for day, close in (("2026-08-20", 100), ("2026-08-21", 101), ("2026-08-24", 999))
+            ]
+            np.save(Path(directory) / "SPY.npy", _daily_bars_to_array(rows, "SPY"))
+            broker = Mock()
             provider = RiskPriceProvider(
                 broker, settings, [], [], datetime(2026, 8, 24, 14, tzinfo=EASTERN)
             )
-            with self.assertRaisesRegex(ValueError, "stale SPY"):
-                provider.spy_marks(
-                    pd.to_datetime(["2026-08-20", "2026-08-21", "2026-08-24"]), 2
-                )
+            dates = pd.to_datetime(["2026-08-20", "2026-08-21", "2026-08-24"])
+            np.testing.assert_equal(provider.spy_marks(dates, 2), [100, 101, np.nan])
+            self.assertEqual(broker.mock_calls, [])
+            # Never forward-fill a missing completed session or use its open/VWAP.
+            np.save(Path(directory) / "SPY.npy", _daily_bars_to_array(rows[1:], "SPY"))
+            with self.assertRaisesRegex(ValueError, "missing SPY daily close for 2026-08-20"):
+                provider.spy_marks(dates, 2)
+            provider.now = datetime(2026, 8, 21, 14, tzinfo=EASTERN)
+            with self.assertRaisesRegex(ValueError, "completed previous daily bars"):
+                provider.spy_marks(dates, 2)
 
     def test_preopen_bootstrap_fails_before_network_or_any_order(self):
         client = Mock()
@@ -227,6 +243,8 @@ import trading_rl.overnight.reconcile_live_sessions
         settings = trend_config()
         signal = snapshot(settings)
         self.assertTrue(signal_is_current(signal, settings, date(2026, 8, 24)))
+        legacy = {**signal, "spy_trend_price_source": "minute-open-1559"}
+        self.assertFalse(signal_is_current(legacy, settings, date(2026, 8, 24)))
         self.assertFalse(signal_is_current(signal, settings, date(2026, 8, 25)))
         self.assertFalse(
             signal_is_current(signal, replace(settings, top=3), date(2026, 8, 24))

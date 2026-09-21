@@ -117,12 +117,17 @@ def replay_risk(saved, parameters, entry_day, top):
     )
     if dates[-1] != entry_day or max(spy_dates) >= entry_day:
         raise ValueError("risk history includes future information")
-    marks = {row["date"]: row["minute_open"] for row in spy}
+    # Older sessions predate explicit source metadata and archived minute_open.
+    # Preserve their actual basis even though new decisions use daily closes.
+    source = saved.get("spy_trend_price_source", "minute-open-1559")
+    field = "price" if "spy_trend_price_source" in saved else "minute_open"
+    marks = {row["date"]: row[field] for row in spy}
     result = risk_signal(
         pd.to_datetime(dates),
         observations,
         np.array([marks.get(day, np.nan) for day in dates]),
         config,
+        spy_trend_price_source=source,
     )
     for field in ("trade_date", "completed_exit_date", "spy_mark_date", "strong_trend"):
         if saved[field] != result[field]:
@@ -250,6 +255,7 @@ def replay_entry_decision(summary):
             },
             "replayed_symbols": selected,
             "target_exposure": risk["target_exposure"] if risk else None,
+            "spy_trend_price_source": risk["spy_trend_price_source"] if risk else None,
             "exposure_sizing": sizing,
         }
     except (KeyError, TypeError, ValueError, RuntimeError) as error:

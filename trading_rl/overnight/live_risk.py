@@ -21,6 +21,7 @@ from .history import (
     _official_opening_auctions,
     company_universe_mask,
     exchange_universe_mask,
+    load_daily_closes,
     load_daily_dollar_volume,
     load_primary_auction_exchange_mask,
     simulation_symbols,
@@ -31,7 +32,8 @@ from .risk_history import historical_baskets, risk_signal, unit_return
 
 def risk_configuration(config):
     return {
-        "pipeline_version": 2,
+        "pipeline_version": 3,
+        "spy_trend_price_source": "daily-close",
         "strategy": config.strategy_name,
         "parameters": config.risk_config.as_dict(),
         "top": config.top,
@@ -66,6 +68,7 @@ def signal_is_current(signal, config, trade_date):
     exposure = signal.get("target_exposure")
     return (
         signal.get("strategy") == config.strategy_name
+        and signal.get("spy_trend_price_source") == "daily-close"
         and signal.get("trade_date") == trade_date.isoformat()
         and signal.get("completed_exit_date") == trade_date.isoformat()
         and signal.get("configuration_sha256") == configuration_fingerprint(config)
@@ -245,45 +248,19 @@ class RiskPriceProvider:
         return value
 
     def spy_marks(self, dates, trend_window):
-        # Fetch the small relevant SPY history afresh so split bases cannot diverge
-        # between a stale minute archive and a current API response.
+        # rank_for_day refreshes the split-adjusted daily cache first, including
+        # SPY. Use that same source as the backtester, with no extra minute API call.
         selected = dates[-trend_window - 1 : -1]
-        params = {
-            "symbols": "SPY",
-            "start": _stamp(selected[0].date(), 240).isoformat(),
-            "end": _stamp(selected[-1].date(), 960).isoformat(),
-            "timeframe": "1Min",
-            "feed": "sip",
-            "adjustment": "split",
-            "sort": "asc",
-            "limit": 10000,
-        }
-        daily = {}
-        for page in _pages(self.client, "stocks/bars", params):
-            for bar in page.get("bars", {}).get("SPY", []):
-                stamp = pd.Timestamp(bar["t"]).tz_convert(EASTERN)
-                minute = stamp.hour * 60 + stamp.minute
-                price = float(bar["o"])
-                if (
-                    240 <= minute <= 959
-                    and np.isfinite(price)
-                    and price > 0
-                    and stamp.to_pydatetime() <= self.now
-                ):
-                    previous = daily.get(stamp.date())
-                    if previous is None or stamp > previous[0]:
-                        daily[stamp.date()] = (stamp, price)
+        if len(selected) != trend_window or any(
+            day.date() >= self.now.astimezone(EASTERN).date() for day in selected
+        ):
+            raise ValueError("SPY trend requires completed previous daily bars")
+        closes = load_daily_closes(self.config.daily_bars_dir / "SPY.npy", selected)
+        if not np.isfinite(closes).all():
+            missing = [str(day.date()) for day in selected[~np.isfinite(closes)]]
+            raise ValueError("missing SPY daily close for " + ", ".join(missing))
         marks = np.full(len(dates), np.nan)
-        for row in range(len(dates) - trend_window - 1, len(dates) - 1):
-            day = dates[row].date()
-            if day not in daily:
-                raise ValueError(f"missing SPY trend mark for {day}")
-            # Preserve the backtest's 15:59 minute-open mark, including after-hours
-            # prints on short sessions. An arbitrary earlier bar is not equivalent.
-            age = (_stamp(day, 959) - daily[day][0].to_pydatetime()).total_seconds()
-            if not 0 <= age <= 60:
-                raise ValueError(f"stale SPY 15:59 trend mark for {day}")
-            marks[row] = daily[day][1]
+        marks[-trend_window - 1 : -1] = closes
         return marks
 
 
@@ -378,7 +355,7 @@ def prepare_live_risk(
     signal["configuration_sha256"] = configuration_fingerprint(config)
     signal["created_at"] = now.isoformat()
     signal["spy_history"] = [
-        {"date": str(day.date()), "minute_open": float(mark)}
+        {"date": str(day.date()), "price": float(mark)}
         for day, mark in zip(
             dates[-config.risk_config.trend_window - 1 : -1],
             marks[-config.risk_config.trend_window - 1 : -1],

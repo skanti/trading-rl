@@ -475,6 +475,15 @@ def daily_bar_dates(path: Path) -> pd.DatetimeIndex:
     return _daily_bar_dates(np.load(path, mmap_mode="r"), path)
 
 
+def load_daily_closes(path: Path, dates: pd.DatetimeIndex) -> np.ndarray:
+    """Align split-adjusted daily closes without filling absent session prices."""
+    daily = np.load(path, mmap_mode="r")
+    daily_dates = _daily_bar_dates(daily, path)
+    close = np.asarray(daily[:, BAR_INDEX["close_mills"]], dtype=float) / 1000.0
+    close[~np.isfinite(close) | (close <= 0)] = np.nan
+    return pd.Series(close, index=daily_dates).reindex(dates).to_numpy()
+
+
 def load_daily_dollar_volume(
     path: Path,
     date_positions: Mapping[pd.Timestamp, int],
