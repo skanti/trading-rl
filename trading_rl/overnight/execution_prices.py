@@ -10,6 +10,7 @@ import pandas as pd
 
 from ..market_data.schema import BAR_INDEX
 from .history import _official_opening_auctions, _security_symbol
+from .price_archives import open_price_archive
 
 MINUTE_PRICE_COLUMNS = {
     f"minute-{field}": BAR_INDEX[f"{field}_mills"]
@@ -75,7 +76,7 @@ def load_scheduled_nbbo_prices(
         raise ValueError("NBBO side must be bid or ask")
     if path.suffix.lower() != ".npz":
         raise ValueError(f"NBBO data must use the split-adjusted NPZ format: {path}")
-    with np.load(path, allow_pickle=False) as data:
+    with open_price_archive(path) as data:
         required = {
             "symbol",
             "date",
@@ -92,21 +93,23 @@ def load_scheduled_nbbo_prices(
             data["split_adjusted"].item()
         ):
             raise ValueError(f"{path} does not contain pre-adjusted NBBO prices")
-        symbol_values = np.char.upper(
-            np.asarray(data["symbol"]).astype(str, copy=False)
+        symbol_values = data.derived(
+            "upper_symbols", lambda: np.char.upper(np.asarray(data["symbol"]).astype(str, copy=False))
         )
         date_values = np.asarray(data["date"], dtype="datetime64[D]")
         # SIP quotes mix whole seconds and fractional precision up to nanoseconds.
         # Infer neither column's format from its first row: all are ISO 8601.
-        targets = pd.to_datetime(
-            np.asarray(data["target_timestamp"]).astype(str, copy=False),
-            format="ISO8601",
-            utc=True,
+        targets = data.derived(
+            "parsed_targets", lambda: pd.to_datetime(
+                np.asarray(data["target_timestamp"]).astype(str, copy=False),
+                format="ISO8601", utc=True,
+            ),
         )
-        stamps = pd.to_datetime(
-            np.asarray(data["timestamp"]).astype(str, copy=False),
-            format="ISO8601",
-            utc=True,
+        stamps = data.derived(
+            "parsed_timestamps", lambda: pd.to_datetime(
+                np.asarray(data["timestamp"]).astype(str, copy=False),
+                format="ISO8601", utc=True,
+            ),
         )
         if targets.hasnans or stamps.hasnans:
             raise ValueError(f"{path} contains missing NBBO timestamps")

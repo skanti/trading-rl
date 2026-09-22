@@ -20,6 +20,7 @@ import requests
 
 from ..market_data.calendar import auction_close_minutes, short_entry_dates
 from ..market_data.schema import BAR_INDEX, validate_bar_columns, validate_bar_manifest
+from .price_archives import open_price_archive
 
 REFERENCE_SYMBOL = "SPY"
 EXTENDED_OPEN_MINUTE = 4 * 60
@@ -62,7 +63,7 @@ def _official_opening_auctions(
     """Select requested official opens without expanding every print into pandas."""
     if path.suffix.lower() != ".npz":
         raise ValueError(f"auction data must use the split-adjusted NPZ format: {path}")
-    with np.load(path, allow_pickle=False) as data:
+    with open_price_archive(path) as data:
         required = {
             "symbol",
             "date",

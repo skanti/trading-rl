@@ -14,12 +14,14 @@ import math
 import os
 import re
 import tempfile
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from .broker_fees import broker_fees_for_session
@@ -44,6 +46,7 @@ from .live import (
     completed_liquidity_ranking,
     load_credentials,
 )
+from .price_archives import cache_price_archives
 from .reconciliation_prices import MissingBenchmarkData, load_benchmark_prices
 
 DEFAULT_WORK_DIR = Path("/data/ppv1/live")
@@ -52,6 +55,32 @@ SCHEDULED_REPORTING_BENCHMARK = "scheduled_strategy"
 ACTUAL_TIME_REPORTING_BENCHMARK = "actual_time_1_min"
 DATE_DIRECTORY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONSOLE = Console()
+
+
+def session_progress(days: Sequence[date], description: str) -> Iterator[date]:
+    """Keep routine status transient in a terminal and silent in redirected output."""
+    with Progress(
+        TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(),
+        TimeElapsedColumn(), console=CONSOLE, transient=True,
+        disable=not CONSOLE.is_terminal,
+    ) as progress:
+        task = progress.add_task(description, total=len(days))
+        for day in days:
+            progress.update(task, description=f"{description} {day}")
+            yield day
+            progress.advance(task)
+
+
+def print_decision_replay(day: date, audit: Mapping[str, Any]) -> None:
+    CONSOLE.print(f"{day}: {audit['strategy_name']} decision replay {audit['status']}")
+    if audit["status"] == "complete":
+        exposure = audit["target_exposure"]
+        CONSOLE.print(
+            f"  Replayed budget {format_usd(audit['budget'])}"
+            + (f"; target exposure {exposure:.4f}x" if exposure is not None else "; cash sizing")
+        )
+    else:
+        CONSOLE.print(str(audit.get("reason") or audit.get("checks") or ""), style="yellow", markup=False)
 
 
 def parse_day(value: str) -> date:
@@ -1990,11 +2019,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-session-details",
         action="store_true",
-        help="print the reconciliation table for every individual session",
+        help="print decision/sizing replay details and the reconciliation table for every session",
     )
     return parser
 
 
+@cache_price_archives()
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -2033,22 +2063,28 @@ def main() -> None:
 
     if args.decision_only:
         output_dir = args.output_dir or args.work_dir / "reconciliations" / "decisions"
-        failed = False
-        for day in selected_days:
+        failures = 0
+        for day in session_progress(selected_days, "Replaying decisions"):
             _, summary = summaries[day]
             result = replay_entry_decision(summary)
+            session_failed = result["status"] != "complete"
             if not args.skip_ranking_replay:
                 try:
                     result['ranking_replay'] = replay_ranking(summary, args.work_dir / str(day) / 'ticks.jsonl')
                     if not result['ranking_replay']['exact_match']:
-                        failed = True
+                        session_failed = True
+                        CONSOLE.print(f"[yellow]{day}: ranking replay mismatch[/yellow]")
                 except (OSError, TypeError, ValueError) as error:
                     result['ranking_replay'] = {'status': 'unavailable', 'reason': str(error)}
-                    failed = True
+                    session_failed = True
+                    CONSOLE.print(f"{day}: ranking replay unavailable: {error}", style="yellow", markup=False)
             _atomic_json(output_dir / f'{day}.json', result)
-            CONSOLE.print(f"{day}: {result['strategy_name']} decision replay {result['status']}")
-            failed |= result['status'] != 'complete'
-        if failed:
+            if args.show_session_details or args.show_symbol_breakdown or result["status"] != "complete":
+                print_decision_replay(day, result)
+            failures += int(session_failed)
+        CONSOLE.print(f"Decision replay: {len(selected_days) - failures}/{len(selected_days)} sessions complete.")
+        CONSOLE.print(f"Wrote {len(selected_days)} decision replay reports to {output_dir}")
+        if failures:
             raise SystemExit(1)
         return
 
@@ -2111,7 +2147,7 @@ def main() -> None:
     failures = 0
     missing_sessions: list[tuple[date, str]] = []
     completed_results: list[dict[str, object]] = []
-    for entry_day in selected_days:
+    for entry_day in session_progress(selected_days, "Reconciling"):
         summary_path, summary = summaries[entry_day]
         try:
             result = reconcile_execution(
@@ -2167,17 +2203,13 @@ def main() -> None:
                         "error": str(error),
                         "warnings": ["execution reconciliation is still complete"],
                     }
-            audit = result["decision_replay"]
-            CONSOLE.print(f"{entry_day}: {audit['strategy_name']} decision replay {audit['status']}")
-            if audit['status'] == 'complete':
-                CONSOLE.print(f"  Replayed budget {format_usd(audit['budget'])}"
-                              + (f"; target exposure {audit['target_exposure']:.4f}x" if audit["target_exposure"] is not None else "; cash sizing"))
             json_path = output_dir / f"{entry_day.isoformat()}.json"
             csv_path = output_dir / f"{entry_day.isoformat()}.csv"
             _atomic_json(json_path, result)
             _atomic_csv(csv_path, result["rows"])
             completed_results.append(result)
             if args.show_session_details or args.show_symbol_breakdown:
+                print_decision_replay(entry_day, result["decision_replay"])
                 print_result(result, show_symbol_breakdown=args.show_symbol_breakdown)
         except MissingBenchmarkData as error:
             missing_sessions.append((entry_day, str(error)))

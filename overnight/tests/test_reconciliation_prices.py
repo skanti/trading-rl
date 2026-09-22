@@ -11,11 +11,73 @@ from rich.console import Console
 
 from trading_rl.overnight import reconcile_live_sessions as reconcile
 from trading_rl.overnight.backtest import ENTRY_PRICE_SOURCES, EXIT_PRICE_SOURCES
-from trading_rl.overnight.reconciliation_prices import BenchmarkPrice, MissingBenchmarkData
+from trading_rl.overnight.reconciliation_prices import BenchmarkPrice, MissingBenchmarkData, load_benchmark_prices
+from trading_rl.overnight.price_archives import cache_price_archives, open_price_archive
 from overnight.tests.test_reconcile_live_sessions import order, seconds
 
 
 class ReconciliationPricesTest(unittest.TestCase):
+    def test_archive_cache_reuses_decoding_without_caching_target_validation(self):
+        targets = {"AAPL": (self.entry_day, 959)}
+
+        def load(max_age=1, query=targets):
+            return load_benchmark_prices(
+                "nbbo-ask", self.entry_nbbo, query,
+                max_staleness_minutes=max_age, split_path=self.auctions,
+            )
+
+        expected = load()
+        original_load = np.load
+        with patch("trading_rl.overnight.price_archives.np.load", wraps=original_load) as read:
+            with cache_price_archives():
+                self.assertEqual(load(), expected)
+                self.assertEqual(load(), expected)
+                # A hit still validates the requested date, clock and freshness.
+                with self.assertRaisesRegex(MissingBenchmarkData, "quote is"):
+                    load(max_age=0)
+                with self.assertRaisesRegex(MissingBenchmarkData, "file contains"):
+                    load(query={"AAPL": (self.entry_day, 945)})
+                with self.assertRaisesRegex(MissingBenchmarkData, "unavailable"):
+                    load(query={"AAPL": (self.exit_day, 959)})
+                self.assertEqual(read.call_count, 1)
+            with cache_price_archives():
+                self.assertEqual(load(), expected)
+            self.assertEqual(read.call_count, 2)
+
+    def test_archive_cache_detects_replaced_inputs_and_bounds_open_files(self):
+        path = self.root / "changing.npz"
+        np.savez(path, price=[10.0])
+        with cache_price_archives(max_archives=1):
+            with open_price_archive(path) as first:
+                np.testing.assert_equal(first["price"], [10.0])
+                self.assertFalse(first["price"].flags.writeable)
+                first.derived("parsed", lambda: 10.0)
+            replacement = self.root / "replacement.npz"
+            np.savez(replacement, price=[20.0])
+            replacement.replace(path)
+            with open_price_archive(path) as second:
+                self.assertIsNot(first, second)
+                self.assertIsNone(first._archive.zip)
+                np.testing.assert_equal(second["price"], [20.0])
+                self.assertEqual(second.derived("parsed", lambda: 20.0), 20.0)
+            with open_price_archive(self.auctions) as third:
+                self.assertIsNone(second._archive.zip)
+                self.assertIn("price", third.files)
+        self.assertIsNone(third._archive.zip)
+
+    def test_archive_cache_releases_files_after_failure(self):
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            with cache_price_archives():
+                with open_price_archive(self.auctions) as cached:
+                    cached["price"]
+                    raise RuntimeError("interrupted")
+        self.assertIsNone(cached._archive.zip)
+        # A following independent read must not inherit the interrupted run.
+        with open_price_archive(self.auctions) as fresh:
+            self.assertIsNot(fresh, cached)
+            self.assertEqual(float(fresh["price"][0]), 20.0)
+        self.assertIsNone(fresh._archive.zip)
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

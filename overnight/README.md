@@ -938,7 +938,14 @@ python reconcile_live_sessions.py --since 2026-08-01 --show-session-details
 ```
 
 Results are written to `WORK_DIR/reconciliations/YYYY-MM-DD.json` and `.csv`. Use
-`--show-session-details` for the former per-session tables and
+the terminal progress bar to follow reconciliation; routine per-session replay
+messages are hidden by default, including when output is redirected. Warnings
+and mismatches remain visible. `--decision-only` prints one completion summary.
+Price archives and parsed NBBO timestamps are reused within each command, with
+at most four archives retained. Changed files are reloaded, and the cache is
+released on completion or failure. Every session still reruns its ranking and
+price/freshness checks; reconciled results are never cached.
+Use `--show-session-details` for per-session decision/sizing details and tables, and
 `--show-symbol-breakdown` for each symbol's actual and simulated entry/exit prices,
 price differences, and P&L attribution. Use
 `--entry-time` or `--liquidity-scheme` only to reconstruct legacy summaries that lack

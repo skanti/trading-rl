@@ -19,6 +19,7 @@ from .history import (
     _official_opening_auctions,
     _security_symbol,
 )
+from .price_archives import open_price_archive
 
 
 class MissingBenchmarkData(ValueError):
@@ -38,7 +39,7 @@ def _split_factors(
 ) -> dict[str, float]:
     if not path.exists():
         raise MissingBenchmarkData(f"split ledger does not exist: {path}")
-    with np.load(path, allow_pickle=False) as data:
+    with open_price_archive(path) as data:
         required = {
             "split_symbol",
             "split_ex_date",
