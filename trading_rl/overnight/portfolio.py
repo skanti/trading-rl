@@ -55,6 +55,7 @@ def basket_quantities(
     share_mode: str = "fractional",
     *,
     slots: int | None = None,
+    weights: np.ndarray | None = None,
 ) -> np.ndarray:
     """Size one equal-notional basket in fractional or whole shares.
 
@@ -64,6 +65,7 @@ def basket_quantities(
     priced above its per-name target therefore receives zero shares and its allocation
     remains cash. ``slots`` also reserves cash for selected names without prices;
     omitting it allocates across every supplied price, as live whole-share sizing does.
+    Explicit weights support experimental allocations and reserve any residual as cash.
     """
     prices = np.asarray(entry_prices, dtype=np.float64)
     if prices.ndim != 1 or not prices.size:
@@ -78,9 +80,17 @@ def basket_quantities(
     slot_count = prices.size if slots is None else slots
     if slot_count < prices.size:
         raise ValueError("slots cannot be fewer than the priced basket members")
-    target_notional = equal_notional(budget, slot_count)
+    target_notional = equal_notional(budget, slot_count) if weights is None else budget * allocation_weights(weights, len(prices))
     quantities = target_notional / prices
     return np.floor(quantities) if share_mode == "whole" else quantities
+
+
+def allocation_weights(weights, size):
+    """Validate explicit long weights; an unallocated fraction remains cash."""
+    values = np.asarray(weights, dtype=float)
+    if values.shape != (size,) or not np.isfinite(values).all() or (values < 0).any() or values.sum() > 1 + 1e-12:
+        raise ValueError("allocation weights must match prices, be finite and non-negative, and sum to at most one")
+    return values
 
 
 def unscaled_basket_return(entry_prices, exit_prices, top, cost_bps=0.0):
@@ -192,6 +202,7 @@ def basket_returns(
     max_entry_age=0.0,
     max_exit_age=0.0,
     require_complete=False,
+    weights=None,
 ):
     """Validate one modeled interval and retain cash weights for unavailable slots.
 
@@ -234,8 +245,12 @@ def basket_returns(
         raise ValueError(
             "risk history requires complete positive entry and exit prices"
         )
+    weighted_return = None
+    if weights is not None:
+        allocations = allocation_weights(weights, len(entries))
+        weighted_return = float(allocations[valid] @ (exits[valid] / entries[valid] - 1 - 2 * cost_bps / 10000))
     return BasketReturns(
         missing_entry,
         missing_exit,
-        unscaled_basket_return(entries[valid], exits[valid], slots, cost_bps),
+        unscaled_basket_return(entries[valid], exits[valid], slots, cost_bps) if weighted_return is None else weighted_return,
     )

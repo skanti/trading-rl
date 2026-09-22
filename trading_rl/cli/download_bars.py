@@ -204,6 +204,49 @@ def clean_ticker(ticker: str) -> str:
     return storage_ticker(ticker)
 
 
+def completed_daily_bar_end() -> datetime:
+    """Exclude the current New York date, including its still-forming daily bar."""
+    return datetime.now(ZoneInfo("America/New_York")).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(UTC) - timedelta(microseconds=1)
+
+
+def confirm_new_daily_symbol(ticker: str) -> dict | None:
+    """Confirm a new symbol after the daily cutoff; empty bars alone are insufficient.
+
+    Only an exact new-symbol corporate action on the first excluded New York
+    date qualifies. Unknown symbols, older changes and failed lookups remain
+    download failures. This does not infer listing dates from first-seen files.
+    """
+    start = (completed_daily_bar_end() + timedelta(microseconds=1)).astimezone(
+        ZoneInfo("America/New_York")
+    ).date().isoformat()
+    url = "https://data.alpaca.markets/v1/corporate-actions"
+    params = {"symbols": clean_ticker(ticker), "types": "name_change", "start": start, "end": start}
+    headers = {
+        "APCA-API-KEY-ID": os.environ["ALPACA_DATA_KEY"],
+        "APCA-API-SECRET-KEY": os.environ["ALPACA_DATA_SECRET"],
+    }
+    seen_tokens = set()
+    with requests.Session() as session:
+        while True:
+            payload = request_json(session, url, params, headers, ticker)
+            for action in payload.get("corporate_actions", {}).get("name_changes", []):
+                if (action.get("new_symbol") == clean_ticker(ticker)
+                        and action.get("old_symbol")
+                        and action["old_symbol"] != action["new_symbol"]
+                        and action.get("process_date") == start):
+                    return {"old_symbol": action["old_symbol"], "new_symbol": action["new_symbol"],
+                            "process_date": start, "source": url}
+            token = payload.get("next_page_token")
+            if not token:
+                return None
+            if token in seen_tokens:
+                raise ValueError("repeated corporate-action page token")
+            seen_tokens.add(token)
+            params["page_token"] = token
+
+
 def download_bars_alpaca_batch(
     tickers: list[str], since: datetime, timeframe: str = "1Min"
 ) -> dict[str, pd.DataFrame]:
@@ -225,9 +268,7 @@ def download_bars_alpaca_batch(
         # Never persist a still-forming daily bar: it would differ on the next
         # update and falsely look like a historical correction requiring a full
         # symbol refresh. Daily downloads intentionally lag until the next NY day.
-        dt_end = datetime.now(ZoneInfo("America/New_York")).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).astimezone(UTC) - timedelta(microseconds=1)
+        dt_end = completed_daily_bar_end()
     else:
         dt_end = datetime.now(UTC) - ALPACA_SIP_DELAY
     if timeframe == "1Day":
@@ -340,6 +381,7 @@ def process_ticker(
     timeframe: str = "1Min",
     initial_df: pd.DataFrame | None = None,
     report: DownloadReport | None = None,
+    deferred_listings: dict | None = None,
 ) -> bool:
     ticker = storage_ticker(ticker)
     out_path = f"{out_dir}/{ticker}.npy"
@@ -409,6 +451,16 @@ def process_ticker(
             else download_ticker(ticker, source, since, timeframe)
         )
         if len(df) == 0:
+            if source == "alpaca" and timeframe == "1Day" and not existed:
+                confirmation = confirm_new_daily_symbol(ticker)
+                if confirmation is not None:
+                    if deferred_listings is not None:
+                        deferred_listings[ticker] = confirmation
+                    logger.info(
+                        "Skipping %s: confirmed new symbol from %s on %s; no completed daily session yet",
+                        ticker, confirmation["old_symbol"], confirmation["process_date"],
+                    )
+                    return finished(True, "Skipped")
             logger.warning(f"No bars found, ticker={ticker}")
             return finished(False)
         return finished(
@@ -454,6 +506,7 @@ def process_alpaca_batch(
     overlap_days: int,
     timeframe: str,
     report: DownloadReport | None = None,
+    deferred_listings: dict | None = None,
 ) -> list[tuple[int, bool]]:
     """Download a symbol batch once, then apply normal per-symbol persistence.
 
@@ -481,6 +534,7 @@ def process_alpaca_batch(
                 overlap_days=overlap_days,
                 timeframe=timeframe,
                 report=report,
+                deferred_listings=deferred_listings,
             )
             return [(index, succeeded)]
         midpoint = len(tasks) // 2
@@ -498,6 +552,7 @@ def process_alpaca_batch(
             overlap_days,
             timeframe,
             report,
+            deferred_listings,
         ) + process_alpaca_batch(
             tasks[midpoint:],
             out_dir,
@@ -507,6 +562,7 @@ def process_alpaca_batch(
             overlap_days,
             timeframe,
             report,
+            deferred_listings,
         )
 
     outcomes = []
@@ -523,6 +579,7 @@ def process_alpaca_batch(
             timeframe=timeframe,
             initial_df=frame,
             report=report,
+            deferred_listings=deferred_listings,
         )
         outcomes.append((index, succeeded))
     return outcomes
@@ -624,6 +681,7 @@ def main(
     if rot:
         tickers = [rot13(ticker) for ticker in tickers]
     tickers_num = len(tickers)
+    deferred_listings = {}
     report.set("Requested", tickers_num, "symbols")
     assert tickers_num > 0, "No tickers found"
     logger.info("Processing %s symbols", f"{tickers_num:,}")
@@ -660,6 +718,7 @@ def main(
             overlap_days=overlap_days,
             timeframe=timeframe,
             report=report,
+            deferred_listings=deferred_listings,
         )
         outcomes: list[tuple[int, bool]] = []
         if workers_num == 0:
@@ -692,6 +751,7 @@ def main(
             overlap_days=overlap_days,
             timeframe=timeframe,
             report=report,
+            deferred_listings=deferred_listings,
         )
         if workers_num == 0:
             res = list(
@@ -711,7 +771,7 @@ def main(
                     res[futures[future]] = future.result()
                     progress.update(1)
 
-    success_num = sum(res)
+    success_num = sum(res) - len(deferred_listings)
     failed_tickers = [
         ticker for ticker, succeeded in zip(tickers, res) if not succeeded
     ]
@@ -737,6 +797,8 @@ def main(
         "tickers_path": str(pathlib.Path(tickers_path).resolve()),
         "ticker_count": tickers_num,
         "success_count": success_num,
+        "deferred_count": len(deferred_listings),
+        "deferred_listings": deferred_listings,
         "failed_count": len(failed_tickers),
         "update_existing": update_existing,
         "overlap_days": overlap_days,

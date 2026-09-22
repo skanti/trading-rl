@@ -57,7 +57,7 @@ overnight-universe = "trading_rl.overnight.universe:main"
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["trading_rl*", "ml*"]
+include = ["trading_rl*", "ml*", "research*"]
 exclude = ["ml.tests*"]
 namespaces = false
 

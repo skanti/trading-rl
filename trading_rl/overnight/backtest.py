@@ -19,16 +19,25 @@ import os
 import tempfile
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 from tqdm import tqdm
 
 from ..market_data.calendar import auction_close_minutes
 from ..market_data.schema import validate_bar_columns
+from .backtest_report import comparison_metadata
+from .backtest_strategies import (
+    BUILTIN_STRATEGIES,
+    PolicyContext,
+    get_strategy,
+    register_plugin,
+)
 
 # Re-export historical helper names for compatibility with existing callers.
 from .execution_prices import (  # noqa: F401
@@ -66,6 +75,7 @@ from .history import (
     simulation_symbols,
 )
 from .portfolio import (
+    allocation_weights,
     basket_quantities,
     basket_returns,
     equal_notional,
@@ -78,11 +88,8 @@ from .strategies import (
 )
 from .strategies import (
     SPY_TREND_PRICE_SOURCES,
-    STRATEGIES,
     STRATEGY_LABELS,
     LiquidityTrendVolConfig,
-    LiquidityTrendVolPolicy,
-    load_trend_vol_config,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -417,55 +424,34 @@ def _benchmark_metrics(returns: pd.Series) -> dict[str, object]:
             for key in strategy_metrics(np.zeros(1))}
 
 
-def _metric_text(summary: dict[str, object]) -> str:
-    minimum_trading_days = int(summary["minimum_completed_trading_days"])
-    if summary["liquidity_scheme"] == "dollar_ema":
-        return (
-            f"lagged log-dollar-volume EMA({summary['ema_span_sessions']}), "
-            f"minimum {minimum_trading_days} completed trading days"
-        )
-    if summary["liquidity_scheme"] == "turnover_stability":
-        return (
-            f"lagged log-dollar-volume EMA({summary['ema_span_sessions']}) less its "
-            f"{summary['ema_span_sessions']}-session dispersion, "
-            f"minimum {minimum_trading_days} completed trading days"
-        )
-    raise ValueError(f"unknown liquidity scheme: {summary['liquidity_scheme']}")
 
-
-def print_summary_table(summary: dict[str, object], console: Console | None = None) -> None:
-    """Render the human-facing CLI report while leaving JSON optional."""
-    output = console or Console()
-    strategy = summary["strategy_metrics"]
-    spy_buy_hold = summary["spy_buy_and_hold_metrics"]
-    if not all(isinstance(metrics, dict) for metrics in (strategy, spy_buy_hold)):
+def comparison_table(summaries: list[dict], *, single: bool = False) -> Table:
+    """Render the same metrics for every strategy and one common benchmark."""
+    summary = summaries[0]
+    metrics = [item["strategy_metrics"] for item in summaries] + [summary["spy_buy_and_hold_metrics"]]
+    if not all(isinstance(group, dict) for group in metrics):
         raise TypeError("summary metric groups must be mappings")
-
-    comparison = Table(title=summary.get("strategy_label", STRATEGY_LABELS["liquidity-fixed"]), show_header=True, header_style="bold")
+    title = summary.get("strategy_label", STRATEGY_LABELS["liquidity-fixed"]) if single else "Strategy comparison"
+    comparison = Table(title=title, show_header=True, header_style="bold")
     comparison.add_column("Metric")
-    comparison.add_column(f"Top {summary['top']}", justify="right")
+    for item in summaries:
+        label = item.get("strategy", "liquidity-fixed")
+        comparison.add_column(label, justify="right", overflow="fold")
     comparison.add_column("SPY buy & hold", justify="right")
     starting_capital = float(summary["budget"]) if summary.get("budget") is not None else 1.0
-    comparison.add_row("Start capital", *(f"${starting_capital:,.2f}" for _ in range(2)))
-    ending_capitals = (
-        float(summary.get(
-            "ending_equity", starting_capital * (1.0 + float(strategy["total_return"])),
-        )),
-        starting_capital * (1.0 + float(spy_buy_hold["total_return"])),
-    )
+    comparison.add_row("Start capital", *(f"${starting_capital:,.2f}" for _ in metrics))
+    ending_capitals = [
+        float(item.get("ending_equity", starting_capital * (1 + item["strategy_metrics"]["total_return"])))
+        for item in summaries
+    ] + [starting_capital * (1 + metrics[-1]["total_return"])]
     comparison.add_row(
-        "End capital",
-        *(f"${value:,.2f}" if np.isfinite(value) else "n/a" for value in ending_capitals),
+        "End capital", *(f"${value:,.2f}" if np.isfinite(value) else "n/a" for value in ending_capitals),
     )
-    strategy_trades = int(summary["trades"])
-    trade_counts = (strategy_trades, int(spy_buy_hold["periods"] > 0))
+    trade_counts = [int(item["trades"]) for item in summaries] + [int(metrics[-1]["periods"] > 0)]
     best_trade_count = min(trade_counts)
     comparison.add_row(
         "Round trips",
-        *(
-            f"[bold]{value:,}[/bold]" if value == best_trade_count else f"{value:,}"
-            for value in trade_counts
-        ),
+        *(f"[bold]{value:,}[/bold]" if value == best_trade_count else f"{value:,}" for value in trade_counts),
     )
     rows = (
         ("Total return", "total_return", 100.0, "%", 2, True),
@@ -485,10 +471,7 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
         ("Calmar ratio", "calmar_ratio", 1.0, "", 2, True),
     )
     for label, key, scale, suffix, precision, higher_is_better in rows:
-        values = (
-            float(strategy[key]) * scale,
-            float(spy_buy_hold[key]) * scale,
-        )
+        values = [float(group[key]) * scale for group in metrics]
         finite_values = [value for value in values if np.isfinite(value)]
         winning_value = (
             (max(finite_values) if higher_is_better else min(finite_values))
@@ -505,144 +488,15 @@ def print_summary_table(summary: dict[str, object], console: Console | None = No
             label,
             *formatted,
         )
-    output.print(comparison)
+    comparison.add_section()
+    for label, values in comparison_metadata(summaries).items():
+        comparison.add_row(label, *(Text(value, justify="left", overflow="fold") for value in values))
+    return comparison
 
-    details = Table(show_header=False, box=None, padding=(0, 1))
-    details.add_column(style="bold")
-    details.add_column()
-    details.add_row(
-        "Period",
-        f"{summary['first_entry_date']} {summary['entry_time_eastern']} -> "
-        f"{summary['last_exit_date']} {str(summary['exit_time_eastern']).split()[0]} Eastern",
-    )
-    details.add_row("Sessions / trades", f"{strategy['periods']} / {summary['trades']:,}")
-    skipped_short = int(summary.get("skipped_short_entry_sessions", 0))
-    if skipped_short:
-        details.add_row("Short sessions", f"{skipped_short} afternoon entries skipped")
-    details.add_row(
-        "Liquidity ranking",
-        _metric_text(summary),
-    )
-    if summary.get("strategy") == "liquidity-trend-vol":
-        details.add_row("Exposure policy", f"{summary['strategy_config']}; mean exposure {summary['average_exposure']:.2f}x")
-        details.add_row("Financing", f"{summary['margin_interest_rate']:.2%} annual; calendar days / 360; borrow drag {summary['annual_borrow_drag']:.2%}/yr")
-    details.add_row("Cost", f"{summary['transaction_cost_bps_per_side']:.2f} bps per side")
-    source_descriptions = {
-        **{
-            source: f"Alpaca SIP minute-bar {source.removeprefix('minute-')}"
-            for source in MINUTE_PRICE_COLUMNS
-        },
-        "nbbo-ask": "latest causal SIP ask",
-        "nbbo-bid": "latest causal SIP bid",
-        "opening-auction": "split-adjusted primary opening auction (Alpaca SIP condition O)",
-    }
-    for side in ("entry", "exit"):
-        source = summary[f"{side}_price_source"]
-        clock = str(summary[f"{side}_time_eastern"]).split()[0]
-        timing = f"at {clock} Eastern"
-        if source in MINUTE_PRICE_COLUMNS and source != "minute-open":
-            hour, minute = map(int, clock.split(":"))
-            end_minute = (hour * 60 + minute + 1) % (24 * 60)
-            timing = (
-                f"during {clock}–{end_minute // 60:02d}:{end_minute % 60:02d} Eastern "
-                "(hypothetical fill)"
-            )
-        details.add_row(
-            f"{side.title()} price source",
-            f"{source}: {source_descriptions[source]} {timing}",
-        )
-    if summary.get("skipped_missing_prices", 0):
-        details.add_row(
-            "WARNING: missing prices",
-            f"{summary['skipped_missing_prices']} symbol/date positions skipped across "
-            f"{summary['missing_price_sessions']} sessions; original allocations held as cash. "
-            "Missing exits are retrospective exclusions.",
-        )
-    if summary.get("missing_benchmark_sessions", 0):
-        details.add_row("WARNING: benchmark gaps",
-                        f"{summary['missing_benchmark_sessions']} sessions unavailable; "
-                        "benchmark aggregate metrics are not reported")
-    if summary.get("budget") is None:
-        details.add_row("Capital basis", "$1.00 normalized start; set --budget for dollar sizing")
-    if summary.get("budget") is not None:
-        details.add_row(
-            "Position sizing",
-            f"{summary['share_mode']} shares; "
-            f"mean deployed ${float(summary['average_capital_deployed']):,.2f} "
-            f"({float(summary['average_capital_utilization']):.2%}), "
-            f"mean basket {float(summary['average_executed_basket_size']):.2f}/"
-            f"{int(summary['basket_size'])}",
-        )
-        if summary["share_mode"] == "whole":
-            details.add_row(
-                "Whole-share effects",
-                f"minimum utilization {float(summary['minimum_capital_utilization']):.2%}; "
-                f"minimum basket {int(summary['minimum_executed_basket_size'])}/"
-                f"{int(summary['basket_size'])}; skipped selections "
-                f"{int(summary['skipped_selections']):,}; mean weight spread "
-                f"{float(summary['average_position_weight_spread']):.2%}",
-            )
-    details.add_row(
-        "KPI sampling",
-        f"daily at {str(summary['exit_time_eastern']).split()[0]}; "
-        "buy-and-hold SPY remains continuously invested",
-    )
-    if float(summary.get("leverage", 1.0)) > 1.0:
-        unlevered = summary["unlevered_metrics"]
-        details.add_row(
-            "Leverage",
-            f"{summary['leverage']:.2f}x at {summary['margin_interest_rate']:.2%} annual "
-            f"(rate/360 per calendar day, mean hold "
-            f"{summary['mean_holding_calendar_days']:.2f}d); "
-            f"borrow drag {summary['annual_borrow_drag']:.2%}/yr",
-        )
-        details.add_row(
-            "Unlevered comparison",
-            f"return {unlevered['annualized_return']:.2%}, "
-            f"Sharpe {unlevered['sharpe_zero_cash_rate']:.2f}, "
-            f"max drawdown {unlevered['max_drawdown']:.2%}",
-        )
-        details.add_row(
-            "Margin headroom",
-            f"worst session leaves {summary['worst_session_margin_ratio']:.0%} equity "
-            f"against a {summary['maintenance_margin']:.0%} floor; "
-            f"that session breaches at {summary['margin_breach_leverage']:.2f}x",
-        )
-    # Tolerate summaries built before these keys existed rather than raising in display.
-    duplicate_days = int(summary.get("sessions_with_two_classes_of_one_issuer", 0))
-    unnamed = int(summary.get("symbols_without_an_issuer_name", 0))
-    if "deduped_share_classes" not in summary:
-        detail = None
-    elif summary["deduped_share_classes"]:
-        detail = "one share class per company"
-        if duplicate_days:
-            detail = f"FAILED: {duplicate_days} session(s) still hold two classes of one issuer"
-        if unnamed:
-            detail += f"; {unnamed} traded symbol(s) had no name in the security master"
-    else:
-        detail = "disabled"
-        if duplicate_days:
-            detail += f"; {duplicate_days} session(s) hold two classes of one issuer"
-    if detail is not None:
-        details.add_row("Share classes", detail)
-    details.add_row("Unique symbols", f"{summary['unique_symbols_traded']:,}")
-    details.add_row(
-        "Daily membership changes",
-        f"mean {summary['average_daily_membership_replacements']:.2f}, "
-        f"maximum {summary['maximum_daily_membership_replacements']}",
-    )
-    details.add_row(
-        "Membership stability",
-        f"retention {summary['average_daily_membership_retention']:.2%}, "
-        f"Jaccard {summary['average_daily_membership_jaccard']:.3f}",
-    )
-    details.add_row(
-        "Stale exit marks",
-        f"{summary['stale_exit_marks_over_10_minutes']} over 10 minutes; "
-        f"maximum {summary['maximum_exit_staleness_minutes']:.1f} minutes",
-    )
-    details.add_row("Cache", str(summary.get("cache_path", "not written")))
-    output.print(details)
+
+def print_summary_table(summary: dict[str, object], console: Console | None = None) -> None:
+    """Render metrics and metadata in one strategy/benchmark table."""
+    (console or Console()).print(comparison_table([summary], single=True))
 
 
 def print_symbol_trade_counts(
@@ -707,30 +561,34 @@ def run_backtest(
     strategy_config: LiquidityTrendVolConfig | None = None,
     spy_trend_marks: np.ndarray | None = None,
     spy_trend_price_source: str = "daily-close",
+    daily_closes: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    if strategy not in STRATEGIES:
-        raise ValueError(f"strategy must be one of {STRATEGIES}")
+    spec = get_strategy(strategy)
     if spy_trend_price_source not in SPY_TREND_PRICE_SOURCES:
         raise ValueError("unsupported SPY trend price source")
-    trend_vol = strategy == "liquidity-trend-vol"
+    trend_vol = spec.policy_type is not None
     if not np.isfinite(leverage) or not 0 < leverage <= MAX_OVERNIGHT_LEVERAGE:
         raise ValueError("leverage must be in (0, 2]")
     if strategy_config is not None and not trend_vol:
-        raise ValueError("strategy_config applies only to liquidity-trend-vol")
-    config = strategy_config or LiquidityTrendVolConfig()
+        raise ValueError("strategy_config requires a dynamic exposure strategy")
+    config = strategy_config or spec.load_config()
+    if trend_vol and type(config) is not spec.config_type:
+        raise ValueError(f"strategy_config must be {spec.config_type.__name__}")
     policy = None
     if margin_interest_rate is None:
         margin_interest_rate = 0.0675 if trend_vol else 0.0
     if trend_vol:
         if exit_minute >= entry_minute:
-            raise ValueError("liquidity-trend-vol requires exit-time before entry-time so risk observations are completed")
+            raise ValueError(f"{strategy} requires exit-time before entry-time so risk observations are completed")
         if leverage != 1.0:
-            raise ValueError("liquidity-trend-vol controls exposure; --leverage applies only to liquidity-fixed")
+            raise ValueError(f"{strategy} controls exposure; --leverage applies only to liquidity-fixed")
         if spy_trend_marks is None or np.asarray(spy_trend_marks).shape != (len(dates),):
-            raise ValueError("liquidity-trend-vol requires one SPY trend price per date")
+            raise ValueError(f"{strategy} requires one SPY trend price per date")
         if start_date < pd.Timestamp(config.risk_history_start):
-            raise ValueError("liquidity-trend-vol start_date precedes risk_history_start")
-        policy = LiquidityTrendVolPolicy(config, spy_trend_marks)
+            raise ValueError(f"{strategy} start_date precedes risk_history_start")
+        policy = spec.policy_type(config, spy_trend_marks)
+        if hasattr(policy, "prepare"):
+            policy.prepare(PolicyContext(dates, symbols, daily_closes))
     if not np.isfinite(margin_interest_rate) or not 0 <= margin_interest_rate <= 1:
         raise ValueError("margin_interest_rate must be a fraction between 0 and 1")
     if not np.isfinite(transaction_cost_bps) or transaction_cost_bps < 0.0:
@@ -798,6 +656,9 @@ def run_backtest(
     for date_index in replay_entries:
         cash_session = not entry_session_mask[date_index]
         exposure = policy.exposure(date_index) if policy is not None else float(leverage)
+        exposure_cap = min(MAX_OVERNIGHT_LEVERAGE, config.max_exposure) if policy is not None else MAX_OVERNIGHT_LEVERAGE
+        if not np.isfinite(exposure) or not 0 <= exposure <= exposure_cap:
+            raise ValueError(f"{strategy} returned invalid exposure {exposure}; this engine supports long/cash exposure in [0, 2]")
         selected = basket_history.select(
             date_index, entry_allowed=not cash_session,
             entry_prices=entry_prices[date_index], entry_staleness=entry_staleness[date_index],
@@ -809,6 +670,9 @@ def run_backtest(
                            if execution_exchange_mask is not None else None),
         )
         selected_ranks = np.arange(1, len(selected) + 1)
+        weights = None
+        if policy is not None and hasattr(policy, "weights"):
+            weights = allocation_weights(policy.weights(date_index, selected), len(selected))
         selected_entries = entry_prices[date_index, selected]
         selected_entry_staleness = entry_staleness[date_index, selected]
         exits = morning_prices[date_index + 1, selected]
@@ -817,12 +681,13 @@ def run_backtest(
             selected_entries, exits, slots=top, cost_bps=transaction_cost_bps,
             entry_staleness=selected_entry_staleness, exit_staleness=exit_staleness,
             max_entry_age=entry_age_limit, max_exit_age=exit_age_limit,
+            weights=weights,
         )
         missing_entry, missing_exit = observation.missing_entry, observation.missing_exit
         missing = observation.missing
         if trend_vol and missing.any():
             names = ", ".join(symbols[selected[missing]])
-            raise ValueError(f"liquidity-trend-vol requires complete fresh prices on {dates[date_index].date()}: {names}")
+            raise ValueError(f"{strategy} requires complete fresh prices on {dates[date_index].date()}: {names}")
         unscaled_return = observation.unscaled_return
         if policy is not None:
             policy.observe(unscaled_return)
@@ -842,14 +707,17 @@ def run_backtest(
         session_budget = current_equity
         quantities = np.zeros(len(selected), dtype=np.float64)
         valid = ~missing
-        if valid.any():
+        if valid.any() and exposure > 0:
             # Preserve the original per-stock allocation, including skipped slots.
             quantities[valid] = basket_quantities(
-                selected_entries[valid], session_budget * exposure, share_mode, slots=top
+                selected_entries[valid], session_budget * exposure, share_mode, slots=top,
+                weights=weights[valid] if weights is not None else None,
             )
         executed = quantities > 0.0
-        skipped = int((~executed).sum())
-        if not executed.any() and not missing.any() and not cash_session:
+        intended = np.ones(len(selected), dtype=bool) if weights is None else weights > 0
+        skipped = int((~executed & intended).sum()) if exposure > 0 else 0
+        has_allocation = weights is None or weights.sum() > 0
+        if not executed.any() and not missing.any() and not cash_session and exposure > 0 and has_allocation:
             raise ValueError(
                 f"equity ${session_budget:,.2f} cannot buy one share from the selected "
                 f"basket on {dates[date_index].date()}"
@@ -858,6 +726,8 @@ def run_backtest(
         selected_ranks = selected_ranks[executed]
         selected_entries = selected_entries[executed]
         quantities = quantities[executed]
+        if weights is not None:
+            weights = weights[executed]
         exits = exits[executed]
         exit_staleness = exit_staleness[executed]
         gross = exits / selected_entries - 1.0
@@ -904,7 +774,10 @@ def run_backtest(
                     "liquidity_score": scores[date_index, selected],
                     "share_mode": share_mode,
                     "budget": session_budget,
-                    "target_notional": equal_notional(session_budget * exposure, top),
+                    "target_notional": (
+                        session_budget * exposure * weights if weights is not None
+                        else equal_notional(session_budget * exposure, top) if exposure > 0 else 0.0
+                    ),
                     "exposure": exposure,
                     "portfolio_start_equity": session_budget,
                     "portfolio_end_equity": current_equity,
@@ -1022,7 +895,8 @@ def run_backtest(
         "strategy_config": config.as_dict() if trend_vol else {"leverage": float(leverage)},
         "spy_trend_price_source": spy_trend_price_source if trend_vol else None,
         "exchange_membership_session": "entry" if trend_vol else "exit",
-        "strategy_label": STRATEGY_LABELS[strategy],
+        "strategy_label": spec.label,
+        "experimental": spec.experimental,
         "leverage_label": f"dynamic exposure, {config.max_exposure:g}× cap" if trend_vol else f"{leverage:g}× leverage",
         "average_exposure": float(sessions.exposure.mean()),
         "maximum_exposure": float(sessions.exposure.max()),
@@ -1100,25 +974,57 @@ def run_backtest(
     return trades, summary
 
 
+class BacktestArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        try:
+            for module in parsed.strategy_plugin:
+                register_plugin(module)
+            raw = parsed.strategy if isinstance(parsed.strategy, list) else [parsed.strategy]
+            names = [name.strip() for token in raw for name in token.split(",") if name.strip()]
+            if not names or len(names) != len(set(names)):
+                raise ValueError("--strategy requires distinct, nonempty strategy names")
+            for name in names:
+                get_strategy(name)
+            parsed.strategies = names
+            parsed.strategy = names[0]
+            spec = get_strategy(parsed.strategy)
+            if len(names) > 1:
+                if parsed.strategy_config is not None:
+                    raise ValueError("--strategy-config requires a single strategy; compare strategy defaults or run configured variants separately")
+                if parsed.output_csv or parsed.summary_json:
+                    raise ValueError("with multiple strategies, use --output-dir instead of --output-csv or --summary-json")
+        except (ImportError, ValueError) as error:
+            self.error(str(error))
+        parsed.top_override = parsed.top
+        parsed.ema_span_override = parsed.ema_span
+        parsed.margin_interest_rate_override = parsed.margin_interest_rate
+        parsed.top = spec.default_top if parsed.top is None else parsed.top
+        parsed.ema_span = spec.default_ema_span if parsed.ema_span is None else parsed.ema_span
+        return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = BacktestArgumentParser(
         description=(
             "Backtest the causal overnight basket used by live trading."
         )
     )
     parser.add_argument(
-        "--strategy", choices=STRATEGIES, default="liquidity-trend-vol",
-        help="strategy family (default: liquidity-trend-vol)",
+        "--strategy", nargs="+", default=["liquidity-trend-vol"],
+        help=f"one or more strategy names, separated by commas or spaces: {', '.join(BUILTIN_STRATEGIES)} (default: liquidity-trend-vol)",
     )
+    parser.add_argument("--strategy-plugin", action="append", default=[], metavar="MODULE",
+                        help="import an experimental module exporting STRATEGY; repeatable")
     parser.add_argument("--strategy-config", type=Path, default=None,
-                        help="JSON overrides for liquidity-trend-vol exposure parameters")
+                        help="JSON overrides for the selected strategy's exposure parameters")
     parser.add_argument(
         "--spy-trend-price-source", choices=SPY_TREND_PRICE_SOURCES, default="daily-close",
         help="SPY trend input; minute-open-1559 reproduces the original research",
     )
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="save trades, portfolio, summary and chart together; liquidity-trend-vol defaults under /tmp/trading-backtests/candidate/liquidity-trend-vol")
-    parser.add_argument("--top", type=int, default=12, help="daily basket size")
+    parser.add_argument("--top", type=int, default=None, help="daily basket size (strategy default)")
     period = parser.add_mutually_exclusive_group()
     period.add_argument(
         "--months",
@@ -1142,8 +1048,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ema-span",
         type=int,
-        default=10,
-        help="liquidity EMA span; also the turnover-stability dispersion span",
+        default=None,
+        help="liquidity EMA/dispersion span (strategy default)",
     )
     parser.add_argument("--min-history-days", type=int, default=20)
     parser.add_argument(
@@ -1286,19 +1192,45 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+@dataclass
+class PreparedBacktest:
+    """One validated input panel reusable across strategy comparisons."""
+
+    args: argparse.Namespace
+    inputs: dict
+    provenance: dict
+
+
+def strategy_run(prepared: PreparedBacktest, name: str) -> PreparedBacktest:
+    """Resolve each strategy's defaults while sharing the prepared market arrays."""
+    args = argparse.Namespace(**vars(prepared.args))
+    spec = get_strategy(name)
+    args.strategy = name
+    args.top = args.top_override if args.top_override is not None else spec.default_top
+    args.ema_span = args.ema_span_override if args.ema_span_override is not None else spec.default_ema_span
+    args.margin_interest_rate = args.margin_interest_rate_override
+    if args.margin_interest_rate is None:
+        args.margin_interest_rate = 0.0675 if spec.policy_type is not None else 0.0
+    inputs = dict(prepared.inputs, strategy=name, top=args.top, ema_span=args.ema_span,
+                  strategy_config=spec.load_config(args.strategy_config),
+                  margin_interest_rate=args.margin_interest_rate)
+    return PreparedBacktest(args, inputs, prepared.provenance)
+
+
+def prepare_backtest(argv: list[str] | None = None) -> PreparedBacktest:
+    """Prepare the CLI's market inputs without running a strategy or writing reports."""
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        config = load_trend_vol_config(args.strategy_config) if args.strategy == "liquidity-trend-vol" else None
-        if args.strategy_config is not None and args.strategy != "liquidity-trend-vol":
-            raise ValueError("--strategy-config requires --strategy liquidity-trend-vol")
-        if args.strategy == "liquidity-trend-vol":
+        specs = [get_strategy(name) for name in args.strategies]
+        configs = [spec.load_config(args.strategy_config) for spec in specs]
+        config = configs[0]
+        if any(item is not None for item in configs):
             if args.leverage != 1.0:
-                raise ValueError("liquidity-trend-vol controls exposure; --leverage applies only to liquidity-fixed")
+                raise ValueError("dynamic strategies control exposure; --leverage applies only to liquidity-fixed")
             if args.margin_interest_rate is None:
                 args.margin_interest_rate = 0.0675
-    except (OSError, ValueError) as error:
+    except (ImportError, OSError, ValueError) as error:
         parser.error(str(error))
     try:
         args.transaction_cost_bps = resolve_transaction_cost_bps(
@@ -1384,9 +1316,10 @@ def main(argv: list[str] | None = None) -> None:
         known_session_closes.get(day.date(), 960) > args.entry_time for day in cache_dates
     ])
     spy_trend_marks = None
-    if args.strategy == "liquidity-trend-vol":
-        if requested_start < pd.Timestamp(config.risk_history_start):
-            parser.error("--since precedes liquidity-trend-vol risk_history_start")
+    if any(item is not None for item in configs):
+        for spec, item in zip(specs, configs, strict=True):
+            if item is not None and requested_start < pd.Timestamp(item.risk_history_start):
+                parser.error(f"--since precedes {spec.name} risk_history_start")
         if args.spy_trend_price_source == "daily-close":
             spy_trend_marks = load_daily_closes(daily_data_dir / f"{REFERENCE_SYMBOL}.npy", cache_dates)
         else:
@@ -1548,7 +1481,13 @@ def main(argv: list[str] | None = None) -> None:
             exit_nbbo_path, cache_dates, symbols, "bid", args.exit_time
         )
         print(f"NBBO exits: loaded {len(nbbo_exit_rows):,} causal SIP bids from {exit_nbbo_path}")
-    trades, summary = run_backtest(
+    daily_closes = None
+    if any(spec.requires_daily_closes for spec in specs):
+        daily_closes = np.column_stack([
+            load_daily_closes(daily_data_dir / f"{_security_symbol(symbol)}.npy", cache_dates)
+            for symbol in symbols
+        ])
+    inputs = dict(  # noqa: C408 - mirrors the run_backtest keyword interface
         dates=cache_dates,
         symbols=symbols,
         dollar_volume=dollar_volume,
@@ -1582,17 +1521,30 @@ def main(argv: list[str] | None = None) -> None:
         strategy_config=config,
         spy_trend_marks=spy_trend_marks,
         spy_trend_price_source=args.spy_trend_price_source,
+        daily_closes=daily_closes,
     )
-    summary["cache_path"] = str(cache_path)
-    summary["asset_filter"] = args.asset_filter
-    summary["exchange_filter"] = args.exchange_filter
-    summary["unclassified_asset_policy"] = args.unclassified_asset_policy
-    summary["unclassified_asset_symbols"] = unclassified_asset_symbols
-    summary["unfiltered_candidate_symbols"] = unfiltered_candidates
-    summary["excluded_asset_reasons"] = excluded_asset_reasons
-    summary["candidate_symbols"] = int(
-        len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())
-    )
+    return PreparedBacktest(args, inputs, {
+        "cache_path": str(cache_path),
+        "asset_filter": args.asset_filter,
+        "exchange_filter": args.exchange_filter,
+        "unclassified_asset_policy": args.unclassified_asset_policy,
+        "unclassified_asset_symbols": unclassified_asset_symbols,
+        "unfiltered_candidate_symbols": unfiltered_candidates,
+        "excluded_asset_reasons": excluded_asset_reasons,
+        "candidate_symbols": int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())),
+        "data_metadata": metadata,
+    })
+
+
+def execute_prepared(prepared: PreparedBacktest, *, print_report: bool = True) -> dict:
+    """Execute and save one resolved strategy without reloading market data."""
+    args, inputs = prepared.args, prepared.inputs
+    config = inputs["strategy_config"]
+    requested_start, end_date = inputs["start_date"], inputs["end_date"]
+    data_dir, daily_data_dir = Path(args.minute_bars_dir), Path(args.daily_bars_dir)
+    auction_path = Path(args.auctions_path)
+    trades, summary = run_backtest(**inputs)
+    summary.update(prepared.provenance)
     summary["symbol_trade_counts"] = {
         _security_symbol(str(symbol)): int(count)
         for symbol, count in trades.groupby("sample_id").size().items()
@@ -1602,7 +1554,7 @@ def main(argv: list[str] | None = None) -> None:
         for symbol, mean_return in trades.groupby("sample_id")["net_return"].mean().items()
     }
     output_dir = args.output_dir
-    if output_dir is None and args.strategy == "liquidity-trend-vol":
+    if output_dir is None and config is not None:
         root = Path("/tmp/trading-backtests/candidate") / args.strategy
         root.mkdir(parents=True, exist_ok=True)
         output_dir = Path(tempfile.mkdtemp(prefix=f"{requested_start:%Y%m%d}_{end_date:%Y%m%d}_", dir=root))
@@ -1612,7 +1564,6 @@ def main(argv: list[str] | None = None) -> None:
         args.summary_json = args.summary_json or str(output_dir / "summary.json")
         pd.DataFrame(summary["daily_portfolio"]).to_csv(output_dir / "portfolio.csv", index=False)
     summary["run_config"] = {key: str(value) if isinstance(value, (Path, pd.Timestamp)) else value for key, value in vars(args).items()}
-    summary["data_metadata"] = metadata
     def fingerprint(path):
         with Path(path).open("rb") as handle:
             return hashlib.file_digest(handle, "sha256").hexdigest()
@@ -1622,6 +1573,8 @@ def main(argv: list[str] | None = None) -> None:
             auction_path, Path(args.security_master_cache),
             daily_data_dir / f"{REFERENCE_SYMBOL}.npy",
             data_dir / f"{REFERENCE_SYMBOL}.npy",
+            *([daily_data_dir / f"{_security_symbol(symbol)}.npy" for symbol in inputs["symbols"]]
+              if inputs["daily_closes"] is not None else []),
             *([Path(args.nbbo_path)] if args.entry_price_source == "nbbo-ask" else []),
             *([Path(args.exit_nbbo_path)] if args.exit_price_source == "nbbo-bid" else []),
         ]) if path.is_file()
@@ -1630,15 +1583,25 @@ def main(argv: list[str] | None = None) -> None:
         str(path.relative_to(Path(__file__).parents[1])): fingerprint(path)
         for path in Path(__file__).parents[1].rglob("*.py")
     }
+    spec = get_strategy(args.strategy)
+    if spec.policy_type is not None:
+        import inspect
+
+        # Include inherited policy/config implementations, including research modules.
+        for cls in (*spec.policy_type.__mro__, *spec.config_type.__mro__):
+            if cls is not object:
+                plugin_path = Path(inspect.getfile(cls))
+                summary["source_sha256"][str(plugin_path)] = fingerprint(plugin_path)
     summary["risk_history_start"] = config.risk_history_start if config else None
-    if args.strategy == "liquidity-trend-vol":
+    if config is not None:
         from .backtest_audit import minute_mark_audit
 
         marks, audit = minute_mark_audit(trades, summary, data_dir)
         summary["minute_mark_audit"] = audit
         marks.to_csv(output_dir / "minute_marks.csv", index=False)
         print(f"Minute-open mark drawdown: {audit['minute_open_mark_drawdown']:.2%}")
-    print_summary_table(summary)
+    if print_report:
+        print_summary_table(summary)
     if args.show_symbol_trade_frequency:
         print_symbol_trade_counts(trades)
 
@@ -1660,6 +1623,17 @@ def main(argv: list[str] | None = None) -> None:
         summary_json.parent.mkdir(parents=True, exist_ok=True)
         summary_json.write_text(json.dumps(summary, indent=2, allow_nan=True) + "\n")
         print(f"wrote summary to {summary_json}")
+    return summary
+
+
+def main(argv: list[str] | None = None) -> None:
+    prepared = prepare_backtest(argv)
+    if len(prepared.args.strategies) == 1:
+        execute_prepared(prepared)
+    else:
+        from .backtest_comparison import run_comparison
+
+        run_comparison(prepared)
 
 
 if __name__ == "__main__":

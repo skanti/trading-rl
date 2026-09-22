@@ -683,12 +683,18 @@ class OvernightLiquidityBaselineTest(unittest.TestCase):
                     self.assertNotIn("SPY overnight", rendered)
                     self.assertIn("SPY buy & hold", rendered)
                     self.assertNotIn('"strategy_metrics"', rendered)
-                    self.assertRegex(rendered, rf"Entry price source\s+{entry}:.*15:45")
-                    self.assertRegex(rendered, rf"Exit price source\s+{exit_source}:.*09:30")
+                    # Text now wraps inside bordered strategy/benchmark cells.
+                    from trading_rl.overnight.backtest_report import strategy_metadata
+
+                    metadata = strategy_metadata(summary)
+                    self.assertIn("Entry price source", rendered)
+                    self.assertIn("Exit price source", rendered)
+                    self.assertRegex(metadata["Entry price source"], rf"{entry}:.*15:45")
+                    self.assertRegex(metadata["Exit price source"], rf"{exit_source}:.*09:30")
                     if entry in MINUTE_PRICE_COLUMNS and entry != "minute-open":
-                        self.assertIn("15:45–15:46 Eastern (hypothetical fill)", rendered)
+                        self.assertIn("15:45–15:46 Eastern (hypothetical fill)", metadata["Entry price source"])
                     if exit_source in MINUTE_PRICE_COLUMNS and exit_source != "minute-open":
-                        self.assertIn("09:30–09:31 Eastern (hypothetical fill)", rendered)
+                        self.assertIn("09:30–09:31 Eastern (hypothetical fill)", metadata["Exit price source"])
                     if entry == "nbbo-ask":
                         self.assertIn("latest causal SIP ask", rendered)
                     if exit_source == "opening-auction":

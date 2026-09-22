@@ -7,9 +7,37 @@ trading-backtest --strategy liquidity-trend-vol --since 2026-01-01 --budget 1000
 trading-backtest --strategy liquidity-fixed --since 2026-01-01 --budget 10000
 ```
 
+Compare strategy families with one shared market-data load:
+
+```bash
+trading-backtest --strategy liquidity-momentum-blend,liquidity-fixed \
+  --since 2023-01-01 --budget 10000
+```
+
+The table contains a result column for each strategy and one for SPY buy-and-hold.
+Names can be separated by commas or spaces. Each strategy keeps its own defaults;
+explicit basket/EMA overrides apply to all. Dates, capital and execution settings
+are shared, and mismatched reporting calendars or benchmarks are rejected.
+Combined CSV/JSON tables and an equity chart accompany separate run artifacts
+under `/tmp/trading-backtests/candidate/comparisons/` or `--output-dir`.
+`--strategy-config` and individual output-file flags require a single strategy.
+
 `liquidity-trend-vol` is the backtester default: liquidity ranking with a SPY
 trend filter and volatility targeting. Select `--strategy liquidity-fixed` for
 a liquidity-ranked basket with fixed exposure.
+
+`--strategy liquidity-momentum-blend` selects the experimental blend of five- and
+ten-session stock momentum. It reached 109.74% calendar CAGR / 19.40% minute-mark
+drawdown in the 2023–September 2026 study, using reused historical data for selection.
+It is an in-sample research preset, not approved for live trading. An extra 1 bp
+per side lowers its CAGR to 96.77%. `liquidity-regime-vol` and
+`liquidity-momentum-vol` retain earlier experimental families for comparisons.
+All use shared execution, allocation and financing code. See
+[research results and plugin instructions](../research/README.md).
+Backtester-only plugins can be registered with `--strategy-plugin MODULE`; live
+and reconciliation retain a separate approved strategy registry. The backtester
+exposes `prepare_backtest(argv)` to prepare one reusable input panel for comparisons
+without running a strategy or producing reports.
 Names describe strategy families; parameter values belong in `--strategy-config`. The live YAML now selects `liquidity-trend-vol`; `trading-live --strategy` can
 select either policy. Existing processes retain their startup configuration until
 the user restarts them.

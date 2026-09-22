@@ -27,6 +27,8 @@ def equity_curve(summary: dict[str, object]) -> pd.DataFrame:
 def write_equity_plot(
     summary: dict[str, object],
     output_dir: Path | None = None,
+    *,
+    comparisons: list[dict] | None = None,
 ) -> Path:
     """Write a unique WebP under the temp directory without opening a GUI."""
     # Keep plotting imports out of parser startup and numerical-only API calls.
@@ -55,27 +57,22 @@ def write_equity_plot(
     FigureCanvasAgg(figure)
     try:
         axis = figure.subplots()
-        strategy_name = summary.get("strategy_label", f"Top {summary['top']} strategy")
-        for key, label, color, metrics_key in (
-            ("strategy", strategy_name, "#2563eb", "strategy_metrics"),
-            (
-                "spy_buy_and_hold",
-                "SPY buy & hold",
-                "#d97706",
-                "spy_buy_and_hold_metrics",
-            ),
-        ):
-            values = curves[key]
+        series = []
+        for item in comparisons or [summary]:
+            label = item["strategy"] if comparisons else item.get("strategy_label", f"Top {item['top']} strategy")
+            series.append((equity_curve(item)["strategy"], label, item["strategy_metrics"]))
+        series.append((curves["spy_buy_and_hold"], "SPY buy & hold", summary["spy_buy_and_hold_metrics"]))
+        for values, label, metrics in series:
             ending = float(values.iloc[-1])
-            annualized = float(summary[metrics_key]["annualized_return"])
+            annualized = float(metrics["annualized_return"])
             if np.isfinite(ending) and np.isfinite(annualized):
                 label += f" · ${ending:,.2f} · {annualized:.2%} annualized"
             else:
                 label += " · incomplete data"
-            axis.plot(curves.index, values, label=label, color=color, linewidth=1.7)
+            axis.plot(values.index, values, label=label, linewidth=1.7)
 
         axis.set_title(
-            "Overnight strategy vs SPY buy & hold",
+            "Strategy comparison vs SPY buy & hold" if comparisons else "Overnight strategy vs SPY buy & hold",
             loc="left",
             fontweight="bold",
             pad=14,
@@ -98,6 +95,8 @@ def write_equity_plot(
         leverage_label = summary.get(
             "leverage_label", f"{float(summary.get('leverage', 1.0)):g}× leverage"
         )
+        if comparisons:
+            leverage_label = "each strategy uses its own exposure policy"
         caption = (
             f"{first:%Y-%m-%d} – {last:%Y-%m-%d} · Start ${curves.strategy.iloc[0]:,.2f}"
             f" · {float(summary['transaction_cost_bps_per_side']):g} bp per side"

@@ -52,8 +52,38 @@ The comparison table shows starting and ending capital for the strategy and the
 SPY buy-and-hold benchmark, using the same starting amount from `--budget`. Without a budget,
 capital is normalized to a $1.00 start. Unavailable benchmark results show `n/a`.
 
+Compare multiple strategies in one run:
+
+```bash
+trading-backtest --strategy liquidity-momentum-blend,liquidity-fixed \
+  --since 2023-01-01 --budget 10000
+```
+
+This prints one result column per strategy plus one SPY buy-and-hold column
+(and a metric-label column). Commas, spaces, or both separate strategy names.
+Market data is loaded once; dates, starting budget, price sources and additional
+costs are shared. Each strategy retains its own default basket size, liquidity
+EMA and exposure policy; explicit `--top` and `--ema-span` override all strategies.
+The table uses exit-mark drawdown and 252-session annualized returns, as in single
+runs. Individual dynamic-strategy reports also retain their minute-mark audits.
+Both single and comparison tables include rows for dates, ranking, exposure
+parameters, financing, execution sources, sizing and portfolio diagnostics.
+SPY-specific assumptions appear in the benchmark column; inapplicable settings
+show a dash. Comparison CSVs include these metadata rows, and comparison JSON
+keeps them in `metadata` alongside the numeric `metrics`.
+
+Comparisons save `comparison.csv`, `comparison.json`, a combined equity chart,
+and separate strategy run directories under
+`/tmp/trading-backtests/candidate/comparisons/`. Use `--output-dir` to choose the
+parent directory. `--strategy-config`, `--output-csv`, and `--summary-json` remain
+single-strategy options; see [STRATEGIES.md](STRATEGIES.md) for configured variants
+and the recommended experiment framework.
+
 Backtests default to `liquidity-trend-vol` for volatility targeting with a SPY
 trend filter. Choose `--strategy liquidity-fixed` for fixed exposure.
+`--strategy liquidity-momentum-blend` selects a backtester-only experimental
+momentum blend. Its historical result meets the research target, but selection
+reused the test period; see [research results and limitations](../research/README.md).
 See [strategy configuration and variant comparisons](STRATEGIES.md).
 `liquidity-trend-vol` outputs are grouped under
 `/tmp/trading-backtests/candidate/liquidity-trend-vol/`; `--output-dir` selects a
@@ -257,6 +287,15 @@ include failed or missing targets. Warning/error event totals are separate from
 failed-symbol counts; repeated diagnostics appear below the table with examples.
 NBBO missing-pair details remain in its JSON manifest, and failed bar symbols remain
 in `_failed_tickers.txt`. Fatal CLI errors print a failed summary and exit nonzero.
+
+An empty first daily-history response is skipped only when Alpaca's corporate
+actions confirm that the exact ticker became a new symbol on the current New
+York date, which the daily downloader excludes. This handles first-day symbol
+changes such as NHIC → NWCL without saving an unfinished or placeholder bar.
+The manifest records these as `deferred_listings` / `deferred_count`, separately
+from successful downloads, and the next run retries them normally. The exception
+expires on the next New York date. Unconfirmed empty histories, lookup failures,
+minute-bar failures, and empty updates to existing files still fail the run.
 The shortlist is ordered by consistent daily top-N appearances, then trailing
 average liquidity, so its most persistently liquid symbols enter the concurrent
 minute-download queue first.
