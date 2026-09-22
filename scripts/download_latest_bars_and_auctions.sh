@@ -18,7 +18,7 @@ NBBO_TRADE_DATE="${NBBO_TRADE_DATE:-}"
 NBBO_RANK_SINCE="${NBBO_RANK_SINCE:-2023-01-01}"
 NBBO_RANK_TOP="${NBBO_RANK_TOP:-12}"
 NBBO_SYMBOLS_PATH="${NBBO_SYMBOLS_PATH:-$UPDATES_DIR/strategy_symbols_$NBBO_RANK_SINCE.txt}"
-MASTER_PATH="${MASTER_PATH:-$REPO_DIR/data/master.txt}"
+MASTER_PATH="${MASTER_PATH:-/data/ppv1/live/master.txt}"
 # Keep the mutable download universe beside the market-data stores, not in the
 # tracked repository. MOST_LIQUID_PATH remains a compatibility override.
 LIQUIDITY_CANDIDATES_PATH="${LIQUIDITY_CANDIDATES_PATH:-${MOST_LIQUID_PATH:-$UPDATES_DIR/liquidity_candidates.txt}}"
@@ -58,6 +58,7 @@ Common environment overrides:
   PYTHON_BIN=/path/to/python
   ENV_FILE=/path/to/.env
   UPDATES_DIR=/data/ppv1/updates
+  MASTER_PATH=/data/ppv1/live/master.txt
   BAR_SINCE=2022-01-01
   DAILY_BARS_DIR=/data/ppv1/updates/bars_1day_2022-01-01
   MINUTE_BARS_DIR=/data/ppv1/updates/bars_1min_2022-01-01

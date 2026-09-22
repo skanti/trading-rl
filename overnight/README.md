@@ -236,11 +236,11 @@ shortlist minute bars, and then update auctions and scheduled NBBO in one pass, 
 ../scripts/download_latest_bars_and_auctions.sh
 ```
 
-The script first rewrites `data/master.txt` with Alpaca's currently active,
+The script first rewrites `/data/ppv1/live/master.txt` with Alpaca's currently active,
 tradable, fractionable Nasdaq company stocks. Only that current universe is
 refreshed, while historical and delisted `.npy` files already in the bar stores are
 retained for backtests. It then loads `overnight/.env` by default and accepts
-environment overrides such as `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
+environment overrides such as `MASTER_PATH`, `PYTHON_BIN`, `UPDATES_DIR`, `WORKERS`, and the
 overlap/shortlist settings shown by `--help`. Downloads default to 8 workers,
 1 symbol per minute-bar batch, and a shared bar-download limit of 180 requests
 per minute. Single-symbol minute batches save each completed symbol independently
@@ -345,7 +345,7 @@ Future updates can reuse the manifest's start date:
 python ../scripts/download_bars.py \
   --source alpaca \
   --timeframe 1Day \
-  --tickers_path /home/aavetisyan/dev/trading-rl/data/master.txt \
+  --tickers_path /data/ppv1/live/master.txt \
   --out_dir /data/ppv1/updates/bars_1day_2022-01-01 \
   --update_existing
 ```
@@ -1029,7 +1029,9 @@ strategy, run:
 python universe.py
 ```
 
-This writes one symbol per line to `data/nasdaq.txt` at the repository root.
+This writes one symbol per line to `/data/ppv1/live/master.txt`. The refreshed
+universe is runtime data and is not tracked in Git. Set `MASTER_PATH` or pass
+`--output` to choose a different location; `--output` takes precedence.
 It exports the conservative fractional-order universe: active, tradable,
 fractionable Nasdaq company stocks by default, excluding ETFs and other
 non-company securities. Use `--exchanges` to override that venue default.

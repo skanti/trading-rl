@@ -21,7 +21,7 @@ from .history import (
 )
 
 
-DEFAULT_OUTPUT = str(Path(__file__).resolve().parents[2] / "data/nasdaq.txt")
+DEFAULT_OUTPUT = "/data/ppv1/live/master.txt"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,7 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
             "excluding ETFs and other non-company securities."
         )
     )
-    parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output", default=os.environ.get("MASTER_PATH", DEFAULT_OUTPUT),
+        help="runtime universe file (default: /data/ppv1/live/master.txt; env: MASTER_PATH)",
+    )
     parser.add_argument("--exchanges", default=",".join(sorted(DEFAULT_EXCHANGES)))
     parser.add_argument("--trading-url", default=os.environ.get("ALPACA_URL", PAPER_TRADING_URL))
     parser.add_argument("--security-master-cache", default=DEFAULT_SECURITY_MASTER_CACHE)
