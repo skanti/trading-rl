@@ -33,21 +33,23 @@ These instructions also live in [AGENTS.md](AGENTS.md) for future coding agents.
 
 ## Strategy experiments
 
-The `liquidity-trend-vol` strategy combines liquidity ranking, a SPY daily-close trend filter,
-and volatility targeting (35% target and 2x cap by default):
+Live execution and backtests default to `liquidity-momentum-focus`: shortlist the
+12 most liquid Nasdaq issuers, select three by ten-session momentum, and target
+35% volatility using 20 completed modeled baskets. Exposure is capped at 2x and
+falls to zero below the 100-session SPY daily-close average.
 
 ```bash
-trading-backtest --strategy liquidity-trend-vol --since 2026-01-01 --budget 10000
+trading-backtest --strategy liquidity-momentum-focus --since 2026-01-01 --budget 10000
 ```
 
-Live execution now defaults to `liquidity-trend-vol`, with shared risk logic and
-no backtester imports. The user must restart `trading-live` to apply it; existing
-positions keep their exit workflow.
+Live, backtesting and reconciliation use shared strategy code. Restart
+`trading-live` to apply the new default; existing positions keep their exit
+workflow and saved plans retain their original strategy. Historical sessions
+remain replayable with their recorded strategy and inputs.
 
-Backtests default to `liquidity-trend-vol`. Use `--strategy liquidity-fixed` for fixed exposure and
-`--strategy-config` for `liquidity-trend-vol` parameter variants. Its summaries,
-trades, portfolio returns, minute audits and charts go to
-`/tmp/trading-backtests/candidate/liquidity-trend-vol/`.
+Use `--strategy liquidity-trend-vol` or `--strategy liquidity-fixed` to select
+the earlier strategies, and `--strategy-config` for backtest parameter variants.
+Generated results default to `/tmp/trading-backtests/candidate/<strategy>/`.
 See [strategies and experiment design](overnight/STRATEGIES.md) for exact rules,
 configuration, reproduction and the recommended comparison framework.
 

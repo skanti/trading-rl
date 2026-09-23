@@ -86,6 +86,8 @@ def historical_baskets(
     min_history_days,
     minimum_trading_days,
     liquidity_scheme,
+    daily_closes=None,
+    allocations=None,
 ):
     """Rank completed entry sessions; the last calendar row is today's exit only."""
     history = BasketHistory(
@@ -108,6 +110,18 @@ def historical_baskets(
         )
         for row in rows
     ]
+    from .momentum import LiquidityMomentumFocusConfig, historical_allocation
+
+    if isinstance(policy_config, LiquidityMomentumFocusConfig):
+        if daily_closes is None:
+            raise ValueError("momentum risk history requires daily closes")
+        for index, (row, basket) in enumerate(zip(rows, baskets, strict=True)):
+            allocation = historical_allocation(dates, symbols, daily_closes, row, basket, policy_config) if len(basket) else None
+            if allocations is not None:
+                allocations.append(allocation)
+            if allocation is not None:
+                chosen = set(allocation["symbols"])
+                baskets[index] = np.array([column for column in basket if str(symbols[column]) in chosen])
     return rows, baskets
 
 
@@ -155,7 +169,7 @@ def risk_signal(
     for observation in observations:
         policy.observe(observation["unscaled_return"])
     return {
-        "strategy": "liquidity-trend-vol",
+        "strategy": "liquidity-momentum-focus" if hasattr(config, "allocation_count") else "liquidity-trend-vol",
         "trade_date": str(dates[-1].date()),
         "completed_exit_date": str(dates[-1].date()),
         "spy_mark_date": str(dates[-2].date()),

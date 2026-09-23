@@ -1,0 +1,9 @@
+{
+  "allocation_window": 10,
+  "allocation_count": 4,
+  "allocation_windows": null,
+  "trend_window": 50,
+  "volatility_window": 20,
+  "volatility_target": 0.35,
+  "weak_trend_multiplier": 0.0
+}

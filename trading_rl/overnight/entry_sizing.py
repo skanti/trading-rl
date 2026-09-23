@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from .strategies import MAX_OVERNIGHT_EXPOSURE
+from .strategies import MAX_OVERNIGHT_EXPOSURE, allocation_slots
 
 
 def _float(value: object, field: str) -> float:
@@ -63,7 +63,7 @@ def trend_vol_budget(
     if (
         equity <= 0
         or not math.isfinite(exposure)
-        or not 0 < exposure <= config.risk_config.max_exposure
+        or not 0 <= exposure <= config.risk_config.max_exposure
     ):
         raise RuntimeError("invalid equity or target exposure")
     allocated = min(
@@ -73,6 +73,13 @@ def trend_vol_budget(
         else equity * config.capital_fraction,
     )
     requested = allocated * exposure
+    if exposure == 0:
+        if config.strategy_name != "liquidity-momentum-focus":
+            raise RuntimeError("zero exposure requires a cash-capable strategy")
+        return {"budget": 0.0, "allocated_equity": allocated, "account_equity": equity,
+                "target_exposure": 0.0, "effective_exposure": 0.0,
+                "cash_buffer_fraction": config.cash_buffer_fraction,
+                "notional_limits": {"policy": 0.0}, "binding_limit": "policy", "margin_eligible": False}
     buying_power = max(0.0, _float(account.get("buying_power"), "account.buying_power"))
     multiplier = _float(account.get("multiplier"), "account.multiplier")
     can_borrow = multiplier >= 2 and all(
@@ -132,7 +139,7 @@ def trend_vol_budget(
     budget = (
         math.floor(min(limits.values()) * (1 - config.cash_buffer_fraction) * 100) / 100
     )
-    if budget / config.top < 1:
+    if budget / allocation_slots(config) < 1:
         raise RuntimeError(
             "constrained per-symbol notional is below the $1 fractional minimum"
         )

@@ -111,7 +111,7 @@ import importlib.abc
 import sys
 class Guard(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if any(part in fullname for part in ('backtest', 'experiments', 'matplotlib')):
+        if any(part in fullname for part in ('backtest', 'experiments', 'matplotlib', 'research')):
             raise AssertionError('unsafe live import: ' + fullname)
 sys.meta_path.insert(0, Guard())
 import trading_rl.overnight.live
@@ -317,9 +317,10 @@ class RiskLifecycleTest(unittest.TestCase):
     def test_defaults_and_legacy_yaml_compatibility(self):
         parser, args, _ = parse_live_arguments(["preview"])
         settings = _validate_args(parser, args)
-        self.assertEqual(settings.strategy_name, "liquidity-trend-vol")
+        self.assertEqual(settings.strategy_name, "liquidity-momentum-focus")
         self.assertEqual(settings.share_mode, "fractional")
-        self.assertEqual(settings.risk_config, LiquidityTrendVolConfig())
+        from trading_rl.overnight.momentum import LiquidityMomentumFocusConfig
+        self.assertEqual(settings.risk_config, LiquidityMomentumFocusConfig())
         self.assertEqual(args.exit_time.isoformat(), "06:00:00")
         self.assertEqual(args.entry_time.isoformat(), "15:45:00")
         legacy = OmegaConf.to_container(load_live_settings(), resolve=True)

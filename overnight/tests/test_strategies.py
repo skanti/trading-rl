@@ -224,7 +224,7 @@ class StrategyTest(unittest.TestCase):
             build_parser().parse_args(["--spy-trend-price-source", "minute-open-1559"]).spy_trend_price_source,
             "minute-open-1559",
         )
-        self.assertEqual(build_parser().parse_args([]).strategy, "liquidity-trend-vol")
+        self.assertEqual(build_parser().parse_args([]).strategy, "liquidity-momentum-focus")
         self.assertEqual(
             build_parser().parse_args(["--strategy", "liquidity-fixed"]).strategy, "liquidity-fixed"
         )

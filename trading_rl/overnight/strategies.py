@@ -13,9 +13,24 @@ MAX_OVERNIGHT_EXPOSURE = 2.0
 STRATEGY_LABELS = {
     "liquidity-fixed": "Liquidity: fixed exposure",
     "liquidity-trend-vol": "Liquidity: trend + volatility target",
+    "liquidity-momentum-focus": "Liquidity: momentum focus + volatility target",
 }
 STRATEGIES = tuple(STRATEGY_LABELS)
+RISK_STRATEGIES = ("liquidity-trend-vol", "liquidity-momentum-focus")
+DEFAULT_STRATEGY = "liquidity-momentum-focus"
 SPY_TREND_PRICE_SOURCES = ("daily-close", "minute-open-1559")
+
+
+def risk_config_type(name):
+    if name == "liquidity-momentum-focus":
+        from .momentum import LiquidityMomentumFocusConfig
+
+        return LiquidityMomentumFocusConfig
+    return LiquidityTrendVolConfig
+
+
+def allocation_slots(config):
+    return min(config.top, config.risk_config.allocation_count) if config.strategy_name == "liquidity-momentum-focus" else config.top
 
 
 @dataclass(frozen=True)

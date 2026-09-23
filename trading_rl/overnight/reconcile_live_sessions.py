@@ -196,6 +196,8 @@ def attach_broker_fees(
     result: dict[str, object], fee_summary: Mapping[str, object]
 ) -> None:
     result["broker_fees"] = dict(fee_summary)
+    if result.get("cash_session"):
+        return
     if fee_summary.get("status") != "complete":
         return
     totals = result["totals"]
@@ -491,6 +493,15 @@ def summary_execution_timing(
     entry_day = parse_day(str(position.get("entry_date")))
     exit_day = parse_day(str(position.get("exit_date")))
     symbols = [str(value).upper() for value in position.get("symbols") or []]
+    if position.get("cash_session"):
+        decision = replay_entry_decision(summary)
+        if decision["status"] != "complete" or decision["orders"] or symbols or position.get("entry_orders") or position.get("exit_orders"):
+            raise ValueError("cash session does not replay as an empty order plan")
+        timing, _ = execution_timing({}, {}, [], entry_day, exit_day,
+                                     infer_entry_minute(summary, entry_minute_override), schedule_tolerance_minutes,
+                                     exit_minute=exit_minute, exit_price_source=exit_price_source)
+        timing.update(schedule_comparable=True, cash_session=True)
+        return timing, []
     if not symbols:
         raise ValueError("closed position has no symbols")
     entry_orders = position.get("entry_orders") or {}
@@ -585,6 +596,22 @@ def reconcile_execution(
     entry_day = parse_day(str(position.get("entry_date")))
     exit_day = parse_day(str(position.get("exit_date")))
     symbols = [str(value).upper() for value in position.get("symbols") or []]
+    if position.get("cash_session"):
+        timing, warnings = summary_execution_timing(summary, entry_minute_override=entry_minute_override,
+                                                    schedule_tolerance_minutes=schedule_tolerance_minutes,
+                                                    exit_minute=exit_minute, exit_price_source=exit_price_source)
+        decision = replay_entry_decision(summary)
+        totals = dict.fromkeys(("actual_entry_notional", "actual_exit_notional", "actual_gross_pnl", "simulator_gross_pnl",
+                               "actual_minus_simulator_gross_pnl", "simulator_transaction_cost", "simulator_net_pnl",
+                               "quantity_pnl_impact", "entry_execution_pnl_impact", "exit_execution_pnl_impact"), 0.0)
+        totals.update(entry_equity=_equity(position, "entry"), broker_equity_pnl=None)
+        return {"strategy_name": decision["strategy_name"], "cash_session": True, "decision_replay": decision,
+                "planned_strategy": replay_planned_performance(decision, {"entry": {}, "exit": {}}, totals["entry_equity"]),
+                "entry_date": str(entry_day), "exit_date": str(exit_day), "symbols": [], "rows": [],
+                "entry_time": _clock_text(infer_entry_minute(summary, entry_minute_override)), "exit_time": _clock_text(exit_minute),
+                "entry_price_source": entry_price_source, "exit_price_source": exit_price_source,
+                "reporting_benchmark": SCHEDULED_REPORTING_BENCHMARK, "transaction_cost_bps_per_side": float(transaction_cost_bps),
+                "timing": timing, "warnings": warnings, "totals": totals}
     if not symbols:
         raise ValueError("closed position has no symbols")
     entry_orders = position.get("entry_orders") or {}
@@ -1102,7 +1129,7 @@ def replay_ranking(
     selected: list[str] = []
     seen_issuers: set[str] = set()
     for symbol, _, _ in replayed:
-        if symbol in excluded:
+        if symbol in excluded and position.get("strategy_name") != "liquidity-momentum-focus":
             continue
         issuer = issuer_by_symbol.get(symbol, symbol)
         if issuer in seen_issuers:
@@ -1111,6 +1138,20 @@ def replay_ranking(
         selected.append(symbol)
         if len(selected) == top:
             break
+    if position.get("strategy_name") == "liquidity-momentum-focus":
+        from .momentum import allocation_snapshot
+        from .strategies import risk_config_type
+
+        policy = risk_config_type("liquidity-momentum-focus")(**position["strategy_parameters"])
+        days = sorted(day for day in session_days if day < entry_day)[-policy.allocation_window - 1:]
+        if len(days) != policy.allocation_window + 1:
+            raise ValueError("archived ranking bars lack momentum history")
+        prices = {symbol: {_bar_day(row["t"]): float(row["c"]) for row in bars[symbol]} for symbol in selected}
+        allocation = allocation_snapshot(selected, [prices[s][days[0]] for s in selected],
+                                         [prices[s][days[-1]] for s in selected], days, entry_day, policy)
+        if allocation != ranking["allocation"]:
+            raise ValueError("archived momentum allocation differs from ranking daily bars")
+        selected = [] if position.get("cash_session") else allocation["symbols"]
     actual_set, selected_set = set(actual), set(selected)
     overlap = actual_set & selected_set
     return {
@@ -1248,6 +1289,9 @@ def select_reporting_benchmark(
     result: dict[str, object], *, prefer_actual_time: bool
 ) -> str:
     """Select the headline benchmark while preserving both result families."""
+    if result.get("cash_session"):
+        result["reporting_benchmark"] = SCHEDULED_REPORTING_BENCHMARK
+        return SCHEDULED_REPORTING_BENCHMARK
     totals = result.get("totals") or {}
     actual_time_available = isinstance(totals, Mapping) and (
         totals.get("actual_time_simulator_gross_pnl") is not None
@@ -1474,6 +1518,12 @@ def print_overview(
     skipped_sessions: Sequence[tuple[date, Sequence[str]]] = (),
     missing_sessions: Sequence[tuple[date, str]] = (),
 ) -> None:
+    cash = [result for result in results if result.get("cash_session")]
+    if cash:
+        CONSOLE.print(f"Cash sessions: {len(cash)}; no orders or modeled trading P&L. Execution comparison covers traded sessions.")
+        results = [result for result in results if not result.get("cash_session")]
+        if not results:
+            return
     summary = summarize_results(results)
     sessions = int(summary["sessions"])
     fee_sessions = int(summary["fee_confirmed_sessions"])
@@ -1686,6 +1736,9 @@ def _scheduled_price_label(result: Mapping[str, object], side: str) -> str:
 def print_result(
     result: Mapping[str, object], *, show_symbol_breakdown: bool = False
 ) -> None:
+    if result.get("cash_session"):
+        CONSOLE.print(f"{result['entry_date']}: cash session; decision replay complete, no orders.")
+        return
     totals = result["totals"]
     use_actual_time = (
         result.get("reporting_benchmark") == ACTUAL_TIME_REPORTING_BENCHMARK
@@ -2167,7 +2220,10 @@ def main() -> None:
                 max_exit_staleness_minutes=args.max_exit_staleness_minutes,
             )
             select_reporting_benchmark(result, prefer_actual_time=not strict_schedule)
-            if args.skip_broker_fees:
+            if result.get("cash_session"):
+                fee_summary = {"status": "not_applicable", "reason": "cash session has no strategy orders or borrowing"}
+                fee_warning = None
+            elif args.skip_broker_fees:
                 fee_summary = {
                     "status": "skipped",
                     "activity_date": result["exit_date"],

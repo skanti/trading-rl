@@ -10,7 +10,7 @@ schedule:
   entry_grace_seconds: 75
 
 strategy:
-  name: "liquidity-trend-vol"
+  name: "liquidity-momentum-focus"
   top: 12
   liquidity_scheme: "turnover_stability"
   ema_span: 10
@@ -25,8 +25,10 @@ risk:
   volatility_window: 20
   warmup_exposure: 1.0
   trend_window: 100
-  weak_trend_multiplier: 0.25
+  weak_trend_multiplier: 0.0
   risk_history_start: "2023-01-01"
+  allocation_window: 10
+  allocation_count: 3
 
 data:
   risk_minute_bars_dir: "/data/ppv1/updates/bars_1min_2022-01-01"

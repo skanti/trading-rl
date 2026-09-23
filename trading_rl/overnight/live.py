@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import sys
 import tempfile
 import threading
 import time as time_module
@@ -65,16 +66,17 @@ from .live_config import (
     effective_live_settings,
     load_live_settings,
 )
-from .live_risk import prepare_live_risk, signal_is_current
+from .live_risk import prepare_live_allocation, prepare_live_risk, signal_is_current
 from .portfolio import (
     basket_quantities,
     equal_notional,
     market_entry_order,
+    select_entry_candidates,
 )
 from .portfolio import (
     client_order_id as _client_order_id,
 )
-from .portfolio import (
+from .portfolio import (  # noqa: F401 - compatibility export for existing callers
     select_unconflicted_candidates as _select_unconflicted_candidates,
 )
 from .ranking import (
@@ -82,7 +84,13 @@ from .ranking import (
     liquidity_features,
     ranked_indices,
 )
-from .strategies import STRATEGIES, LiquidityTrendVolConfig
+from .strategies import (
+    RISK_STRATEGIES,
+    STRATEGIES,
+    LiquidityTrendVolConfig,
+    allocation_slots,
+    risk_config_type,
+)
 
 EASTERN = ZoneInfo("America/New_York")
 PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
@@ -109,7 +117,7 @@ TERMINAL_ORDER_STATUSES = frozenset(
 )
 LOGGER = logging.getLogger("overnight-liquidity-live")
 CONSOLE = Console()
-RANKING_PIPELINE_VERSION = 7
+RANKING_PIPELINE_VERSION = 8
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -1317,7 +1325,7 @@ def rank_for_day(
             and prior.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
             and prior.get("liquidity_scheme") == config.liquidity_scheme
             and (
-                config.strategy_name != "liquidity-trend-vol"
+                config.strategy_name not in RISK_STRATEGIES
                 or signal_is_current(prior.get("risk_signal"), config, trade_date)
             )
         ):
@@ -1375,7 +1383,7 @@ def rank_for_day(
             client,
             bars_dir,
             sorted(eligible_companies | (
-                {REFERENCE_SYMBOL} if config.strategy_name == "liquidity-trend-vol" else set()
+                {REFERENCE_SYMBOL} if config.strategy_name in RISK_STRATEGIES else set()
             )),
             config.shortlist_since,
             bars_end,
@@ -1518,7 +1526,9 @@ def rank_for_day(
                 )
             ],
         }
-        if config.strategy_name == "liquidity-trend-vol":
+        if config.strategy_name == "liquidity-momentum-focus":
+            result["allocation"] = prepare_live_allocation(config, result, completed, trade_date)
+        if config.strategy_name in RISK_STRATEGIES:
             result["risk_signal"] = prepare_live_risk(
                 client,
                 config,
@@ -1819,11 +1829,13 @@ def enter_for_day(
         state = store.load()
         ranking = state.get("ranking") or {}
         previous = state.get("position") or {}
+        if previous.get("entry_date") == trade_date.isoformat() and previous.get("status") == "closed":
+            return dict(previous)
         resuming = (
             previous.get("entry_date") == trade_date.isoformat()
             and previous.get("status") != "closed"
         )
-        if (
+        if not resuming and (
             ranking.get("trade_date") != trade_date.isoformat()
             or ranking.get("ranking_pipeline_version") != RANKING_PIPELINE_VERSION
         ):
@@ -1859,14 +1871,14 @@ def enter_for_day(
             open_orders = client.list_orders("open")
             held_symbols = {str(item["symbol"]) for item in held_positions}
             open_order_symbols = {str(item["symbol"]) for item in open_orders}
-            selected = _select_unconflicted_candidates(
-                ranking, held_symbols, open_order_symbols, config.top
+            selected = select_entry_candidates(
+                ranking, held_symbols, open_order_symbols, config
             )
             account = client.account()
             risk = None
             selected_assets = []
             exposure_sizing = None
-            if config.strategy_name == "liquidity-trend-vol":
+            if config.strategy_name in RISK_STRATEGIES:
                 risk = ranking.get("risk_signal")
                 if not signal_is_current(risk, config, trade_date):
                     raise RuntimeError(
@@ -1889,10 +1901,10 @@ def enter_for_day(
                 budget = exposure_sizing["budget"]
             else:
                 budget = available_budget(account, config)
-            per_symbol = equal_notional(budget, config.top, round_to_cents=True)
+            per_symbol = equal_notional(budget, allocation_slots(config), round_to_cents=True) if budget > 0 else 0.0
             share_mode = config.share_mode
             sizing: dict[str, object] = {}
-            if share_mode == "whole":
+            if share_mode == "whole" and selected:
                 sizing = whole_share_order_plan(
                     selected,
                     client.latest_quotes(selected, config.quote_feed),
@@ -1948,6 +1960,7 @@ def enter_for_day(
                 "order_submit_workers": config.order_submit_workers,
                 "entry_orders": {},
                 "exit_orders": {},
+                "cash_session": bool(risk is not None and risk["target_exposure"] == 0),
                 "created_at": _iso_now(now),
             }
             if submit:
@@ -1971,6 +1984,14 @@ def enter_for_day(
             return position
 
         if not submit:
+            return position
+
+        if position.get("cash_session"):
+            position.update(status="closed", filled_symbols=[], entry_completed_at=_iso_now())
+            state["position"] = position
+            state["updated_at"] = _iso_now()
+            store.save(state)
+            LOGGER.info("cash session for %s: momentum trend filter disabled entries", trade_date)
             return position
 
         if share_mode == "whole":
@@ -2593,7 +2614,7 @@ def run_daemon(
                     or ranking.get("ranking_pipeline_version")
                     != RANKING_PIPELINE_VERSION
                     or (
-                        config.strategy_name == "liquidity-trend-vol"
+                        config.strategy_name in RISK_STRATEGIES
                         and not signal_is_current(
                             ranking.get("risk_signal"), config, today
                         )
@@ -2622,7 +2643,7 @@ def run_daemon(
                 ranking.get("trade_date") == today.isoformat()
                 and ranking.get("ranking_pipeline_version") == RANKING_PIPELINE_VERSION
                 and (
-                    config.strategy_name != "liquidity-trend-vol"
+                    config.strategy_name not in RISK_STRATEGIES
                     or signal_is_current(ranking.get("risk_signal"), config, today)
                 )
             )
@@ -2755,7 +2776,7 @@ def build_parser(
         "weak_trend_multiplier",
     ):
         parser.add_argument("--" + parameter.replace("_", "-"), type=float)
-    for parameter in ("volatility_window", "trend_window"):
+    for parameter in ("volatility_window", "trend_window", "allocation_window", "allocation_count"):
         parser.add_argument("--" + parameter.replace("_", "-"), type=int)
     parser.add_argument("--risk-history-start")
     for parameter in ("risk_minute_bars_dir", "risk_nbbo_path", "risk_auctions_path"):
@@ -2953,6 +2974,11 @@ def parse_live_arguments(
         config_parser.error(str(error))
     parser = build_parser(argparse_defaults(settings))
     args = parser.parse_args(argv)
+    # Switching a strategy on the CLI also switches its default weak-trend rule;
+    # an explicitly supplied risk override still takes precedence.
+    tokens = list(argv) if argv is not None else sys.argv[1:]
+    if args.strategy_name != settings.strategy.name and not any(token.split("=")[0] == "--weak-trend-multiplier" for token in tokens):
+        args.weak_trend_multiplier = risk_config_type(args.strategy_name)().weak_trend_multiplier
     return parser, args, settings
 
 
@@ -2969,10 +2995,11 @@ def _validate_args(
     if args.strategy_name not in STRATEGIES:
         parser.error("unknown live strategy")
     try:
-        risk_config = LiquidityTrendVolConfig(
+        config_type = risk_config_type(args.strategy_name)
+        risk_config = config_type(
             **{
                 key: getattr(args, key)
-                for key in LiquidityTrendVolConfig.__dataclass_fields__
+                for key in config_type.__dataclass_fields__ if hasattr(args, key)
             }
         )
     except ValueError as error:
@@ -3072,11 +3099,11 @@ def _validate_args(
     )
     if not exchanges:
         parser.error("exchanges cannot be empty")
-    if args.strategy_name == "liquidity-trend-vol" and exchanges != frozenset(
+    if args.strategy_name in RISK_STRATEGIES and exchanges != frozenset(
         {"NASDAQ"}
     ):
         parser.error(
-            "liquidity-trend-vol risk history currently requires the NASDAQ universe"
+            "risk-managed strategy history currently requires the NASDAQ universe"
         )
     return StrategyConfig(
         top=args.top,
@@ -3149,7 +3176,7 @@ def _print_effective_configuration(
     capital = (
         f"${args.capital:,.2f} cap"
         if args.capital is not None
-        else f"{args.capital_fraction:.1%} of {'equity' if args.strategy_name == 'liquidity-trend-vol' else 'cash'}"
+        else f"{args.capital_fraction:.1%} of {'equity' if args.strategy_name in RISK_STRATEGIES else 'cash'}"
     )
     table.add_row(
         "Sizing",

@@ -9,16 +9,17 @@ import numpy as np
 import pandas as pd
 
 from .entry_sizing import available_budget, trend_vol_budget
+from .momentum import replay_allocation
 from .portfolio import (
     basket_quantities,
     equal_notional,
     market_entry_order,
-    select_unconflicted_candidates,
+    select_entry_candidates,
 )
 from .risk_history import risk_signal, unit_return
-from .strategies import STRATEGIES, LiquidityTrendVolConfig
+from .strategies import RISK_STRATEGIES, STRATEGIES, allocation_slots, risk_config_type
 
-REPLAY_VERSION = 1
+REPLAY_VERSION = 2
 SIZING_SETTINGS = (
     "top",
     "capital",
@@ -81,18 +82,25 @@ def capture_decision_inputs(config, account, positions, orders, assets):
     )
 
 
-def replay_risk(saved, parameters, entry_day, top):
+def replay_risk(saved, parameters, entry_day, top, strategy_name="liquidity-trend-vol"):
     """Recalculate unit returns, lagged SPY trend and exposure from saved inputs."""
     if saved.get("parameters") != parameters:
         raise ValueError("saved risk parameters differ from the entry policy")
-    config = LiquidityTrendVolConfig(**parameters)
+    config = risk_config_type(strategy_name)(**parameters)
+    count = min(top, config.allocation_count) if strategy_name == "liquidity-momentum-focus" else top
     observations = copy.deepcopy(saved["observations"])
     for row in observations:
         names = row["symbols"]
-        if len(names) not in (0, top) or len(set(names)) != len(names):
+        if len(names) not in (0, count) or len(set(names)) != len(names):
             raise ValueError(
                 "risk basket must contain exactly top distinct symbols or be cash"
             )
+        if strategy_name == "liquidity-momentum-focus":
+            if row["entry_allowed"]:
+                if replay_allocation(row["allocation"], config, top, row["entry_date"]) != names:
+                    raise ValueError("risk momentum basket differs from its archived allocation")
+            elif names or row["allocation"] is not None:
+                raise ValueError("short session must have an empty modeled basket")
         if len(row["entry_prices"]) != len(names) or len(row["exit_prices"]) != len(
             names
         ):
@@ -155,23 +163,25 @@ def replay_entry_decision(summary):
             "reason": "entry decision inputs were not archived; backfill from historical evidence",
         }
     try:
-        if inputs["version"] != REPLAY_VERSION or name not in STRATEGIES:
+        if inputs["version"] not in (1, REPLAY_VERSION) or name not in STRATEGIES:
             raise ValueError("unsupported decision replay version or strategy")
         if inputs["strategy_name"] != name:
             raise ValueError("entry inputs and position disagree on strategy")
         settings = inputs["configuration"]
         config = SimpleNamespace(**settings)
-        config.risk_config = LiquidityTrendVolConfig(
+        config.strategy_name = name
+        config.risk_config = risk_config_type(name)(
             **(position.get("strategy_parameters") or {})
         )
         checks = {}
         risk = None
-        if name == "liquidity-trend-vol":
+        if name in RISK_STRATEGIES:
             risk = replay_risk(
                 position["risk_signal"],
                 position["strategy_parameters"],
                 position["entry_date"],
                 config.top,
+                name,
             )
             sizing = trend_vol_budget(
                 inputs["account"],
@@ -193,7 +203,7 @@ def replay_entry_decision(summary):
         checks["budget"] = math.isclose(
             budget, position["budget"], rel_tol=0, abs_tol=1e-8
         )
-        per_symbol = equal_notional(budget, config.top, round_to_cents=True)
+        per_symbol = equal_notional(budget, allocation_slots(config), round_to_cents=True) if budget > 0 else 0.0
         checks["per_symbol_notional"] = math.isclose(
             per_symbol, position["per_symbol_notional"], rel_tol=0, abs_tol=1e-8
         )
@@ -204,13 +214,16 @@ def replay_entry_decision(summary):
         ranking = position.get("ranking_snapshot") or summary.get("ranking") or {}
         held = {row["symbol"] for row in inputs["positions"]}
         pending = {row["symbol"] for row in inputs["open_orders"]}
-        selected = select_unconflicted_candidates(ranking, held, pending, config.top)
+        selected = select_entry_candidates(ranking, held, pending, config)
         checks["selected_symbols"] = names == selected
         checks["basket_size"] = (
-            len(names) == config.top and len(set(names)) == config.top
+            len(names) == (allocation_slots(config) if budget > 0 else 0) and len(set(names)) == len(names)
         )
+        if name == "liquidity-momentum-focus":
+            checks["cash_session"] = bool(position.get("cash_session")) == (risk["target_exposure"] == 0)
+            checks["ranking_risk"] = ranking.get("risk_signal") == position.get("risk_signal")
         orders = {}
-        if config.share_mode == "whole":
+        if config.share_mode == "whole" and names:
             quantities = basket_quantities(
                 [position["sizing_prices"][s] for s in names], budget, "whole"
             )

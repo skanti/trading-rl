@@ -83,12 +83,13 @@ from .portfolio import (
 from .ranking import build_issuer_map
 from .risk_history import BasketHistory
 from .strategies import (
-    MAX_OVERNIGHT_EXPOSURE as MAX_OVERNIGHT_LEVERAGE,
-)
-from .strategies import (
+    DEFAULT_STRATEGY,
     SPY_TREND_PRICE_SOURCES,
     STRATEGY_LABELS,
     LiquidityTrendVolConfig,
+)
+from .strategies import (
+    MAX_OVERNIGHT_EXPOSURE as MAX_OVERNIGHT_LEVERAGE,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -1010,8 +1011,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument(
-        "--strategy", nargs="+", default=["liquidity-trend-vol"],
-        help=f"one or more strategy names, separated by commas or spaces: {', '.join(BUILTIN_STRATEGIES)} (default: liquidity-trend-vol)",
+        "--strategy", nargs="+", default=[DEFAULT_STRATEGY],
+        help=f"one or more strategy names, separated by commas or spaces: {', '.join(BUILTIN_STRATEGIES)} (default: liquidity-momentum-focus)",
     )
     parser.add_argument("--strategy-plugin", action="append", default=[], metavar="MODULE",
                         help="import an experimental module exporting STRATEGY; repeatable")
@@ -1022,7 +1023,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="SPY trend input; minute-open-1559 reproduces the original research",
     )
     parser.add_argument("--output-dir", type=Path, default=None,
-                        help="save trades, portfolio, summary and chart together; liquidity-trend-vol defaults under /tmp/trading-backtests/candidate/liquidity-trend-vol")
+                        help="save trades, portfolio, summary and chart together; defaults under /tmp/trading-backtests/candidate/<strategy>")
     parser.add_argument("--top", type=int, default=None, help="daily basket size (strategy default)")
     period = parser.add_mutually_exclusive_group()
     period.add_argument(

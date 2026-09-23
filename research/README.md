@@ -1,8 +1,17 @@
 # Experimental overnight strategies
 
 Research source stays here. Generated results go under
-`/tmp/trading-backtests/candidate/`. Live trading remains `liquidity-trend-vol`;
-experimental names are unavailable to the live daemon and reconciliation.
+`/tmp/trading-backtests/candidate/`. The promoted live and backtest default is `liquidity-momentum-focus`; its
+implementation lives in shared production modules. Other experimental names
+remain unavailable to the live daemon and reconciliation.
+
+The newer [momentum-focus study](MOMENTUM_FOCUS.md) simplifies the blend to one
+three-stock basket. Its user-selected defaults are 10-session momentum, a
+100-session SPY trend and 20 closed baskets for volatility. Through September 23,
+2026 these settings reached 120.39% calendar CAGR, 2.365 Sharpe and 21.12%
+minute-mark drawdown; they miss the original Sharpe and drawdown targets.
+Select it explicitly with `--strategy liquidity-momentum-focus` in live or backtests. The
+earlier optimized 8/150/40 configuration remains an explicit research variant.
 
 ## Selected experimental preset
 

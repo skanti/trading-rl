@@ -13,6 +13,7 @@ import pandas as pd
 from test_strategies import fixture
 
 from research.liquidity_momentum import LiquidityMomentumConfig, LiquidityMomentumPolicy
+from trading_rl.overnight.momentum import LiquidityMomentumFocusConfig
 from research.liquidity_regime import LiquidityRegimeConfig, LiquidityRegimePolicy
 from trading_rl.overnight.backtest import build_parser, run_backtest
 from trading_rl.overnight.backtest_strategies import (
@@ -26,6 +27,44 @@ from trading_rl.overnight.strategies import STRATEGIES, LiquidityTrendVolConfig
 
 
 class BacktestPluginTest(unittest.TestCase):
+    def test_focus_uses_one_equal_weight_basket_and_lagged_prices(self):
+        config = get_strategy("liquidity-momentum-focus").load_config()
+        self.assertEqual((config.allocation_window, config.allocation_count), (10, 3))
+        self.assertEqual((config.trend_window, config.volatility_window, config.volatility_target), (100, 20, .35))
+        self.assertIsNone(config.allocation_windows)
+        self.assertIn("liquidity-momentum-focus", STRATEGIES)
+        dates = pd.bdate_range("2023-01-01", periods=180)
+        symbols = np.array([f"S{i}" for i in range(6)])
+        daily = 100. + np.arange(180)[:, None] * np.arange(1, 7)[None, :]
+        spy = np.arange(180) + 100.
+        policy = LiquidityMomentumPolicy(config, spy)
+        policy.prepare(PolicyContext(dates, symbols, daily))
+        np.testing.assert_array_equal(policy.weights(160, np.arange(6)), [0, 0, 0, 1/3, 1/3, 1/3])
+        changed = daily.copy()
+        changed[160:, 0] *= 100
+        other = LiquidityMomentumPolicy(config, spy)
+        other.prepare(PolicyContext(dates, symbols, changed))
+        np.testing.assert_array_equal(policy.weights(160, np.arange(6)), other.weights(160, np.arange(6)))
+        self.assertGreater(other.weights(161, np.arange(6))[0], 0)
+        for values in ({"allocation_windows": [5, 10]}, {"allocation_count": 0}):
+            with self.assertRaises(ValueError):
+                LiquidityMomentumFocusConfig(**values)
+
+    def test_focus_matches_existing_engine_and_preserves_warmup_on_short_reports(self):
+        args = fixture()
+        x = np.arange(len(args["dates"]))
+        daily = np.column_stack([100 + x, 100 + 2 * x, 100 + x / 2])
+        config = LiquidityMomentumFocusConfig()
+        args.update(strategy="liquidity-momentum-focus", strategy_config=config, daily_closes=daily)
+        trades, summary = run_backtest(**args)
+        comparison, old = run_backtest(**dict(args, strategy="liquidity-momentum-vol",
+                                             strategy_config=LiquidityMomentumConfig(**config.as_dict())))
+        pd.testing.assert_frame_equal(trades, comparison)
+        self.assertEqual(summary["daily_portfolio"], old["daily_portfolio"])
+        _, short = run_backtest(**dict(args, start_date=args["dates"][-12]))
+        np.testing.assert_allclose(pd.DataFrame(short["daily_portfolio"]).exposure,
+                                   pd.DataFrame(summary["daily_portfolio"]).exposure.iloc[-11:])
+
     def test_weighted_sizing_return_and_reserved_cash(self):
         prices = np.array([10., 20.])
         weights = np.array([0.25, 0.5])
@@ -90,7 +129,7 @@ class BacktestPluginTest(unittest.TestCase):
     def test_cli_defaults_and_live_separation(self):
         current = build_parser().parse_args([])
         experimental = build_parser().parse_args(["--strategy", "liquidity-regime-vol"])
-        self.assertEqual((current.strategy, current.top, current.ema_span), ("liquidity-trend-vol", 12, 10))
+        self.assertEqual((current.strategy, current.top, current.ema_span), ("liquidity-momentum-focus", 12, 10))
         self.assertEqual((experimental.top, experimental.ema_span), (6, 20))
         self.assertNotIn("liquidity-regime-vol", STRATEGIES)
         explicit = build_parser().parse_args(["--strategy", "liquidity-regime-vol", "--top", "8", "--ema-span", "5"])

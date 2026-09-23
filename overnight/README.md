@@ -79,15 +79,15 @@ parent directory. `--strategy-config`, `--output-csv`, and `--summary-json` rema
 single-strategy options; see [STRATEGIES.md](STRATEGIES.md) for configured variants
 and the recommended experiment framework.
 
-Backtests default to `liquidity-trend-vol` for volatility targeting with a SPY
-trend filter. Choose `--strategy liquidity-fixed` for fixed exposure.
+Backtests default to `liquidity-momentum-focus`: three stocks selected by
+ten-session momentum from twelve liquid issuers, with a 100-session SPY trend
+filter and volatility targeting over twenty completed modeled baskets. Choose `--strategy liquidity-fixed` for fixed exposure.
 `--strategy liquidity-momentum-blend` selects a backtester-only experimental
 momentum blend. Its historical result meets the research target, but selection
 reused the test period; see [research results and limitations](../research/README.md).
 See [strategy configuration and variant comparisons](STRATEGIES.md).
-`liquidity-trend-vol` outputs are grouped under
-`/tmp/trading-backtests/candidate/liquidity-trend-vol/`; `--output-dir` selects a
-run directory for either strategy.
+Strategy outputs are grouped under `/tmp/trading-backtests/candidate/<strategy>/`;
+`--output-dir` selects a run directory.
 
 Every CLI backtest also writes a WebP equity plot for the strategy and SPY buy &
 hold under `/tmp/trading-backtests` (or the configured system temporary directory).
@@ -673,8 +673,8 @@ position weights.
 ## Alpaca paper execution
 
 `live.py` applies the same causal liquidity idea to an
-Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional top-12
-basket at 15:45, and submits its exit at 06:00 on the next trading session.
+Alpaca account. By default it starts ranking at 14:00 ET, opens an equal-notional three-stock
+basket selected from twelve liquid issuers at 15:45, and submits its exit at 06:00 on the next trading session.
 The daemon checks Alpaca's market calendar once per New York date and idles on
 weekends and exchange holidays instead of attempting scheduled actions.
 Before ranking, it refreshes every symbol already present in the broad
@@ -813,12 +813,17 @@ replace the ranking error or stop the daemon's normal retry loop. No email
 worker runs during entry preflight. Restart the live daemon after changing code
 or notification settings.
 
-The shipped strategy is `liquidity-trend-vol`: a 35% annual volatility target,
-20 completed modeled basket returns, a 100-session SPY daily-close trend filter, and a maximum
-2x exposure. `--strategy liquidity-fixed` retains cash-only fixed sizing. Both use
-the same execution workflow; see [strategy and risk details](STRATEGIES.md).
+The shipped strategy is `liquidity-momentum-focus`: select three of the twelve
+liquidity-ranked Nasdaq issuers by ten-session daily-close momentum, target 35%
+annual volatility using 20 completed modeled basket returns, and cap exposure at
+2x. Hold cash below the 100-session SPY daily-close average. Ranking prepares the
+selection and risk history; preflight checks account limits and saves the order
+plan. Cash decisions are also persisted for exact reconciliation.
+`--strategy liquidity-trend-vol` retains the earlier twelve-stock risk policy;
+`--strategy liquidity-fixed` retains cash-only fixed sizing. All use the same
+execution workflow; see [strategy and risk details](STRATEGIES.md).
 
-For `liquidity-trend-vol`, `--capital-fraction` defaults to `1.0` of account equity.
+For both risk-based strategies, `--capital-fraction` defaults to `1.0` of account equity.
 `--capital` instead caps the allocated equity before policy exposure is applied.
 Sizing respects Reg T and regular buying power, existing account exposure, asset
 margin eligibility and reported maintenance requirements, then applies the 2%

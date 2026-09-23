@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .momentum import LiquidityMomentumFocusConfig, LiquidityMomentumPolicy
 from .strategies import LiquidityTrendVolConfig, LiquidityTrendVolPolicy
 
 
@@ -48,6 +49,10 @@ class StrategySpec:
 
 
 _REGISTRY = {
+    "liquidity-momentum-focus": StrategySpec(
+        "liquidity-momentum-focus", "Liquidity: momentum focus + volatility target",
+        LiquidityMomentumFocusConfig, LiquidityMomentumPolicy, requires_daily_closes=True,
+    ),
     "liquidity-fixed": StrategySpec("liquidity-fixed", "Liquidity: fixed exposure"),
     "liquidity-trend-vol": StrategySpec(
         "liquidity-trend-vol", "Liquidity: trend + volatility target",

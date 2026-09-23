@@ -26,13 +26,15 @@ from .history import (
     load_primary_auction_exchange_mask,
     simulation_symbols,
 )
+from .momentum import allocation_snapshot
+from .portfolio import select_unconflicted_candidates
 from .ranking import build_issuer_map
 from .risk_history import historical_baskets, risk_signal, unit_return
 
 
 def risk_configuration(config):
     return {
-        "pipeline_version": 3,
+        "pipeline_version": 4,
         "spy_trend_price_source": "daily-close",
         "strategy": config.strategy_name,
         "parameters": config.risk_config.as_dict(),
@@ -75,7 +77,8 @@ def signal_is_current(signal, config, trade_date):
         and isinstance(exposure, (float, int))
         and not isinstance(exposure, bool)
         and np.isfinite(exposure)
-        and 0 < exposure <= config.risk_config.max_exposure
+        and (0 <= exposure <= config.risk_config.max_exposure if config.strategy_name == "liquidity-momentum-focus"
+             else 0 < exposure <= config.risk_config.max_exposure)
         and len(signal.get("observations") or [])
         == config.risk_config.volatility_window
         and len(signal.get("spy_history") or []) == config.risk_config.trend_window
@@ -85,7 +88,19 @@ def signal_is_current(signal, config, trade_date):
             for row in signal["observations"]
         )
         and bool(signal.get("input_sha256"))
+        and (config.strategy_name != "liquidity-momentum-focus" or all(
+            "allocation" in row and "entry_allowed" in row for row in signal["observations"]
+        ))
     )
+
+
+def prepare_live_allocation(config, ranking, completed, trade_date):
+    names = select_unconflicted_candidates(ranking, set(), set(), config.top)
+    days = pd.DatetimeIndex(completed[-config.risk_config.allocation_window - 1:])
+    if len(days) != config.risk_config.allocation_window + 1:
+        raise ValueError("insufficient completed momentum sessions")
+    prices = np.column_stack([load_daily_closes(config.daily_bars_dir / f"{symbol}.npy", days) for symbol in names])
+    return allocation_snapshot(names, prices[0], prices[-1], days, trade_date, config.risk_config)
 
 
 def _pages(client, path, params, *, version="v2"):
@@ -308,6 +323,9 @@ def prepare_live_risk(
     exchange, _ = load_primary_auction_exchange_mask(
         config.risk_auctions_path, dates, symbols, "nasdaq"
     )
+    allocations = []
+    daily_closes = (np.column_stack([load_daily_closes(config.daily_bars_dir / f"{symbol}.npy", dates) for symbol in symbols])
+                    if config.strategy_name == "liquidity-momentum-focus" else None)
     rows, baskets = historical_baskets(
         dates,
         symbols,
@@ -321,6 +339,8 @@ def prepare_live_risk(
         min_history_days=config.min_history_days,
         minimum_trading_days=config.minimum_trading_days,
         liquidity_scheme=config.liquidity_scheme,
+        daily_closes=daily_closes,
+        allocations=allocations,
     )
     selected_symbols = {str(symbols[column]) for basket in baskets for column in basket}
     for row, basket in zip(rows, baskets, strict=True):
@@ -333,7 +353,7 @@ def prepare_live_risk(
     )
     provider.refresh_splits(selected_symbols, dates[rows[0]].date(), trade_date)
     observations = []
-    for row, basket in zip(rows, baskets, strict=True):
+    for index, (row, basket) in enumerate(zip(rows, baskets, strict=True)):
         entry_day, exit_day = dates[row].date(), dates[row + 1].date()
         names = [str(symbols[column]) for column in basket]
         entries = [
@@ -350,6 +370,8 @@ def prepare_live_risk(
                 "unscaled_return": unit_return(entries, exits),
             }
         )
+        if config.strategy_name == "liquidity-momentum-focus":
+            observations[-1].update(allocation=allocations[index], entry_allowed=closes[row] > config.entry_minute)
     marks = provider.spy_marks(dates, config.risk_config.trend_window)
     signal = risk_signal(dates, observations, marks, config.risk_config)
     signal["configuration_sha256"] = configuration_fingerprint(config)

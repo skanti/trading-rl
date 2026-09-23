@@ -22,8 +22,8 @@ Combined CSV/JSON tables and an equity chart accompany separate run artifacts
 under `/tmp/trading-backtests/candidate/comparisons/` or `--output-dir`.
 `--strategy-config` and individual output-file flags require a single strategy.
 
-`liquidity-trend-vol` is the backtester default: liquidity ranking with a SPY
-trend filter and volatility targeting. Select `--strategy liquidity-fixed` for
+`liquidity-momentum-focus` is the live and backtester default: momentum selection
+within a liquidity shortlist, a SPY trend filter and volatility targeting. Select `--strategy liquidity-fixed` for
 a liquidity-ranked basket with fixed exposure.
 
 `--strategy liquidity-momentum-blend` selects the experimental blend of five- and
@@ -34,12 +34,20 @@ per side lowers its CAGR to 96.77%. `liquidity-regime-vol` and
 `liquidity-momentum-vol` retain earlier experimental families for comparisons.
 All use shared execution, allocation and financing code. See
 [research results and plugin instructions](../research/README.md).
+`liquidity-momentum-focus` simplifies the blend to a single equal-weight top-three
+basket ranked by ten-session momentum, with a 100-session SPY trend and
+20-basket volatility history. These are the user-selected defaults, with a 35%
+volatility target and 2x cap. Through September 23, 2026 their in-sample result is
+120.39% calendar CAGR, 2.365 Sharpe and 21.12% minute-mark drawdown. The earlier
+optimized 8/150/40 settings remain available as an explicit variant. See the
+[full study and reproduction commands](../research/MOMENTUM_FOCUS.md).
 Backtester-only plugins can be registered with `--strategy-plugin MODULE`; live
 and reconciliation retain a separate approved strategy registry. The backtester
 exposes `prepare_backtest(argv)` to prepare one reusable input panel for comparisons
 without running a strategy or producing reports.
-Names describe strategy families; parameter values belong in `--strategy-config`. The live YAML now selects `liquidity-trend-vol`; `trading-live --strategy` can
-select either policy. Existing processes retain their startup configuration until
+Names describe strategy families; parameter values belong in `--strategy-config`.
+The live YAML selects `liquidity-momentum-focus`; `trading-live --strategy` also
+accepts `liquidity-trend-vol` and `liquidity-fixed`. Existing processes retain their startup configuration until
 the user restarts them.
 
 `liquidity-trend-vol` uses the selected research rules: the usual top 12 distinct
@@ -66,7 +74,7 @@ borrowing using calendar days / 360. `--margin-interest-rate 5` means 5%.
 `liquidity-trend-vol` requires the exit clock before the entry clock so every risk
 observation has completed before the next entry.
 
-Both strategies share ranking, sizing, financing, compounding and metric code.
+The strategies share ranking, sizing, financing, compounding and metric code.
 Whole shares round down per position and financing uses actual deployed capital.
 `liquidity-fixed` now includes early-close cash intervals in its metrics, initializes
 rankings from all available history, and sizes leveraged trades before calculating
@@ -77,9 +85,9 @@ differ around exchange changes, so do not attribute those differences to risk
 sizing. Current security-master classification also remains a limitation; a fully
 point-in-time universe is a separate data improvement.
 
-`liquidity-trend-vol` output defaults to a unique directory under
-`/tmp/trading-backtests/candidate/liquidity-trend-vol/`. `--output-dir` works for either strategy.
-`liquidity-trend-vol` writes `trades.csv`, `portfolio.csv`, `minute_marks.csv`,
+Strategy output defaults to a unique directory under
+`/tmp/trading-backtests/candidate/<strategy>/`. `--output-dir` overrides it.
+Runs write `trades.csv`, `portfolio.csv`, `minute_marks.csv`,
 `summary.json`, and an equity chart. Summaries include resolved policy and CLI
 parameters, data-manifest metadata, source hashes, input archive hashes, session
 metrics and calendar CAGR. Minute-open audits reconcile to every modeled exit;
@@ -89,10 +97,14 @@ bid-side drawdown. Historical research results and reports were archived under
 was removed. Temporary output needs copying to durable storage if it must survive
 system cleanup.
 
-## Live trend/volatility strategy
+## Live momentum-focus strategy
 
-The shipped live configuration selects `liquidity-trend-vol` with the same risk
-parameters. It keeps fractional equal-notional entries at 15:45 ET, a 2% sizing
+The shipped live configuration selects `liquidity-momentum-focus` with 10-session
+momentum, a 100-session SPY average, 20 modeled basket returns, a 35% volatility
+target and a 2x cap. Ranking first selects 12 liquid issuers, then chooses three
+by momentum from completed daily closes. Equal momentum retains liquidity order.
+A weak or incomplete SPY trend means zero exposure. The older trend/volatility
+strategy retains its twelve-stock basket and 0.25 weak-trend multiplier. It keeps fractional equal-notional entries at 15:45 ET, a 2% sizing
 buffer, and DAY market exits queued at 06:00 ET. For Nasdaq stocks, market orders
 received by Alpaca before 09:28 ET receive the official opening price; fractional
 DAY orders retain that price basis. State records the broker submission timestamp
@@ -101,7 +113,8 @@ and whether it precedes the cutoff. Missing timestamps remain unknown.
 At ranking time, `live_risk.py` prepares the last 20 completed modeled overnight
 returns through that morning's exit, including zero returns for short-session
 cash intervals. Historical rankings use the shared scorer and historical venue
-filter. Entry prices are SIP asks at 15:45; exits are primary opening auctions;
+filter, followed by the same three-stock momentum selection. Trend-filter cash
+days still observe the modeled three-stock return for volatility. Entry prices are SIP asks at 15:45; exits are primary opening auctions;
 additional modeled costs are zero. Raw prices and a refreshed split ledger keep
 each entry/exit pair on the same basis. Missing quotes and auction prints are
 fetched through read-only data requests. SPY uses the previous 100 sessions'
@@ -120,13 +133,23 @@ containing `minute_open` using their original prices, without rewriting past tra
 Changing the source invalidates a cached ranking signal and requires fresh risk
 preparation. An already prepared entry keeps its saved plan.
 
-Snapshots under `WORK_DIR/risk/liquidity-trend-vol/YYYY-MM-DD.json` record inputs,
+Snapshots under `WORK_DIR/risk/<strategy>/YYYY-MM-DD.json` record inputs,
 parameters, timestamps, configuration and data fingerprints. Ranking state also
 holds the snapshot. A date or parameter change requires fresh preparation. Entry
 preflight saves the risk snapshot, allocated equity, target and effective exposure,
 broker limits, and exact order plan with the position. Retries reuse that plan
-and deterministic order IDs. Positions created before this promotion retain
-`liquidity-fixed` semantics and exit normally.
+and deterministic order IDs. The current and historical momentum snapshots record
+the full liquidity shortlist, lagged close endpoints, history dates and selected
+symbols. Reconciliation recomputes selection, exposure and sizing from these saved
+inputs. Existing fixed and trend/volatility positions keep their recorded semantics
+and exit normally; historical sessions are not relabeled or backfilled as focus.
+
+The ranking stage does the momentum and risk-history work. Preflight validates
+those snapshots and checks current account limits before saving an immutable
+order plan. A conflict in one of the chosen three blocks entry instead of silently
+substituting another stock. Cash sessions save a closed, zero-order decision that
+reconciliation can replay. The new pipeline fingerprint forces old ranking caches
+to rebuild after restart; already prepared order plans remain unchanged.
 
 Allocated capital is the smaller of account equity and `--capital`, or account
 equity times `--capital-fraction`. Target notional is allocated capital times
@@ -136,8 +159,10 @@ requirements. The 2% buffer is applied after these limits. Cash accounts or bask
 containing a non-marginable asset are additionally capped at cash. Fractional
 notionals are rounded down to cents. `liquidity-fixed` retains cash-only sizing.
 
-`strategies.py`, `risk_history.py`, `portfolio.py`, and `execution_prices.py` hold
-shared policy, risk calculations, portfolio operations, and explicit price loaders.
+`strategies.py`, `momentum.py`, `risk_history.py`, `portfolio.py`, and
+`execution_prices.py` hold shared policies, momentum selection, risk calculations,
+portfolio operations, and explicit price loaders. Live imports neither the
+backtester nor research modules.
 `BasketHistory` supplies the same lagged ranking features and basket selection to
 simulation and live risk bootstrap. The shared return evaluator validates prices
 and computes unit-exposure observations. Allocation uses an explicit slot count,

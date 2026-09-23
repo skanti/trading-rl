@@ -149,6 +149,25 @@ def select_unconflicted_candidates(
     return symbols[selected].tolist()
 
 
+def select_entry_candidates(ranking, held_symbols, open_order_symbols, config):
+    """Freeze focus membership at ranking; broker conflicts cannot change its basket."""
+    if config.strategy_name != "liquidity-momentum-focus":
+        return select_unconflicted_candidates(ranking, held_symbols, open_order_symbols, config.top)
+    from .momentum import replay_allocation
+
+    snapshot = ranking["allocation"]
+    chosen = replay_allocation(snapshot, config.risk_config, config.top, ranking["trade_date"])
+    shortlist = select_unconflicted_candidates(ranking, set(), set(), config.top)
+    if [row["symbol"] for row in snapshot["candidates"]] != shortlist:
+        raise ValueError("momentum allocation differs from the liquidity shortlist")
+    if ranking["risk_signal"]["target_exposure"] == 0:
+        return []
+    conflicts = set(chosen) & (held_symbols | open_order_symbols)
+    if conflicts:
+        raise RuntimeError("momentum basket conflicts with existing positions/orders: " + ", ".join(sorted(conflicts)))
+    return chosen
+
+
 def client_order_id(entry_date: date, side: str, symbol: str, attempt: int = 1) -> str:
     clean_symbol = "".join(
         character for character in symbol.upper() if character.isalnum()

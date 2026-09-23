@@ -51,6 +51,8 @@ CONFIG_FIELDS = {
         "trend_window",
         "weak_trend_multiplier",
         "risk_history_start",
+        "allocation_window",
+        "allocation_count",
     ),
     "data": (
         "risk_minute_bars_dir",
@@ -122,6 +124,8 @@ class RiskSettings:
     trend_window: int = 100
     weak_trend_multiplier: float = 0.25
     risk_history_start: str = "2023-01-01"
+    allocation_window: int = 10
+    allocation_count: int = 3
 
 
 @dataclass
