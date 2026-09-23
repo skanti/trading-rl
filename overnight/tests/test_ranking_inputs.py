@@ -1,9 +1,9 @@
 import json
-import os
 import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -96,7 +96,7 @@ class RankingInputsTest(unittest.TestCase):
         calendar = self.root / "calendar.json"
         calendar.write_text(json.dumps(self.sessions(["2026-07-02", "2026-07-06"])))
         with self.assertRaisesRegex(
-            ValueError, "calendar JSON requires start, end, and sessions"
+            ValueError, "invalid calendar snapshot"
         ):
             ranking_inputs.daily_ranking_calendar(
                 self.root, ["AAPL"], calendar_path=calendar
@@ -121,29 +121,12 @@ class RankingInputsTest(unittest.TestCase):
             ranking_inputs.daily_ranking_symbols(self.root).tolist(), ["AAPL"]
         )
 
-    def test_fetch_reuses_authenticated_client_and_only_requests_calendar(self):
-        with (
-            patch(
-                "trading_rl.overnight.live.load_credentials",
-                return_value=("test-key", "test-secret"),
-            ),
-            patch("trading_rl.overnight.live.AlpacaClient") as client,
-            patch.dict(
-                os.environ, {"ALPACA_URL": "https://paper-api.alpaca.markets/v2"}
-            ),
-        ):
-            client.return_value.calendar.return_value = self.sessions(["2026-07-02"])
-            result = ranking_inputs.fetch_ranking_calendar(
-                date(2026, 7, 1), date(2026, 7, 6)
-            )
-        client.assert_called_once_with(
-            "test-key", "test-secret", trading_url="https://paper-api.alpaca.markets/v2"
-        )
-        self.assertEqual(len(client.return_value.method_calls), 1)
-        client.return_value.calendar.assert_called_once_with(
-            date(2026, 7, 1), date(2026, 7, 6)
-        )
-        self.assertEqual(result, self.sessions(["2026-07-02"]))
+    def test_fetch_reuses_shared_calendar_snapshot(self):
+        sessions = self.sessions(["2026-07-02"])
+        with patch.object(ranking_inputs, "load_calendar", return_value=SimpleNamespace(sessions=sessions)) as load:
+            result = ranking_inputs.fetch_ranking_calendar(date(2026, 7, 1), date(2026, 7, 6))
+        load.assert_called_once_with(date(2026, 7, 1), date(2026, 7, 6))
+        self.assertEqual(result, sessions)
 
 
 if __name__ == "__main__":

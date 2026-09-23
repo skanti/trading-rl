@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import json
-import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from ..market_data.calendar import _clock_minute
+from ..market_data.calendar import session_closes
+from ..market_data.session_calendar import load_calendar
 from .history import EASTERN, _security_symbol, daily_bar_dates
 
 
@@ -39,43 +38,7 @@ def daily_ranking_symbols(
 
 
 def fetch_ranking_calendar(start: date, end: date) -> list[dict[str, object]]:
-    # Reuse the application's authenticated client, including bounded retries.
-    from .live import AlpacaClient, load_credentials
-
-    key, secret = load_credentials()
-    client = AlpacaClient(
-        key,
-        secret,
-        trading_url=os.environ.get("ALPACA_URL", "https://paper-api.alpaca.markets/v2"),
-    )
-    return client.calendar(start, end)
-
-
-def session_closes(
-    sessions: Sequence[Mapping[str, object]], start: date, end: date
-) -> dict[date, int]:
-    """Validate official records without guessing holidays or shortened sessions."""
-    closes: dict[date, int] = {}
-    for session in sessions:
-        if not isinstance(session, Mapping):
-            raise ValueError(  # noqa: TRY004 -- invalid external data
-                "calendar sessions must be objects with date, open, and close"
-            )
-        try:
-            day = date.fromisoformat(str(session["date"]))
-            opening = _clock_minute(session["open"])
-            closing = _clock_minute(session["close"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"invalid calendar session: {session!r}") from error
-        if closing <= opening:
-            raise ValueError(f"calendar close must follow open for {day}")
-        if start <= day <= end:
-            if day in closes:
-                raise ValueError(f"duplicate calendar session: {day}")
-            closes[day] = closing
-    if not closes:
-        raise ValueError(f"no calendar sessions from {start} through {end}")
-    return closes
+    return load_calendar(start, end).sessions
 
 
 def daily_ranking_calendar(
@@ -107,17 +70,7 @@ def daily_ranking_calendar(
     if calendar_path is None:
         sessions = fetch_ranking_calendar(start, end)
     else:
-        payload = json.loads(calendar_path.read_text())
-        try:
-            covered_start = date.fromisoformat(payload["start"])
-            covered_end = date.fromisoformat(payload["end"])
-            sessions = payload["sessions"]
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(
-                "calendar JSON requires start, end, and sessions"
-            ) from error
-        if covered_start > start or covered_end < end:
-            raise ValueError(f"calendar coverage must include {start} through {end}")
+        sessions = load_calendar(start, end, path=calendar_path, offline=True).sessions
     if not isinstance(sessions, list):
         raise ValueError("calendar sessions must be a list")  # noqa: TRY004 -- invalid external data
     closes = session_closes(sessions, start, end)

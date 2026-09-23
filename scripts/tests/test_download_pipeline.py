@@ -64,6 +64,7 @@ class DownloadPipelineTest(unittest.TestCase):
                     "PYTHON_BIN": str(runner), "ENV_FILE": str(root / "absent.env"),
                     "UPDATES_DIR": str(root), "LOCK_DIR": str(root / "lock"),
                     "MASTER_PATH": str(root / "master.txt"),
+                    "CALENDAR_PATH": str(root / "calendar.json"),
                     "LIQUIDITY_CANDIDATES_PATH": str(root / "symbols.txt"),
                     "DAILY_BARS_DIR": str(root / "daily"), "MINUTE_BARS_DIR": str(root / "minute"),
                     "AUCTIONS_PATH": str(root / "auctions.npz"), "NBBO_PATH": str(root / "nbbo.npz"),
@@ -112,15 +113,16 @@ class DownloadPipelineTest(unittest.TestCase):
                     self.assertNotIn("--trade-date", args)
                     self.assertEqual(calls[-1]["symbols"], ["MSFT", "NVDA"])
                     self.assertEqual([call["name"] for call in calls], [
-                        "universe.py", "download_bars.py", "build_most_liquid.py",
+                        "trading_rl.cli.download_calendar", "universe.py", "download_bars.py", "build_most_liquid.py",
                         "trading_rl.cli.rank", "download_bars.py",
                         "download_auctions.py", "download_nbbo.py",
                     ])
-                    rank_args = calls[3]["args"]
+                    rank_args = calls[4]["args"]
                     for flag, value in {
                         "--since": "2023-01-01", "--top": "12",
                         "--daily-bars-dir": str(root / "daily"),
                         "--symbols-file": str(root / "symbols.txt"),
+                        "--calendar-path": str(root / "calendar.json"),
                         "--output": str(root / "strategy_symbols_2023-01-01.txt"),
                     }.items():
                         self.assertEqual(rank_args[rank_args.index(flag) + 1], value)

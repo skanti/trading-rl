@@ -106,12 +106,24 @@ and news-related volume spikes from dominating the ranking. Turnover stability
 uses that same span for its dispersion window, keeping the two horizons aligned.
 
 The first run loads split-adjusted daily bars from
-`/data/ppv1/updates/bars_1day_2022-01-01` and uses the minute-store inventory and
-SPY bars in `/data/ppv1/updates/bars_1min_2022-01-01` for candidates and sessions.
+`/data/ppv1/updates/bars_1day_2022-01-01` and uses the minute-store inventory in
+`/data/ppv1/updates/bars_1min_2022-01-01` for candidates.
 It writes a date-by-symbol cache under `/tmp/trading/baseline_cache`, reused when
 inputs and dates match. Override the bar stores with `--daily-bars-dir` and
 `--minute-bars-dir`. Default execution prices come from `--nbbo-path` and
 `--auctions-path`; explicit minute price sources read the minute-bar store.
+
+Sessions and early closes come from the official Alpaca calendar cached at
+`/data/ppv1/live/market_calendar.json`, shared with `trading-rank`. The download
+pipeline refreshes it; `--refresh-calendar` refreshes it on demand. Missing cache
+coverage requires Alpaca credentials. `--calendar-path` selects an offline
+snapshot in the format shown below for ranking, and fails on insufficient coverage.
+Backtest summaries retain the exact session records and their hash.
+The default final exit date follows the selected exit-price archive (or minute
+store), bounded by elapsed exit times. Today's 09:30 exit can therefore be included
+without today's completed SPY session. Missing individual execution prices still
+use the existing validation and staleness checks; they do not remove dates from
+the calendar.
 
 Both `--entry-price-source` and `--exit-price-source` accept `minute-open`,
 `minute-high`, `minute-low`, `minute-close`, and `minute-vwap`. Entry defaults to
@@ -447,7 +459,8 @@ explicit shortlist. Every shortlisted symbol must have a daily file. Neither SPY
 nor a minute-bar store is required. The latest observed date before today in New
 York bounds the replay; today's and future bars never enter its history.
 
-Session dates and early closes come from Alpaca's calendar API, using `ALPACA_KEY`
+Session dates and early closes use the shared cached Alpaca calendar. Missing
+cache coverage is fetched from the API using `ALPACA_KEY`
 and `ALPACA_SECRET` (or the `APCA_API_*` equivalents), with `ALPACA_URL` selecting the
 trading endpoint. Missing bar days remain on the official calendar; weekends and
 holidays do not become sessions. For an offline replay, `--calendar-path` accepts a

@@ -536,6 +536,7 @@ def historical_window(
     min_history_days: int,
     min_trading_days: int,
     entry_time: int,
+    session_closes: Mapping[date, int] | None = None,
 ) -> HistoricalWindow:
     """Choose the replay interval, preceding warm-up, and eligible entry sessions.
 
@@ -552,7 +553,13 @@ def historical_window(
     requested_dates = [
         stamp.date() for stamp in dates if requested_start <= stamp < final_exit
     ]
-    requested_closes = auction_close_minutes(auction_path, requested_dates)
+    if session_closes is None:
+        requested_closes = auction_close_minutes(auction_path, requested_dates)
+    else:
+        missing = set(requested_dates) - session_closes.keys()
+        if missing:
+            raise ValueError(f"market calendar is missing sessions: {sorted(missing)}")
+        requested_closes = {day: session_closes[day] for day in requested_dates}
     shortened = short_entry_dates(requested_closes, entry_time)
     return HistoricalWindow(
         requested_start,

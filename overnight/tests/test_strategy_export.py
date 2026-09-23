@@ -430,6 +430,9 @@ class RankingCliTest(unittest.TestCase):
 
     def test_stale_calendar_coverage_is_rejected(self):
         self.calendar["end"] = str(self.inputs["dates"][-2].date())
+        self.calendar["sessions"] = [
+            row for row in self.calendar["sessions"] if row["date"] <= self.calendar["end"]
+        ]
         self.calendar_path.write_text(json.dumps(self.calendar))
         error = io.StringIO()
         with redirect_stderr(error), self.assertRaises(SystemExit):

@@ -50,3 +50,17 @@ trades, portfolio returns, minute audits and charts go to
 `/tmp/trading-backtests/candidate/liquidity-trend-vol/`.
 See [strategies and experiment design](overnight/STRATEGIES.md) for exact rules,
 configuration, reproduction and the recommended comparison framework.
+
+Backtesting and historical ranking use Alpaca's official market calendar, cached
+at `/data/ppv1/live/market_calendar.json`. Session dates and early closes no longer
+depend on complete SPY minute bars. A morning-only final session can supply the
+09:30 exit once that time has elapsed and the exit data is available; individual
+missing prices remain subject to the existing execution-data checks.
+
+The download pipeline refreshes this calendar before updating prices
+(`CALENDAR_PATH` overrides its location). Backtests reuse the cache, fetching
+missing coverage with Alpaca credentials when needed. Use `--refresh-calendar`
+to refresh it explicitly, or `--calendar-path /path/to/calendar.json` for an
+offline snapshot with `start`, `end`, and `sessions` fields. Insufficient or
+invalid offline coverage is an error. Run summaries save the exact calendar
+records and their hash so the session schedule is reproducible.

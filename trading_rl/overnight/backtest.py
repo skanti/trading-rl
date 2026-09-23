@@ -29,8 +29,8 @@ from rich.table import Table
 from rich.text import Text
 from tqdm import tqdm
 
-from ..market_data.calendar import auction_close_minutes
 from ..market_data.schema import validate_bar_columns
+from .backtest_calendar import backtest_sessions
 from .backtest_report import comparison_metadata
 from .backtest_strategies import (
     BUILTIN_STRATEGIES,
@@ -71,7 +71,6 @@ from .history import (
     load_daily_dollar_volume,
     load_nasdaq_security_master,
     load_primary_auction_exchange_mask,
-    reference_session_calendar,
     simulation_symbols,
 )
 from .portfolio import (
@@ -1043,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--end-date",
         type=_parse_day,
         default=None,
-        help="final exit date, default: latest data date",
+        help="final exit date, default: latest available exit-data date whose exit time has elapsed",
     )
     parser.add_argument(
         "--ema-span",
@@ -1184,6 +1183,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-csv", default=None)
     parser.add_argument("--summary-json", default=None)
+    parser.add_argument("--calendar-path", type=Path, default=None,
+                        help="offline market-calendar JSON snapshot with start, end, sessions")
+    parser.add_argument("--refresh-calendar", action="store_true",
+                        help="refresh the shared /data/ppv1/live/market_calendar.json from Alpaca")
     parser.add_argument(
         "--show-symbol-trade-frequency",
         action="store_true",
@@ -1287,21 +1290,19 @@ def prepare_backtest(argv: list[str] | None = None) -> PreparedBacktest:
     auction_path = Path(args.auctions_path)
     if not auction_path.exists():
         parser.error(
-            f"auction data required for official session-close filtering does not exist: "
+            f"auction data required for execution prices and exchange membership does not exist: "
             f"{auction_path}"
         )
     data_dir = Path(args.minute_bars_dir)
     daily_data_dir = Path(args.daily_bars_dir)
-    known_session_closes = auction_close_minutes(auction_path, None)
-    all_dates, all_context_sod = reference_session_calendar(
-        data_dir / f"{REFERENCE_SYMBOL}.npy", known_session_closes
-    )
     try:
+        all_dates, all_context_sod, known_session_closes, calendar_metadata = backtest_sessions(args)
         window = historical_window(
             all_dates, all_context_sod, auction_path,
             since=args.since, end_date=args.end_date, months=args.months,
             ema_span=args.ema_span, min_history_days=args.min_history_days,
             min_trading_days=args.min_trading_days, entry_time=args.entry_time,
+            session_closes=known_session_closes,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -1313,7 +1314,7 @@ def prepare_backtest(argv: list[str] | None = None) -> PreparedBacktest:
     history = all_dates <= end_date
     cache_dates, cache_context_sod = all_dates[history], all_context_sod[history]
     entry_session_mask = np.array([
-        known_session_closes.get(day.date(), 960) > args.entry_time for day in cache_dates
+        known_session_closes[day.date()] > args.entry_time for day in cache_dates
     ])
     spy_trend_marks = None
     if any(item is not None for item in configs):
@@ -1344,6 +1345,7 @@ def prepare_backtest(argv: list[str] | None = None) -> PreparedBacktest:
         args.entry_price_source,
         args.exit_price_source,
     )
+    metadata["calendar_sessions_sha256"] = calendar_metadata["sessions_sha256"]
     cache_name = (
         f"liquidity_{cache_dates[0]:%Y%m%d}_{cache_dates[-1]:%Y%m%d}_"
         f"e{args.entry_time:04d}_{args.entry_price_source}_"
@@ -1533,6 +1535,7 @@ def prepare_backtest(argv: list[str] | None = None) -> PreparedBacktest:
         "excluded_asset_reasons": excluded_asset_reasons,
         "candidate_symbols": int(len(symbols) - int((symbols == REFERENCE_SYMBOL).sum())),
         "data_metadata": metadata,
+        "market_calendar": calendar_metadata,
     })
 
 

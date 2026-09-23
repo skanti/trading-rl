@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, time
 from pathlib import Path
-from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -116,3 +115,30 @@ def short_entry_dates(
     return {
         day for day, close_minute in close_minutes.items() if close_minute <= entry_minute
     }
+
+
+def session_closes(
+    sessions: Sequence[Mapping[str, object]], start: date, end: date
+) -> dict[date, int]:
+    """Validate official records without guessing holidays or shortened sessions."""
+    closes: dict[date, int] = {}
+    for session in sessions:
+        if not isinstance(session, Mapping):
+            raise ValueError(  # noqa: TRY004 -- invalid external data
+                "calendar sessions must be objects with date, open, and close"
+            )
+        try:
+            day = date.fromisoformat(str(session["date"]))
+            opening = _clock_minute(session["open"])
+            closing = _clock_minute(session["close"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid calendar session: {session!r}") from error
+        if closing <= opening:
+            raise ValueError(f"calendar close must follow open for {day}")
+        if start <= day <= end:
+            if day in closes:
+                raise ValueError(f"duplicate calendar session: {day}")
+            closes[day] = closing
+    if not closes:
+        raise ValueError(f"no calendar sessions from {start} through {end}")
+    return closes
