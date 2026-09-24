@@ -41,14 +41,14 @@ from trading_rl.overnight.risk_history import (
 
 
 class MomentumLiveTest(unittest.TestCase):
-    def setup_session(self, cash=False, share_mode="fractional", count=4):
+    def setup_session(self, cash=False, share_mode="fractional", count=4, multiplier=0.0):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         store = StateStore(Path(directory.name) / "state.json")
         settings = replace(
             config(top=6, share_mode=share_mode),
             strategy_name="liquidity-momentum-focus",
-            risk_config=LiquidityMomentumFocusConfig(allocation_count=count),
+            risk_config=LiquidityMomentumFocusConfig(allocation_count=count, weak_trend_multiplier=multiplier),
             capital_fraction=1.0,
         )
         day = date(2026, 8, 24)
@@ -159,6 +159,7 @@ class MomentumLiveTest(unittest.TestCase):
         default = _validate_args(parser, args)
         self.assertEqual(default.top, 12)
         self.assertEqual(default.risk_config.allocation_count, 3)
+        self.assertEqual(default.risk_config.weak_trend_multiplier, 0.1)
         store, settings, day, broker = self.setup_session(count=3)
         plan = enter_for_day(broker, store, settings, day, False)
         self.assertEqual(plan["symbols"], list("DEF"))
@@ -172,6 +173,28 @@ class MomentumLiveTest(unittest.TestCase):
             replace(settings, risk_config=LiquidityMomentumFocusConfig(allocation_count=4)),
             day,
         ))
+
+    def test_weak_trend_default_trades_reduced_size_and_replays(self):
+        policy = LiquidityMomentumFocusConfig()
+        store, settings, day, broker = self.setup_session(
+            cash=True, count=policy.allocation_count,
+            multiplier=policy.weak_trend_multiplier,
+        )
+        plan = enter_for_day(broker, store, settings, day, True, preflight_only=True)
+        signal = plan["risk_signal"]
+        self.assertFalse(signal["strong_trend"])
+        self.assertAlmostEqual(signal["target_exposure"], .1 * min(
+            policy.max_exposure, policy.volatility_target / signal["annualized_volatility"],
+        ))
+        self.assertGreater(plan["budget"], 0)
+        self.assertFalse(plan["cash_session"])
+        self.assertEqual(plan["symbols"], list("DEF"))
+        self.assertFalse(signal_is_current(signal, replace(
+            settings, risk_config=replace(policy, weak_trend_multiplier=0),
+        ), day))
+        entered = enter_for_day(broker, store, settings, day, True)
+        self.assertEqual(len(broker.submissions), 3)
+        self.assertEqual(replay_entry_decision({"position": entered})["status"], "complete")
 
     def test_cash_is_valid_replayable_idempotent_and_never_submits(self):
         store, settings, day, broker = self.setup_session(cash=True)

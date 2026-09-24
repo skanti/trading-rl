@@ -31,6 +31,7 @@ class BacktestPluginTest(unittest.TestCase):
         config = get_strategy("liquidity-momentum-focus").load_config()
         self.assertEqual((config.allocation_window, config.allocation_count), (10, 3))
         self.assertEqual((config.trend_window, config.volatility_window, config.volatility_target), (100, 20, .35))
+        self.assertEqual(config.weak_trend_multiplier, 0.1)
         self.assertIsNone(config.allocation_windows)
         self.assertIn("liquidity-momentum-focus", STRATEGIES)
         dates = pd.bdate_range("2023-01-01", periods=180)

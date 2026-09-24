@@ -5,5 +5,5 @@
   "trend_window": 100,
   "volatility_window": 20,
   "volatility_target": 0.35,
-  "weak_trend_multiplier": 0.0
+  "weak_trend_multiplier": 0.1
 }

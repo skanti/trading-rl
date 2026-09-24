@@ -816,7 +816,8 @@ or notification settings.
 The shipped strategy is `liquidity-momentum-focus`: select three of the twelve
 liquidity-ranked Nasdaq issuers by ten-session daily-close momentum, target 35%
 annual volatility using 20 completed modeled basket returns, and cap exposure at
-2x. Hold cash below the 100-session SPY daily-close average. Ranking prepares the
+2x. Below the 100-session SPY daily-close average, use 10% of the volatility-sized
+exposure (`weak_trend_multiplier: 0.1`). Early-close sessions still skip entry. Ranking prepares the
 selection and risk history; preflight checks account limits and saves the order
 plan. Cash decisions are also persisted for exact reconciliation.
 `--strategy liquidity-trend-vol` retains the earlier twelve-stock risk policy;

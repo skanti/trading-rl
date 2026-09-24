@@ -236,7 +236,7 @@ class LiquidityMomentumFocusConfig(LiquidityMomentumConfig):
     volatility_target: float = 0.35
     volatility_window: int = 20
     trend_window: int = 100
-    weak_trend_multiplier: float = 0.0
+    weak_trend_multiplier: float = 0.1
     allocation_window: int = 10
     allocation_count: int = 3
     allocation_windows: tuple[int, ...] | None = None

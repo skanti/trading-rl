@@ -38,7 +38,8 @@ All use shared execution, allocation and financing code. See
 basket ranked by ten-session momentum, with a 100-session SPY trend and
 20-basket volatility history. These are the user-selected defaults, with a 35%
 volatility target and 2x cap. Through September 23, 2026 their in-sample result is
-120.39% calendar CAGR, 2.365 Sharpe and 21.12% minute-mark drawdown. The earlier
+119.38% calendar CAGR, 2.351 Sharpe and 21.38% minute-mark drawdown
+with the current 0.1 weak-trend multiplier. The earlier
 optimized 8/150/40 settings remain available as an explicit variant. See the
 [full study and reproduction commands](../research/MOMENTUM_FOCUS.md).
 Backtester-only plugins can be registered with `--strategy-plugin MODULE`; live
@@ -103,7 +104,9 @@ The shipped live configuration selects `liquidity-momentum-focus` with 10-sessio
 momentum, a 100-session SPY average, 20 modeled basket returns, a 35% volatility
 target and a 2x cap. Ranking first selects 12 liquid issuers, then chooses three
 by momentum from completed daily closes. Equal momentum retains liquidity order.
-A weak or incomplete SPY trend means zero exposure. The older trend/volatility
+A weak SPY trend applies a 0.1 multiplier to volatility-sized exposure, so it
+reduces position sizes instead of skipping entries. Missing required live inputs
+still block entry, and early-close sessions remain skipped. The older trend/volatility
 strategy retains its twelve-stock basket and 0.25 weak-trend multiplier. It keeps fractional equal-notional entries at 15:45 ET, a 2% sizing
 buffer, and DAY market exits queued at 06:00 ET. For Nasdaq stocks, market orders
 received by Alpaca before 09:28 ET receive the official opening price; fractional

@@ -25,8 +25,9 @@ prints the chart's absolute path.
 2. Rank those twelve by ten-session daily-close momentum, using only closes
    through the previous session. Buy the top three at equal weights. There is
    one basket and one momentum lookback, with no overlapping allocations.
-3. Hold cash when the previous SPY close is below its lagged 100-session SMA.
-4. Otherwise target 35% annualized volatility using the last twenty completed
+3. When the previous SPY close is below its lagged 100-session SMA, multiply
+   volatility-sized exposure by 0.1. This replaces the previous zero-exposure rule.
+4. Target 35% annualized volatility using the last twenty completed
    modeled, unlevered basket returns. Cap exposure at 2x; use 1x during volatility
    warmup or zero measured volatility. Cash decisions continue observing the
    modeled basket, and early-close cash intervals contribute zero returns.
@@ -52,14 +53,15 @@ full minute-open marked path, including financing and auction liquidation.
 
 | Strategy | Calendar CAGR | Sharpe | Minute drawdown | Ending equity |
 | --- | ---: | ---: | ---: | ---: |
-| Momentum focus default 10/100/20, N=3 | 120.39% | 2.365 | 21.12% | $189,196 |
+| Current 10/100/20, N=3, weak multiplier 0.1 | 119.38% | 2.351 | 21.38% | $185,999 |
+| Previous 10/100/20, N=3, weak multiplier 0 | 120.39% | 2.365 | 21.12% | $189,196 |
 | Previous 10/100/20, N=4 | 114.29% | 2.291 | 21.16% | $170,447 |
 | Earlier optimized focus 8/150/40 | 124.34% | 2.524 | 18.36% | $202,137 |
 | Momentum blend | 112.27% | 2.340 | 19.40% | $164,527 |
 | Optimized 8/150/40 + 0.25 bp/side | 120.75% | 2.477 | 18.39% | $190,340 |
 | Optimized 8/150/40 + 1 bp/side | 110.30% | 2.336 | 18.46% | $158,917 |
 
-The current default makes 2,385 stock trades versus 4,319 for the blend, and holds
+The current default makes 2,775 stock trades versus 4,319 for the blend, and holds
 three names on every traded interval. Use
 `research/variants/momentum-focus-8d-spy150-vol40.json` to reproduce the earlier
 optimized variant. Its 15.13% exit-only drawdown is smaller than its 18.36%
@@ -151,3 +153,11 @@ user-selected default. The explicit `momentum-focus-10d-spy100-vol20.json` varia
 retains N=4 to reproduce the previous default. Existing live decisions retain their
 saved basket size. Changing N requires a daemon restart and fresh ranking/risk
 preparation before new entries; an already prepared plan is reused unchanged.
+
+The weak-trend multiplier comparison is reproducible with
+`research/compare_weak_trend.py`; results are under
+`/tmp/trading-backtests/candidate/weak-trend-multipliers-20260923/`. The current
+0.1 setting trades all 925 eligible intervals in that study, versus 795 with zero;
+eight early-close intervals still skip entry. Explicit historical variants retain
+their original multipliers. The basket-size study also pins its original zero
+multiplier. Saved live decisions always replay their archived policy parameters.

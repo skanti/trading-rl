@@ -36,7 +36,8 @@ These instructions also live in [AGENTS.md](AGENTS.md) for future coding agents.
 Live execution and backtests default to `liquidity-momentum-focus`: shortlist the
 12 most liquid Nasdaq issuers, select three by ten-session momentum, and target
 35% volatility using 20 completed modeled baskets. Exposure is capped at 2x and
-falls to zero below the 100-session SPY daily-close average.
+is reduced to 10% of the volatility-sized amount below the 100-session SPY
+daily-close average.
 
 ```bash
 trading-backtest --strategy liquidity-momentum-focus --since 2026-01-01 --budget 10000
