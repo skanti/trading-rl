@@ -147,6 +147,7 @@ function buildSnapshot(): Snapshot {
       { symbol: 'MSFT', qty: 19.8, side: 'long', avg_entry_price: 502.66, current_price: 508.2, market_value: 10062.36, cost_basis: 9952.67, unrealized_pl: 109.69, unrealized_plpc: 0.011, change_today: 0.011 }
     ],
     strategy: {
+      strategy_name: 'liquidity-fixed', cash_session: false,
       status: 'open',
       entry_date: at(2).day,
       exit_date: last.day,
@@ -185,6 +186,7 @@ function buildSessions(snapshot: Snapshot): SessionRecord[] {
       const chosen = symbols.slice(0, 3 + (index % 3))
       const perSymbol = point.profit_loss / chosen.length
       return {
+        strategy_name: 'liquidity-fixed', cash_session: false,
         trading_day: point.day,
         last_action: 'exit',
         updated_at: `${point.day}T13:35:00Z`,

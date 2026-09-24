@@ -65,6 +65,11 @@ const columns: TableColumn<SessionMetricRow>[] = [
 
 const rows = computed<SessionMetricRow[]>(() => [
   {
+    metric: 'Strategy',
+    value: props.strategy.strategy_name ?? '—',
+    detail: ''
+  },
+  {
     metric: 'Deployed capital',
     value: formatCurrency(summary.value.deployed),
     detail: summary.value.utilization === null
@@ -133,7 +138,7 @@ const rows = computed<SessionMetricRow[]>(() => [
       <template #value-cell="{ row }">
         <div class="flex flex-col items-end">
           <span
-            class="numeric font-semibold"
+            class="numeric whitespace-normal break-words font-semibold"
             :class="row.original.tone ?? 'text-highlighted'"
           >
             {{ row.original.value }}

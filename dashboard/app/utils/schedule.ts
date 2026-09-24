@@ -143,9 +143,11 @@ export function executionMilestone(
         active: false,
         completed: true,
         warning,
-        description: warning
-          ? `${filled}/${total} filled · ${formatScheduleTime(completedAt, now, timeZone)}`
-          : `Filled · ${formatScheduleTime(completedAt, now, timeZone)}`
+        description: strategy.cash_session
+          ? `Cash · no orders · ${formatScheduleTime(completedAt, now, timeZone)}`
+          : warning
+            ? `${filled}/${total} filled · ${formatScheduleTime(completedAt, now, timeZone)}`
+            : `Filled · ${formatScheduleTime(completedAt, now, timeZone)}`
       }
     }
     if (event.at <= now) {

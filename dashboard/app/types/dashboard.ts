@@ -85,6 +85,8 @@ export interface BasketTotals {
 }
 
 export interface StrategyState {
+  strategy_name: string | null
+  cash_session: boolean
   status: string | null
   entry_date: string | null
   exit_date: string | null
@@ -139,6 +141,7 @@ export interface TradingSchedule {
 }
 
 export interface TradingConfiguration {
+  risk?: Record<string, unknown>
   schedule?: TradingSchedule
   strategy?: Record<string, unknown>
   data?: Record<string, unknown>
@@ -164,6 +167,8 @@ export interface Snapshot {
 }
 
 export interface SessionRecord {
+  strategy_name: string
+  cash_session: boolean
   trading_day: string
   last_action: string | null
   updated_at: string | null

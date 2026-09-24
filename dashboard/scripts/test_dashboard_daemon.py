@@ -261,6 +261,7 @@ class MetricsTest(unittest.TestCase):
 
     def test_closed_basket_aggregates_partial_exit_attempts(self):
         position = {
+            "strategy_name": "liquidity-fixed", "cash_session": False,
             "entry_date": "2026-08-25",
             "entry_orders": {"NVDA": order(10, 100.0)},
             "exit_orders": {"NVDA": order(6, 111.0)},
@@ -298,6 +299,7 @@ class SnapshotTest(unittest.TestCase):
     def test_snapshot_preserves_the_frontend_contract(self):
         state = {
             "position": {
+                "strategy_name": "liquidity-fixed", "cash_session": False,
                 "status": "closed",
                 "share_mode": "whole",
                 "symbols": ["NVDA"],
@@ -435,6 +437,7 @@ class SnapshotTest(unittest.TestCase):
                                 "entry_grace_seconds": 75,
                             },
                             "strategy": {
+                                "name": "liquidity-momentum-focus",
                                 "top": 15,
                                 "liquidity_scheme": "turnover_stability",
                                 "ema_span": 10,
@@ -463,6 +466,12 @@ class SnapshotTest(unittest.TestCase):
                                 "fill_timeout_seconds": 45.0,
                                 "poll_seconds": 1.0,
                                 "entry_preflight_seconds": 10.0,
+                            },
+                            "risk": {
+                                "volatility_target": .35, "max_exposure": 2,
+                                "volatility_window": 20, "trend_window": 100,
+                                "weak_trend_multiplier": .1, "allocation_window": 10,
+                                "allocation_count": 3,
                             },
                             "runtime": {"submit": True},
                         },
@@ -499,6 +508,7 @@ class ArtifactTest(unittest.TestCase):
                         {
                             "trading_day": day,
                             "position": {
+                                "strategy_name": "liquidity-fixed", "cash_session": False,
                                 "status": "closed",
                                 "entry_orders": {"NVDA": order(10, 100.0)},
                                 "exit_orders": {"NVDA": order(10, 100.0 + pnl / 10)},
@@ -522,6 +532,7 @@ class ArtifactTest(unittest.TestCase):
                         {
                             "trading_day": day,
                             "position": {
+                                "strategy_name": "liquidity-fixed", "cash_session": False,
                                 "entry_date": day,
                                 "entry_orders": {"NVDA": order(qty, 100.0)},
                             },
@@ -532,6 +543,7 @@ class ArtifactTest(unittest.TestCase):
 
     def test_session_history_reconciles_partial_fills_and_deduplicates_artifacts(self):
         position = {
+            "strategy_name": "liquidity-fixed", "cash_session": False,
             "status": "closed",
             "entry_date": "2026-08-25",
             "exit_date": "2026-08-26",
@@ -614,6 +626,7 @@ class ArtifactTest(unittest.TestCase):
                     "last_action": "exit",
                     "error": None,
                     "position": {
+                        "strategy_name": "liquidity-fixed", "cash_session": False,
                         "status": "closed",
                         "entry_date": entry_date,
                         "exit_date": exit_date,
@@ -628,6 +641,7 @@ class ArtifactTest(unittest.TestCase):
                     "last_action": "error",
                     "error": "2026-08-30 is not an Alpaca trading session",
                     "position": {
+                        "strategy_name": "liquidity-fixed", "cash_session": False,
                         "status": "open",
                         "entry_date": entry_date,
                         "exit_date": exit_date,
@@ -692,6 +706,7 @@ class ArtifactTest(unittest.TestCase):
                     {
                         "trading_day": "2026-08-28",
                         "position": {
+                            "strategy_name": "liquidity-fixed", "cash_session": False,
                             "status": "closed",
                             "entry_date": "2026-08-28",
                             "exit_date": "2026-08-31",
@@ -743,6 +758,7 @@ class FeeCacheIntegrationTest(unittest.TestCase):
         payload = {
             "trading_day": entry_day,
             "position": {
+                "strategy_name": "liquidity-fixed", "cash_session": False,
                 "status": "closed", "entry_date": entry_day, "exit_date": exit_day,
                 "entry_orders": {"NVDA": order(10, 100)},
                 "exit_orders": {"NVDA": order(10, 101)},
@@ -930,6 +946,7 @@ class DigestTest(unittest.TestCase):
         )
         self.state = {
             "position": {
+                "strategy_name": "liquidity-fixed", "cash_session": False,
                 "status": "closed",
                 "entry_date": "2026-08-25",
                 "exit_date": "2026-08-26",
@@ -1026,6 +1043,55 @@ class DigestTest(unittest.TestCase):
             dashboard_digest.mark_delivered(path, "first")
             dashboard_digest.mark_delivered(path, "second")
             self.assertEqual(dashboard_digest.delivered_keys(path), {"first", "second"})
+
+
+class StrategyIdentityTest(unittest.TestCase):
+    def test_active_strategy_requires_canonical_saved_position(self):
+        for name in ("liquidity-fixed", "liquidity-trend-vol", "liquidity-momentum-focus"):
+            state = {"position": {"strategy_name": name, "cash_session": False}, "strategy": "different-current-config"}
+            self.assertEqual(dashboard_daemon._strategy_view(state)["strategy_name"], name)
+        self.assertIsNone(dashboard_daemon._strategy_view({})["strategy_name"])
+        with self.assertRaises(KeyError):
+            dashboard_daemon._strategy_view({"position": {"status": "closed"}})
+
+    def test_history_retains_strategy_and_cash_without_fee_or_future_equity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            positions = [
+                {"entry_date": "2026-09-21", "exit_date": "2026-09-22", "status": "closed",
+                 "strategy_name": "liquidity-fixed", "cash_session": False,
+                 "entry_orders": {"A": order(.5, 100)}, "exit_orders": {"A": order(.5, 110)}},
+                {"entry_date": "2026-09-22", "exit_date": "2026-09-23", "status": "closed",
+                 "strategy_name": "liquidity-momentum-focus", "cash_session": False, "symbols": ["A", "B", "C"],
+                 "entry_account_snapshot": {"equity": 1000},
+                 "entry_orders": {s: order(.5, 100) for s in "ABC"},
+                 "exit_orders": {s: order(.5, 110) for s in "ABC"}},
+                {"entry_date": "2026-09-23", "exit_date": "2026-09-24", "status": "closed",
+                 "strategy_name": "liquidity-momentum-focus", "cash_session": True,
+                 "entry_account_snapshot": {"equity": 1015}, "symbols": [],
+                 "entry_orders": {}, "exit_orders": {}},
+            ]
+            for position in positions:
+                folder = root / position["entry_date"]
+                folder.mkdir()
+                (folder / "summary.json").write_text(json.dumps({
+                    "position": position, "configuration": {"strategy_name": "a-new-default"},
+                }))
+            with mock.patch.object(dashboard_daemon, "_session_fee_summary", return_value=("pending", None)) as fees:
+                records = session_records(root)
+            self.assertEqual(fees.call_count, 2)
+        cash, focus, legacy = records
+        self.assertEqual(legacy["strategy_name"], "liquidity-fixed")
+        self.assertEqual(focus["strategy_name"], "liquidity-momentum-focus")
+        self.assertEqual(len(focus["trades"]), 3)
+        self.assertEqual(focus["realized_pnl"], 15)
+        self.assertEqual(focus["realized_return"], .015)
+        self.assertTrue(cash["cash_session"])
+        self.assertEqual(cash["realized_pnl"], 0)
+        self.assertEqual(cash["fee_status"], "not_applicable")
+        curve = metrics.realized_equity_series(records, base_value=1000, include_provisional=True)
+        self.assertEqual(curve[-1].day, date(2026, 9, 23))
+        self.assertEqual(curve[-1].equity, 1020)
 
 
 if __name__ == "__main__":

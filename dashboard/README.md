@@ -42,6 +42,19 @@ emails label these results as `provisional`; the final chart segment is dashed, 
 provisional sessions remain excluded from risk statistics until fees post, normally the
 next day. Today/WTD/MTD/YTD/inception performance includes provisional sessions.
 Confirmed results then subtract the actual fees.
+History uses the compact label `provisional · fees TBD`; the expanded row retains
+the specific fee status. History and the active-session card show the strategy
+recorded with the position, so changing the current default never relabels older
+trades. Position artifacts must contain explicit `strategy_name` and `cash_session` fields;
+the publisher does not infer a strategy from current configuration or other metadata.
+Three-stock momentum-focus baskets, fractional sizing, and reduced exposure use
+the same actual-fill accounting as the earlier strategies.
+
+Cash-only decisions appear in history as `Cash · no orders`, with zero trading P&L
+and no fee request. They do not count as filled baskets or add a future scheduled
+exit to the equity chart. These publisher changes require restarting the dashboard
+publisher; the trading daemon does not need restarting for dashboard changes.
+
 Account-equity change remains a separate reconciliation value, with any difference
 shown as the unexplained residual. This keeps strategy performance independent of
 deposits, settlement rounding, and Alpaca's delayed portfolio-history rollover.
@@ -60,7 +73,7 @@ credentials. Failed market-data requests leave the reference unavailable without
 preventing the account snapshot from publishing. Older snapshots without benchmark
 data continue to render normally. Restart the publisher when deploying this change.
 
-The publisher reads the credential-free schedule, strategy, data, and execution
+The publisher reads the credential-free schedule, strategy, risk, data, and execution
 sections from the live runner's `effective_config.json` on every poll, falling back to
 `overnight/config.yaml` when no active-runtime artifact exists. The frontend renders
 pipeline times from that snapshot, including CLI overrides, so parameters no longer

@@ -154,6 +154,7 @@ describe('lastCompletedTimelineIndex', () => {
 describe('executionMilestone', () => {
   const symbols = ['AAPL', 'MSFT']
   const strategy: StrategyState = {
+    strategy_name: 'liquidity-momentum-focus', cash_session: false,
     status: 'exit_queued',
     entry_date: '2026-09-08',
     exit_date: '2026-09-09',
@@ -175,6 +176,16 @@ describe('executionMilestone', () => {
       { date: '2026-09-09', open: '09:30', close: '16:00' }
     ]
   })!
+  it('labels a saved cash decision without claiming orders filled', () => {
+    const entry = timeline.events.find(event => event.key === 'entry')!
+    const result = executionMilestone(entry, {
+      ...strategy, status: 'closed', cash_session: true, symbols: [], filled_symbols: []
+    }, now, config.timeZone)
+    expect(result?.completed).toBe(true)
+    expect(result?.warning).toBe(false)
+    expect(result?.description).toContain('Cash · no orders')
+  })
+
   const exit = timeline.events.find(event => event.key === 'exit')!
   const opening = timeline.events.find(event => event.key === 'next_open')!
 

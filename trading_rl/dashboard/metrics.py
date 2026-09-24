@@ -223,6 +223,8 @@ def realized_equity_series(
     closed: list[tuple[date, date, float]] = []
     entry_days: list[date] = []
     for session in sessions:
+        if session.get("cash_session"):
+            continue
         if session.get("status") != "closed" or session.get("realized_pnl") is None:
             continue
         if (
@@ -306,6 +308,8 @@ def strategy_inception_equity(
     """
     candidates: list[tuple[date, float]] = []
     for session in sessions:
+        if session.get("cash_session"):
+            continue
         equity = _float(session.get("entry_equity"))
         if equity <= 0.0:
             continue

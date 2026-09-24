@@ -127,6 +127,15 @@ const columns: TableColumn<SessionRecord>[] = [
           <span class="numeric font-medium text-highlighted">
             {{ formatDay(row.original.trading_day) }}
           </span>
+          <p class="mt-0.5 max-w-44 whitespace-normal break-words text-xs text-muted">
+            {{ row.original.strategy_name }}
+          </p>
+          <p
+            v-if="row.original.cash_session"
+            class="text-xs text-muted"
+          >
+            Cash · no orders
+          </p>
           <p
             v-if="row.original.error"
             class="mt-0.5 line-clamp-1 text-xs text-error"
@@ -161,10 +170,11 @@ const columns: TableColumn<SessionRecord>[] = [
             {{ row.original.realized_pnl === null ? '—' : formatSignedCurrency(row.original.realized_pnl) }}
           </span>
           <p
-            v-if="row.original.status === 'closed' && row.original.fee_status !== 'confirmed'"
+            v-if="row.original.status === 'closed' && ['pending', 'unavailable'].includes(row.original.fee_status)"
             class="text-xs text-warning"
+            :title="feeStatusLabel(row.original)"
           >
-            provisional · {{ row.original.fee_status === 'pending' ? 'fees pending' : 'fees unavailable' }}
+            provisional · fees TBD
           </p>
         </div>
       </template>

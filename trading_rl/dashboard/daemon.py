@@ -66,6 +66,7 @@ _PUBLIC_TRADING_CONFIG_FIELDS = {
         "entry_grace_seconds",
     ),
     "strategy": (
+        "name",
         "top",
         "liquidity_scheme",
         "ema_span",
@@ -73,6 +74,10 @@ _PUBLIC_TRADING_CONFIG_FIELDS = {
         "minimum_trading_days",
         "liquidity_lookback_days",
         "exchanges",
+    ),
+    "risk": (
+        "volatility_target", "max_exposure", "volatility_window",
+        "trend_window", "weak_trend_multiplier", "allocation_window", "allocation_count",
     ),
     "data": (
         "shortlist_since",
@@ -340,6 +345,8 @@ def _strategy_view(state: Mapping[str, Any]) -> dict[str, Any]:
     position = state.get("position") or {}
     ranking = state.get("ranking") or {}
     return {
+        "strategy_name": position["strategy_name"] if position else None,
+        "cash_session": position["cash_session"] if position else False,
         "status": position.get("status"),
         "entry_date": position.get("entry_date"),
         "exit_date": position.get("exit_date"),
@@ -498,8 +505,11 @@ def session_records(
             continue
 
         position = summary.get("position") or {}
+        if not position:
+            continue
         entry_orders = position.get("entry_orders") or {}
-        if performance.filled_notional(entry_orders) <= 0.0:
+        cash_session = position["cash_session"] and position.get("status") == "closed"
+        if performance.filled_notional(entry_orders) <= 0.0 and not cash_session:
             continue
         entry_date = str(position.get("entry_date") or summary.get("trading_day") or directory.name)
         exit_date = str(position.get("exit_date") or "")
@@ -539,7 +549,7 @@ def session_records(
         )
         fee_status = "not_applicable"
         fee_summary: dict[str, object] | None = None
-        if position.get("status") == "closed" and exit_date:
+        if position.get("status") == "closed" and exit_date and not cash_session:
             try:
                 if basket_key not in resolved_fees:
                     resolved_fees[basket_key] = _session_fee_summary(
@@ -578,7 +588,17 @@ def session_records(
             if account_equity_change is not None and realized_pnl is not None
             else None
         )
+        if cash_session:
+            # A closed cash decision needs no fills or fee query. Its scheduled exit
+            # can still be in the future; it must not create a future equity point.
+            entry_notional = exit_notional = 0.0
+            gross_realized_pnl = gross_realized_return = 0.0
+            realized_pnl = realized_return = 0.0
+            fee_cost = 0.0
+            account_equity_change = unexplained_residual = None
         record = {
+            "strategy_name": position["strategy_name"],
+            "cash_session": cash_session,
             "trading_day": entry_date,
             "last_action": summary.get("last_action"),
             "updated_at": summary.get("updated_at"),

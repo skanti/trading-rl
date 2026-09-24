@@ -34,6 +34,9 @@ const closed = computed(() => snapshot.value?.closed_basket ?? [])
             <StatusBadge :status="strategy?.status" />
           </div>
         </template>
+        <p class="mb-3 text-sm text-muted">
+          Strategy: <span class="text-highlighted">{{ strategy?.strategy_name ?? '—' }}</span>
+        </p>
         <dl class="grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <dt class="text-xs uppercase tracking-wide text-slate-500">
