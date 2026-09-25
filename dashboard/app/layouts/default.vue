@@ -38,20 +38,23 @@ async function handleSignOut() {
   await navigateTo('/login')
 }
 
-const dashboardMenu: DropdownMenuItem[][] = [[
+const dashboardMenu = computed<DropdownMenuItem[][]>(() => [links.map(link => ({
+  ...link,
+  active: route.path === link.to
+})), [
   {
     label: 'Sign out',
     icon: 'i-lucide-log-out',
     color: 'error',
     onSelect: () => void handleSignOut()
   }
-]]
+]])
 </script>
 
 <template>
   <div class="min-h-screen min-w-0 overflow-x-clip bg-slate-950 text-slate-100">
     <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/85 backdrop-blur">
-      <div class="mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 p-2 md:flex md:gap-x-6">
+      <div class="mx-auto flex w-full max-w-6xl items-center justify-between gap-3 p-2 md:gap-6">
         <div class="flex min-w-0 items-center gap-1">
           <UDropdownMenu
             :items="dashboardMenu"
@@ -85,25 +88,7 @@ const dashboardMenu: DropdownMenuItem[][] = [[
           </NuxtLink>
         </div>
 
-        <nav class="col-span-2 row-start-2 flex min-w-0 items-center gap-1 md:col-auto md:row-auto">
-          <NuxtLink
-            v-for="link in links"
-            :key="link.to"
-            :to="link.to"
-            class="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm transition"
-            :class="route.path === link.to
-              ? 'bg-slate-800 text-white'
-              : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'"
-          >
-            <UIcon
-              :name="link.icon"
-              class="size-4"
-            />
-            {{ link.label }}
-          </NuxtLink>
-        </nav>
-
-        <div class="col-start-2 row-start-1 flex items-center gap-1 sm:gap-2 md:col-auto md:row-auto md:ml-auto md:gap-3">
+        <div class="flex shrink-0 items-center gap-1 sm:gap-2 md:gap-3">
           <UBadge
             v-if="demoMode"
             class="hidden sm:inline-flex"
