@@ -1,8 +1,10 @@
 # Process ownership
 
-Keep experiment and research source code inside this repository, under `research/`.
-Save generated run summaries, CSVs, and charts under `/tmp` by default, not in
-the code folder. Candidate run results belong in `/tmp/trading-backtests/candidate/`.
+Keep supported strategies and shared components under `trading_rl/`; production
+code must not import from `research/`. Keep reusable research tooling and its tests
+under `research/`. Put one-off experiment scripts, parameter files, generated run
+summaries, CSVs, and charts under `/tmp/trading-backtests/candidate/` by default,
+not in the code folder.
 Do not create sibling clones or external worktrees unless the user explicitly
 requests an external location.
 

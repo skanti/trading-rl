@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from research.basket_screen import load_inputs
-from research.liquidity_momentum import LiquidityMomentumConfig
+from trading_rl.overnight.momentum import LiquidityMomentumConfig
 from research.regime_screen import metrics
 from trading_rl.overnight.backtest import run_backtest
 

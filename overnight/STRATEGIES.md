@@ -32,7 +32,9 @@ drawdown in the 2023–September 2026 study, using reused historical data for se
 It is an in-sample research preset, not approved for live trading. An extra 1 bp
 per side lowers its CAGR to 96.77%. `liquidity-regime-vol` and
 `liquidity-momentum-vol` retain earlier experimental families for comparisons.
-All use shared execution, allocation and financing code. See
+All built-in strategies are registered in `trading_rl/overnight/backtest_strategies.py`
+and use packaged execution, allocation and financing code. None requires imports
+from `research/`; experimental labels and live eligibility remain unchanged. See
 [research results and plugin instructions](../research/README.md).
 `liquidity-momentum-focus` simplifies the blend to a single equal-weight top-three
 basket ranked by ten-session momentum, with a 100-session SPY trend and
@@ -241,7 +243,7 @@ and the unique formula matching its ordered basket is explicitly labeled.
 
 Use `--strategy` for distinct named policies and `--strategy-config` for validated
 JSON parameter overrides. Avoid a new strategy name for each numeric setting.
-For example, save this as `research/variants/vol25.json` when starting a new
+For example, save this as `/tmp/trading-backtests/candidate/vol25.json` when starting a new
 experiment:
 
 ```json
@@ -249,7 +251,7 @@ experiment:
 ```
 
 ```bash
-trading-backtest --strategy liquidity-trend-vol --strategy-config research/variants/vol25.json \
+trading-backtest --strategy liquidity-trend-vol --strategy-config /tmp/trading-backtests/candidate/vol25.json \
   --since 2026-01-01 --end-date 2026-09-18 --budget 10000 \
   --output-dir /tmp/trading-backtests/candidate/liquidity-trend-vol/vol25
 ```
@@ -261,9 +263,11 @@ execution times, financing and costs retain their existing CLI flags.
 
 ## Recommended experiment framework
 
-Keep this simulator as the accounting authority. Future experiment source and
-versioned specifications belong in `research/`; results belong in `/tmp` by
-default. The older `trading-experiments` command has its own historical simulator
+Keep this simulator as the accounting authority. Reusable research tools and
+archived study specifications belong in `research/`. One-off experiment source,
+new parameter files, and results belong in `/tmp/trading-backtests/candidate/` by
+default. Supported strategies and shared components belong in `trading_rl/` and
+must not import research tooling. The older `trading-experiments` command has its own historical simulator
 and is not the runner for `liquidity-trend-vol`. New comparisons should call
 `run_backtest` with the same immutable input arrays for every variant.
 

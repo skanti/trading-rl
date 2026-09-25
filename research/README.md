@@ -1,9 +1,12 @@
 # Experimental overnight strategies
 
-Research source stays here. Generated results go under
-`/tmp/trading-backtests/candidate/`. The promoted live and backtest default is `liquidity-momentum-focus`; its
-implementation lives in shared production modules. Other experimental names
-remain unavailable to the live daemon and reconciliation.
+Reusable research tooling and archived study specifications stay here. One-off
+experiment scripts, new parameter files, and generated results go under
+`/tmp/trading-backtests/candidate/`. All built-in backtest strategy registrations
+live in `trading_rl/overnight/backtest_strategies.py`; shared momentum policies and
+presets live in `trading_rl/overnight/momentum.py`. Production imports never depend
+on this directory. The live and backtest default is `liquidity-momentum-focus`;
+the experimental families remain unavailable to live trading and reconciliation.
 
 The newer [momentum-focus study](MOMENTUM_FOCUS.md) simplifies the blend to one
 three-stock basket. Its user-selected defaults are 10-session momentum, a
@@ -103,8 +106,10 @@ is null by default; 0 means Monday, 4 means Friday. Missing required prices or
 momentum inputs fail the run instead of silently replacing names.
 
 New plugins export `STRATEGY`, an experimental `StrategySpec`, from an importable
-module. Register it with `--strategy-plugin research.my_variant`, then select its
-name with `--strategy`. Builtin names cannot be replaced by external plugins.
+module. For a one-off experiment, save `my_variant.py` in a temporary study directory
+and register it with `PYTHONPATH=/tmp/trading-backtests/candidate/my-study
+trading-backtest --strategy-plugin my_variant --strategy my-variant`.
+Builtin names cannot be replaced by external plugins.
 The spec supplies config/policy classes, a label, default shortlist/EMA settings,
 and whether daily stock closes are needed. Configs validate shared risk fields
 and provide `as_dict()`. Policies accept `(config, spy_marks)` and implement
@@ -120,9 +125,9 @@ negative exposure is never silently priced as a long trade.
 Plugins must enforce lagging and have causality tests: receiving historical arrays
 is not a sandbox against lookahead. Source fingerprints include inherited plugin
 implementations and config classes. Experiments never enter the approved live
-strategy registry. The repository packages `research` with the CLI; after adding
-it to an existing checkout, refresh its editable installation (`uv pip install
---no-deps -e .`, using the intended virtual environment).
+strategy registry. Research tooling is not included in the installed package;
+run it from the repository root with `python -m research.<tool>`. Run its tests
+with `python -m unittest discover -s research/tests -p 'test_*.py'`.
 
 ## Research protocol and reproduction
 

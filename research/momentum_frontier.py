@@ -10,7 +10,7 @@ import pandas as pd
 
 from research.basket_screen import load_inputs
 from research.frontier_screen import drawdown_bound, mark_bounds
-from research.liquidity_momentum import LiquidityMomentumConfig
+from trading_rl.overnight.momentum import LiquidityMomentumConfig
 from research.regime_screen import metrics
 from trading_rl.overnight.backtest import run_backtest
 from trading_rl.overnight.backtest_audit import minute_mark_audit

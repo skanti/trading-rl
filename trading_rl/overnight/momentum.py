@@ -232,6 +232,19 @@ class LiquidityMomentumPolicy(LiquidityRegimePolicy):
 
 
 @dataclass(frozen=True)
+class LiquidityMomentumBlendConfig(LiquidityMomentumConfig):
+    """Experimental backtest preset; not an approved live strategy."""
+
+    volatility_target: float = 0.35
+    volatility_window: int = 20
+    trend_window: int = 100
+    weak_trend_multiplier: float = 0.0
+    allocation_window: int = 10
+    allocation_count: int = 4
+    allocation_windows: tuple[int, ...] | None = (5, 10)
+
+
+@dataclass(frozen=True)
 class LiquidityMomentumFocusConfig(LiquidityMomentumConfig):
     volatility_target: float = 0.35
     volatility_window: int = 20

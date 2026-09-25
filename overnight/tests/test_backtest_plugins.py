@@ -1,6 +1,7 @@
 """Experimental policies share execution without entering live strategy discovery."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -12,9 +13,13 @@ import numpy as np
 import pandas as pd
 from test_strategies import fixture
 
-from research.liquidity_momentum import LiquidityMomentumConfig, LiquidityMomentumPolicy
-from trading_rl.overnight.momentum import LiquidityMomentumFocusConfig
-from research.liquidity_regime import LiquidityRegimeConfig, LiquidityRegimePolicy
+from trading_rl.overnight.momentum import (
+    LiquidityMomentumConfig,
+    LiquidityMomentumFocusConfig,
+    LiquidityMomentumPolicy,
+    LiquidityRegimeConfig,
+    LiquidityRegimePolicy,
+)
 from trading_rl.overnight.backtest import build_parser, run_backtest
 from trading_rl.overnight.backtest_strategies import (
     PolicyContext,
@@ -27,6 +32,29 @@ from trading_rl.overnight.strategies import STRATEGIES, LiquidityTrendVolConfig
 
 
 class BacktestPluginTest(unittest.TestCase):
+    def test_all_builtin_strategies_work_without_research_imports(self):
+        code = """
+import importlib.abc
+import sys
+class Guard(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'research' or fullname.startswith('research.'):
+            raise AssertionError(f'production imported {fullname}')
+sys.meta_path.insert(0, Guard())
+from trading_rl.overnight.backtest import build_parser
+from trading_rl.overnight.backtest_strategies import BUILTIN_STRATEGIES, get_strategy
+import trading_rl.overnight.live
+import trading_rl.overnight.reconcile_live_sessions
+for name in BUILTIN_STRATEGIES:
+    assert build_parser().parse_args(['--strategy', name]).strategy == name
+    spec = get_strategy(name)
+    config = spec.load_config()
+    if spec.policy_type is not None:
+        policy = spec.policy_type(config, [100.] * 200)
+        assert policy.exposure(150) >= 0
+"""
+        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
     def test_focus_uses_one_equal_weight_basket_and_lagged_prices(self):
         config = get_strategy("liquidity-momentum-focus").load_config()
         self.assertEqual((config.allocation_window, config.allocation_count), (10, 3))

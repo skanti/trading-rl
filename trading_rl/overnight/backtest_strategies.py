@@ -1,7 +1,8 @@
-"""Backtester-only strategy plugins; never imported by live or reconciliation.
+"""Packaged backtest strategies and optional external plugin registration.
 
 A plugin exports STRATEGY (StrategySpec). Its policy implements exposure(row) and
 observe(unit_return); the common engine owns selection, execution and accounting.
+Live and reconciliation import shared policies directly, never this registry.
 """
 
 import importlib
@@ -12,7 +13,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .momentum import LiquidityMomentumFocusConfig, LiquidityMomentumPolicy
+from .momentum import (
+    LiquidityMomentumBlendConfig,
+    LiquidityMomentumConfig,
+    LiquidityMomentumFocusConfig,
+    LiquidityMomentumPolicy,
+    LiquidityRegimeConfig,
+    LiquidityRegimePolicy,
+)
 from .strategies import LiquidityTrendVolConfig, LiquidityTrendVolPolicy
 
 
@@ -58,13 +66,23 @@ _REGISTRY = {
         "liquidity-trend-vol", "Liquidity: trend + volatility target",
         LiquidityTrendVolConfig, LiquidityTrendVolPolicy,
     ),
+    "liquidity-regime-vol": StrategySpec(
+        "liquidity-regime-vol", "Liquidity: experimental regime + volatility target",
+        LiquidityRegimeConfig, LiquidityRegimePolicy, experimental=True,
+        default_top=6, default_ema_span=20,
+    ),
+    "liquidity-momentum-vol": StrategySpec(
+        "liquidity-momentum-vol", "Liquidity: experimental momentum allocation + volatility target",
+        LiquidityMomentumConfig, LiquidityMomentumPolicy, experimental=True,
+        requires_daily_closes=True,
+    ),
+    "liquidity-momentum-blend": StrategySpec(
+        "liquidity-momentum-blend", "Liquidity: experimental momentum blend + volatility target",
+        LiquidityMomentumBlendConfig, LiquidityMomentumPolicy, experimental=True,
+        requires_daily_closes=True,
+    ),
 }
-EXPERIMENTAL_MODULES = {
-    "liquidity-regime-vol": "research.liquidity_regime",
-    "liquidity-momentum-vol": "research.liquidity_momentum",
-    "liquidity-momentum-blend": "research.liquidity_momentum_blend",
-}
-BUILTIN_STRATEGIES = (*_REGISTRY, *EXPERIMENTAL_MODULES)
+BUILTIN_STRATEGIES = tuple(_REGISTRY)
 
 
 def register_plugin(module_name: str):
@@ -73,9 +91,9 @@ def register_plugin(module_name: str):
         raise ValueError("a backtest plugin must export an experimental StrategySpec as STRATEGY")
     if spec.config_type is None or spec.policy_type is None:
         raise ValueError("a plugin requires config_type and policy_type")
-    if spec.name in EXPERIMENTAL_MODULES and module_name != EXPERIMENTAL_MODULES[spec.name]:
-        raise ValueError(f"reserved strategy name: {spec.name}")
     existing = _REGISTRY.get(spec.name)
+    if spec.name in BUILTIN_STRATEGIES:
+        raise ValueError(f"reserved strategy name: {spec.name}; already registered")
     if existing is not None and existing != spec:
         raise ValueError(f"strategy already registered: {spec.name}")
     _REGISTRY[spec.name] = spec
@@ -83,8 +101,6 @@ def register_plugin(module_name: str):
 
 
 def get_strategy(name: str) -> StrategySpec:
-    if name in EXPERIMENTAL_MODULES and name not in _REGISTRY:
-        register_plugin(EXPERIMENTAL_MODULES[name])
     if name not in _REGISTRY:
         raise ValueError(f"unknown backtest strategy {name!r}; available: {', '.join(BUILTIN_STRATEGIES)}; use --strategy-plugin for others")
     return _REGISTRY[name]
