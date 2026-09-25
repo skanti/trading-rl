@@ -27,7 +27,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--reference-summary", type=Path, required=True)
+    parser.add_argument("--reference-summary", type=Path, help="Optional exact N=4 portfolio reference")
+    parser.add_argument("--weak-trend-multiplier", type=float, default=0.0)
     parser.add_argument("--counts", type=int, nargs="+", default=list(range(1, 13)))
     parser.add_argument(
         "--minute-data-dir", type=Path,
@@ -42,7 +43,7 @@ def main():
     if any(n < 1 or n > inputs["top"] for n in args.counts):
         parser.error("counts must be between 1 and the liquidity shortlist size")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    policy = LiquidityMomentumFocusConfig(weak_trend_multiplier=0.0)
+    policy = LiquidityMomentumFocusConfig(weak_trend_multiplier=args.weak_trend_multiplier)
     protocol = {
         "status": "historical in-sample sensitivity; no live configuration changes",
         "counts": args.counts,
@@ -64,7 +65,7 @@ def main():
             **{**inputs, "strategy": "liquidity-momentum-focus", "strategy_config": config}
         )
         portfolio = pd.DataFrame(summary["daily_portfolio"])
-        if count == 4:
+        if count == 4 and args.reference_summary is not None:
             reference = json.loads(args.reference_summary.read_text())
             pd.testing.assert_frame_equal(
                 portfolio, pd.DataFrame(reference["daily_portfolio"]), check_exact=True,
@@ -85,6 +86,7 @@ def main():
             "total_return": summary["ending_equity"] / summary["budget"] - 1,
             "ending_equity": summary["ending_equity"],
             "sharpe": metrics["sharpe_zero_cash_rate"],
+            "annualized_volatility": metrics["annualized_volatility"],
             "minute_drawdown": audit["minute_open_mark_drawdown"],
             "exit_drawdown": metrics["max_drawdown"],
             "average_exposure": summary["average_exposure"],
@@ -93,9 +95,12 @@ def main():
             "last_exit": summary["last_exit_date"],
         })
         for year, rows in portfolio.groupby(pd.to_datetime(portfolio.exit_date).dt.year):
+            equity = np.r_[1.0, np.cumprod(1 + rows.strategy_return)]
             annual.append({
                 "stocks": count, "exit_year": int(year),
                 "return": float(np.prod(1 + rows.strategy_return) - 1),
+                "annualized_volatility": float(rows.strategy_return.std(ddof=1) * np.sqrt(252)),
+                "exit_drawdown": float(np.max(1 - equity / np.maximum.accumulate(equity))),
             })
         pd.DataFrame(records).to_csv(args.output_dir / "comparison.csv", index=False)
         pd.DataFrame(annual).to_csv(args.output_dir / "annual_returns.csv", index=False)
@@ -105,15 +110,16 @@ def main():
             f"minute drawdown {audit['minute_open_mark_drawdown']:.2%}", flush=True,
         )
     frame = pd.DataFrame(records).sort_values("stocks")
-    figure = Figure(figsize=(11, 8), dpi=150)
+    figure = Figure(figsize=(11, 10), dpi=150)
     FigureCanvasAgg(figure)
     for axis, (column, label) in zip(
-        figure.subplots(3, 1, sharex=True),
+        figure.subplots(4, 1, sharex=True),
         [("calendar_cagr", "Annual return (CAGR)"),
-         ("sharpe", "Sharpe"), ("minute_drawdown", "Minute-mark drawdown")], strict=True,
+         ("sharpe", "Sharpe"), ("annualized_volatility", "Realized volatility"),
+         ("minute_drawdown", "Minute-mark drawdown")], strict=True,
     ):
         axis.plot(frame.stocks, frame[column], marker="o")
-        axis.axvline(4, color="darkorange", linestyle="--", label="Current N=4")
+        axis.axvline(3, color="darkorange", linestyle="--", label="Current N=3")
         if column == "minute_drawdown":
             axis.axhline(.20, color="gray", linestyle=":", label="20% drawdown")
         if column != "sharpe":
@@ -126,7 +132,7 @@ def main():
     figure.suptitle(
         "Liquidity momentum focus: basket-size sensitivity\n"
         f"{records[0]['first_entry']}–{records[0]['last_exit']} · "
-        "10/100/20 · 35% target · 2× cap · in-sample",
+        f"10/100/20 · 35% target · 2× cap · weak multiplier {args.weak_trend_multiplier:g} · in-sample",
     )
     figure.tight_layout()
     chart = args.output_dir / "basket_size_comparison.png"
