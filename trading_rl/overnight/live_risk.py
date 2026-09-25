@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..market_data.sip import RECENT_SIP_SAFETY_DELAY
 from .execution_prices import load_scheduled_nbbo_asks
 from .history import (
     EASTERN,
@@ -214,7 +215,13 @@ class RiskPriceProvider:
             start = _stamp(day, 570)
             if self.now <= start:
                 raise ValueError(f"opening auction on {day} has not completed yet")
-            end = min(self.now, _stamp(day, 960))
+            # Even a morning-auction lookup is rejected if its requested end
+            # includes recent SIP data. Match the historical downloader's window.
+            end = min(self.now - RECENT_SIP_SAFETY_DELAY, _stamp(day, 960))
+            if end <= start:
+                raise ValueError(
+                    f"opening auction on {day} is not yet available in the delayed SIP window"
+                )
             params = {
                 "symbols": symbol,
                 "start": start.isoformat(),
@@ -234,7 +241,7 @@ class RiskPriceProvider:
                             auction.get("c") == "O"
                             and np.isfinite(price)
                             and price > 0
-                            and pd.Timestamp(auction["t"]).to_pydatetime() <= self.now
+                            and pd.Timestamp(auction["t"]) <= self.now
                         ):
                             priority = {
                                 "N": 0,

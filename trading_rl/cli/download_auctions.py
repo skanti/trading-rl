@@ -19,6 +19,7 @@ import requests
 
 from ..market_data.download_mode import use_incremental_download
 from ..market_data.download_output import current_report, download_output, download_progress, info
+from ..market_data.sip import RECENT_SIP_SAFETY_DELAY
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,7 +39,6 @@ FIELDNAMES = (
 SPLIT_FIELDNAMES = ("type", "symbol", "ex_date", "old_rate", "new_rate", "id")
 FORMAT_VERSION = 1
 EASTERN = ZoneInfo("America/New_York")
-RECENT_SIP_SAFETY_DELAY = timedelta(minutes=20)
 
 
 def default_end(now: datetime | None = None) -> str:

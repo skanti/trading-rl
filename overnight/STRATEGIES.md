@@ -120,7 +120,10 @@ filter, followed by the same three-stock momentum selection. Trend-filter cash
 days still observe the modeled three-stock return for volatility. Entry prices are SIP asks at 15:45; exits are primary opening auctions;
 additional modeled costs are zero. Raw prices and a refreshed split ledger keep
 each entry/exit pair on the same basis. Missing quotes and auction prints are
-fetched through read-only data requests. SPY uses the previous 100 sessions'
+fetched through read-only data requests. Auction queries stop at least 20 minutes
+before the preparation timestamp, matching the downloader and avoiding recent-SIP
+subscription restrictions. An uncached opening auction is unavailable until that
+delayed window reaches the open. SPY uses the previous 100 sessions'
 split-adjusted daily closes from the same daily cache as the backtester. Ranking
 seeds missing SPY daily history and refreshes it with the stock bars; SPY never
 occupies a stock-shortlist slot. The current day's close is excluded. A missing

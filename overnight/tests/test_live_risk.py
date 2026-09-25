@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -198,6 +198,41 @@ import trading_rl.overnight.reconcile_live_sessions
             ]
             entry = provider.adjusted_entry("A", date(2026, 8, 21), date(2026, 8, 24))
             self.assertAlmostEqual(unit_return([entry], [101]), 0.01)
+
+    def test_opening_request_excludes_recent_sip_and_preserves_primary_price(self):
+        day = date(2026, 9, 24)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = trend_config(
+                risk_nbbo_path=Path(directory) / "absent.npz",
+                risk_auctions_path=Path(directory) / "absent.npz",
+            )
+            for now, expected_end in (
+                (datetime(2026, 9, 24, 14, tzinfo=EASTERN), datetime(2026, 9, 24, 13, 40, tzinfo=EASTERN)),
+                (datetime(2026, 9, 25, 14, tzinfo=EASTERN), datetime(2026, 9, 24, 16, tzinfo=EASTERN)),
+            ):
+                with self.subTest(now=now):
+                    broker = Mock(data_url="https://data.alpaca.markets/v2")
+                    def request(method, base, path, *, params, data_credentials, expected_end=expected_end, now=now):
+                        self.assertEqual((method, path, data_credentials), ("GET", "stocks/auctions", True))
+                        self.assertEqual(params["feed"], "sip")
+                        end = datetime.fromisoformat(params["end"])
+                        self.assertEqual(end, expected_end)
+                        self.assertLessEqual(end, now - timedelta(minutes=20))
+                        return {"auctions": {"A": [{"d": str(day), "o": [
+                            {"t": "2026-09-24T13:30:00.123456789Z", "c": "O", "p": 101, "s": 1000, "x": "Q"},
+                        ]}]}}
+                    broker._request.side_effect = request
+                    provider = RiskPriceProvider(broker, settings, [], [], now)
+                    self.assertEqual(provider.opening("A", day), 101)
+                    self.assertEqual(provider.opening("A", day), 101)
+                    self.assertEqual(broker._request.call_count, 1)
+            broker = Mock(data_url="https://data.alpaca.markets/v2")
+            provider = RiskPriceProvider(broker, settings, [], [], datetime(2026, 9, 24, 9, 45, tzinfo=EASTERN))
+            with self.assertRaisesRegex(ValueError, "delayed SIP window"):
+                provider.opening("A", day)
+            broker._request.assert_not_called()
+            provider.opens[(day, "A")] = 101
+            self.assertEqual(provider.opening("A", day), 101)
 
     def test_spy_uses_completed_daily_closes_without_minute_api_calls(self):
         with tempfile.TemporaryDirectory() as directory:
