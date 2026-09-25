@@ -2815,7 +2815,7 @@ def build_parser(
         "subtracts that name's own dispersion, demoting a stock that is only briefly "
         "enormous below one that trades heavily every session",
     )
-    parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=20)
+    parser.add_argument("--minimum-ranking-lead-minutes", type=int, default=5)
     parser.add_argument("--entry-grace-seconds", type=int, default=75)
     parser.add_argument(
         "--ema-span",

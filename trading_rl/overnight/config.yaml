@@ -6,7 +6,7 @@ schedule:
   ranking_time: "14:00"
   entry_time: "15:45"
   exit_time: "06:00"
-  minimum_ranking_lead_minutes: 20
+  minimum_ranking_lead_minutes: 5
   entry_grace_seconds: 75
 
 strategy:
